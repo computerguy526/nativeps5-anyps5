@@ -36,10 +36,8 @@ agents break.
   layer runs on KosmicKrisp; say which ICD.
 
 Where nativeps5 differs: the pull request template is [.github/pull_request_template.md](.github/pull_request_template.md)
-(its `AI-assisted` line is answered honestly) and evidence is `nps5 report` output from the entry repository.
-Upstream's template fields (`What`, `Tested`, `Depends on`, `Fixes`, `Unblocks`, `GPUs tested`) are still filled.
-
-The project-wide rules are in https://github.com/computerguy526/nativeps5 [AGENTS.md](https://github.com/computerguy526/nativeps5/blob/main/AGENTS.md). Read it first. In short: the game-data rule (never game data or anything derived from a title in a commit, issue, PR or prompt; derived files live under `NPS5_SCRATCH`); the run safety rules (one GPU-using process on the machine, title runs only through `scripts/run-title.sh` of the entry repository, never raise `NPS5_SELF_MEM_LIMIT_MB`, no Metal counter heaps or GPU timestamp queries, no screenshots, kill only what you started); evidence for every speed or picture claim (`nps5 report`, A/B with interleaved runs, scene named, commits of every component); and git: the identity comes from git's configuration (never `--author`, `-c user.*` or `--no-verify`), no pushes to an upstream, and the pull request template states whether AI assisted.
+(its `AI assistance` section is answered honestly) and evidence is `nps5 report` output from the entry repository.
+The template's sections are What and why, Evidence, Safety and AI assistance.
 
 ## Where things live
 
@@ -79,4 +77,4 @@ cmake -S . -B build-relinker -DANYPS5_RELINKER_ONLY=ON && ctest --test-dir build
   loops keep their caps (`KK_LOOP_CAP`) and watchdog.
 - `.nps5-check-allow` lists large upstream or table files that are not dumps; do not add to it to dodge a finding.
 
-Pull requests use `.github/pull_request_template.md` (it points at the entry repository's CONTRIBUTING.md; fill the evidence block with `nps5 report`, see docs/agents/evidence.md there). `scripts/check.sh --tree` of the entry repository run against this checkout must report 0 failures; this repository's `.nps5-check-tests` lists the CPU-only tests it runs.
+Pull requests use `.github/pull_request_template.md` (it points at the entry repository's CONTRIBUTING.md; fill the evidence block with `nps5 report`, see docs/agents/evidence.md there). The entry repository's `scripts/check.sh --tree`, run from inside this checkout, must report 0 failures; this repository's `.nps5-check-tests` lists the CPU-only tests it runs.
