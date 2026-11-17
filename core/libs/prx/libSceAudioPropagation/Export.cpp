@@ -472,8 +472,12 @@ std::int32_t APS5_VABI sceAudioPropagationSourceCalculateAudioPaths(AudioPropaga
     const auto found = state.objects.find(source);
     if (found == state.objects.end() || found->second.kind != Kind::Source || !liveSystem(state, found->second.system)) return ErrorInvalidHandle;
     if (!rays || !paths) return ErrorNullPointer;
-    if (rayCount != 6 || reflectionOrder == 0 || pathCount == 0) return ErrorInvalidArgument;
-    NotImplemented_nid_no_patch(__func__);
+    // No propagation model: the calculation succeeds with zero audio paths (the output is left untouched), for any ray
+    // count, reflection order and capacity. Games treat an error here as fatal (one stopped
+    // with 0x8A700001), and the source plays without paths, as with SetAudioPaths(source, nullptr, 0).
+    (void)rayCount;
+    (void)reflectionOrder;
+    (void)pathCount;
     return 0;
 }
 

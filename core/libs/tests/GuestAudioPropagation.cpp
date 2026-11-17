@@ -433,9 +433,14 @@ int main() {
     RequireThrows<std::runtime_error>([&] { sceAudioPropagationSystemSetRays(system, rays, 1); }, "unrequested ray results");
     Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 0, 1, nullptr, 0) == AudioPropagation::ErrorNullPointer, "path calculation null output");
     Require(sceAudioPropagationSourceCalculateAudioPaths(0, nullptr, 0, 0, nullptr, 0) == AudioPropagation::ErrorInvalidHandle, "path calculation handle precedence");
-    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 0, 1, rays, 6) == AudioPropagation::ErrorInvalidArgument, "path calculation empty rays");
-    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 6, 0, rays, 6) == AudioPropagation::ErrorInvalidArgument, "path calculation zero reflection order");
-    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 6, 1, rays, 0) == AudioPropagation::ErrorInvalidArgument, "path calculation zero output capacity");
+    // no propagation model: success with zero paths for any counts, output untouched
+    std::uint8_t pathsOut[AudioPropagation::PathEntrySize]{};
+    pathsOut[0] = 0x5a;
+    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 0, 1, pathsOut, 1) == 0, "path calculation empty rays");
+    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 6, 0, pathsOut, 1) == 0, "path calculation zero reflection order");
+    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 6, 1, pathsOut, 0) == 0, "path calculation zero output capacity");
+    Require(sceAudioPropagationSourceCalculateAudioPaths(source, rays, 6, 2, pathsOut, 1) == 0, "path calculation valid request");
+    Require(pathsOut[0] == 0x5a, "path calculation wrote output");
     Require(sceAudioPropagationSourceSetAudioPaths(source, nullptr, 0) == 0, "empty audio paths failed");
     RequireThrows<std::runtime_error>([&] { sceAudioPropagationSourceSetAudioPaths(source, rays, 1); }, "set audio paths");
 
