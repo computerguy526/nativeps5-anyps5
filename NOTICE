@@ -1,3 +1,27 @@
+nativeps5-anyps5
+================
+
+This repository is licensed under the GNU General Public License, version 2 (LICENSE). It is a fork and carries
+the work of the projects below.
+
+AnyPS5
+------
+https://github.com/boykopovar/AnyPS5 (GPL-2.0). The history of this repository up to commit
+ea0c471cbc04ff0b7e5e0f1f0f53777e5f71de5c is upstream's, unchanged, with its authors. Two later upstream changes
+are included in the nativeps5 commits and named in their messages (authors: Codex, XIIYAZ).
+
+AstroHybrid host callbacks
+--------------------------
+https://github.com/imnotsharingmyname/pcportastrobot, AnyPS5 patches 0021 and 0022 (libAstroHybridHost). Those
+patches are a derivative of the GPL-2.0 AnyPS5 and are used under GPL-2.0. The event-queue and pad-publish
+callbacks in core/libs/nps5/KytyHost.cpp are a port of them (same filters, idents and trigger behaviour); credit
+for that design belongs to their author. Nothing else from that repository, which carries no licence, is included.
+
+Third-party libraries
+---------------------
+The submodules under 3rdparty/ (listed in .gitmodules) keep their own licences and are fetched by git, not
+stored here.
+
 nativeps5 additions to AnyPS5 (AGC driver, pipeline pre-warm)
 =============================================================
 
@@ -8,7 +32,7 @@ them is included.
 
 RPCS3 (GPL-2.0)
 ---------------
-https://github.com/RPCS3/rpcs3 (reference clone in repos/rpcs3)
+https://github.com/RPCS3/rpcs3 (read as a reference)
 
   - Draw with something compiled instead of skipping the draw while a pipeline builds (async shader mode with the interpreter as
     the stand-in: rpcs3/Emu/RSX/VK/VKGSRender.cpp get_graphics_pipeline / use_interpreter, VKShaderInterpreter.cpp), and the
@@ -19,14 +43,14 @@ https://github.com/RPCS3/rpcs3 (reference clone in repos/rpcs3)
 
 RPCS3 ARM64 port "ARMSX3" (GPL-2.0)
 -----------------------------------
-reference clone in repos/armsx3
+https://github.com/ARMSX3 (read as a reference)
 
   - Persisting the Vulkan pipeline cache properly: temporary file plus rename, a header carrying the vendor/device/UUID of the
     driver, a size cap, validation at launch (vk/vkutils/device.cpp).
 
 ARMSX2 (GPL-3.0): ideas only, no code
 -------------------------------------
-reference clone in repos/armsx2 (read for design only)
+read for design only
 
   - A recorded pipeline-key list kept apart from the binary cache, replayed at start-up on a worker pool in three priority classes
     (Now / Ahead / Idle), where a waiting thread runs the job itself if no worker has started it, and where the key-list

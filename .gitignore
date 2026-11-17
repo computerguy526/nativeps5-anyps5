@@ -116,3 +116,6 @@ cookies.txt
 
 .env
 .env.local
+
+# nativeps5 build tree (README.md)
+/build-arm64/

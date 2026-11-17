@@ -1,0 +1,12 @@
+# Upstream AnyPS5 sources, identical to upstream at ea0c471cbc or extended by nativeps5: large because each holds
+# many test cases or a generated export table in one file. Not dumps.
+core/libs/prx/libSceAgcDriver/tests/Graphics.cpp
+core/libs/prx/libSceAgcDriver/tests/Recorder.cpp
+core/libs/prx/libSceNKWebKit/Export.cpp
+# Upstream AnyPS5 test fixtures, unchanged: throwaway TLS test keys and certificates generated for the tests.
+core/libs/tests/GuestLibreSslPemPrivateKey.cpp
+core/libs/tests/GuestSandboxCertificates.cpp
+core/libs/tests/SslCertificateFixture.hpp
+# Upstream AnyPS5 tests of path redaction, unchanged: made-up home folders (canaryuser, someone).
+core/libs/tests/RunReport.cpp
+core/libs/tests/GuestEnvironment.cpp

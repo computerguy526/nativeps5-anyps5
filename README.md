@@ -1,47 +1,51 @@
-**English** | [Português (Brasil)](docs/user/README.pt-BR.md) | [Español](docs/user/README.es.md) | [Català](docs/user/README.ca.md) | [Italiano](docs/user/README.it.md) | [简体中文](docs/user/README.zh-CN.md) | [Русский](docs/user/README.ru.md) | [Bahasa Indonesia](docs/user/README.id.md) | [Polski](docs/user/README.pl.md) | [日本語](docs/user/README.ja.md)
+# nativeps5-anyps5
 
-# About
+The PS5 system libraries and AGC graphics driver of [nativeps5](https://github.com/computerguy526/nativeps5):
+[AnyPS5](https://github.com/boykopovar/AnyPS5)'s host libraries built as native arm64 macOS images
+(`libkernel.prx`, `libc.prx`, `libSceAgc.prx`, `libSceAgcDriver.prx`, `libnps5_gpu.dylib`) that a natively
+translated PlayStation 5 program loads. Every title run of nativeps5 needs them, with either graphics back end:
+they provide the system libraries, and `libnps5_gpu.dylib` carries the host side of the bridge to the Kyty GPU
+library (`core/libs/nps5/KytyHost.cpp`).
 
-Tool for automatic executables porting to Linux and Windows.
+**Start at the entry repository**: https://github.com/computerguy526/nativeps5 has the build instructions
+(`BUILDING.md`), the contribution rules (`CONTRIBUTING.md`, `AGENTS.md`), the pre-commit check and the
+KosmicKrisp (Vulkan on Metal) patch series the AGC driver runs on. This repository is one of its components and
+is normally cloned by its `scripts/fetch-components.sh` as `anyps5/`.
 
-The relinker-only build runs on macOS, including Apple silicon.
+## Where this comes from
 
-[**Web converter**](https://boykopovar.github.io/AnyPS5/) - files stay on your device.
+| Layer | Source | Licence |
+|---|---|---|
+| AnyPS5 | [boykopovar/AnyPS5](https://github.com/boykopovar/AnyPS5), history up to commit `ea0c471cbc` (2026-11-14), unchanged, with its authors | GPL-2.0 |
+| nativeps5 | the commits on top: arm64 macOS host build, AGC driver and shader recompiler work for Apple GPUs on KosmicKrisp, the bridge for the nativeps5 runtime, tests, tools and design notes (`docs/nps5-*.md`) | GPL-2.0 |
 
-![anyps5_collage1](https://github.com/user-attachments/assets/ed2f0b2d-33d3-46d7-ab88-767ca872fc99)
+Upstream's own README is kept as [docs/AnyPS5-README.md](docs/AnyPS5-README.md); upstream's documentation under
+`docs/dev` and `docs/user` is unchanged. Upstream's GitHub workflows are not carried (they release, publish pages
+and label pull requests for upstream's repository). The KosmicKrisp patch series is not here: it lives in the
+entry repository under `kosmickrisp/` (MIT), where the design notes' `mesa/` paths now point.
 
-Includes a [relinker](core/relinker) that converts executable to the target system's native format and implementations of [system prx libraries](core/libs/prx) suitable for dynamic linking. No emulation or separate runtime process.
+**No game data is here and none is accepted.** The media and image byte arrays in `core/libs/tests`
+(`GuestAvPlayer.cpp`, `GuestAudiodec.cpp`, `GuestAjm.cpp`, `GuestVideodec2.cpp`, `GuestPngDec.cpp`) are upstream
+AnyPS5's test vectors, unchanged: clips of at most one second and 100x60 pixels (70 bytes to 6 KB) that carry
+their encoder's tags (FFmpeg `Lavf`/`Lavc`, x264, libvpx, LAME), produced with those tools for the tests and not
+cut from any game. Not affiliated with or endorsed by Sony Interactive Entertainment or any game publisher.
 
-[**Discord**](https://discord.gg/x9naWVzC6A), [Usage](docs/user/USAGE.md), [Build instructions](docs/dev/BUILD.md), [Architecture](docs/dev/ARCHITECTURE.md), [Technical debt of the project](docs/dev/TechnicalDebt.md), [code style conventions](docs/dev/CONVENTIONS.md), [contributing](CONTRIBUTING.md)
+## Build (Apple silicon, macOS 26)
 
-## Status
+```sh
+brew install cmake ninja sdl2-compat zstd glslang freetype vulkan-headers vulkan-loader
+git submodule update --init --depth 1 3rdparty/ZArchive 3rdparty/stb 3rdparty/libjpeg-turbo 3rdparty/zstd \
+    3rdparty/Vulkan-Headers 3rdparty/SPIRV-Headers
+cmake -S . -B build-arm64 -G Ninja -DAPS5_HOST_ARM64=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build build-arm64 -j 4 --target libSceAgc libSceAgcDriver libkernel libc nps5_gpu   # -> build-arm64/core/libs/libs/unpatched/
+```
 
-[![libraries](https://boykopovar.github.io/AnyPS5/badge-libraries.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![RDNA2 reference shader forms decoded](https://boykopovar.github.io/AnyPS5/badge-shaders.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![gfx1013 reference shader forms decoded](https://boykopovar.github.io/AnyPS5/badge-shaders-gfx1013.svg)](https://boykopovar.github.io/AnyPS5/progress.html) [![implemented in 7 days](https://boykopovar.github.io/AnyPS5/badge-week.svg)](https://boykopovar.github.io/AnyPS5/history.html)
+The entry repository's `scripts/build.sh anyps5` runs exactly this. The runtime of
+[nativeps5-recomp](https://github.com/computerguy526/nativeps5-recomp) finds the build through
+`NPS5_ANYPS5_BUILD=<path>/build-arm64`. Only the arm64 macOS host libraries are built and maintained in this
+fork; upstream's relinker, Windows and Linux targets and web converter are untouched and not tested here.
+`docs/nps5-arm64.md` describes the port.
 
-[![progress map](https://boykopovar.github.io/AnyPS5/progress.svg)](https://boykopovar.github.io/AnyPS5/progress.html)
+## Licence
 
-[Progress history](https://boykopovar.github.io/AnyPS5/history.html)
-
-<sub>* System libraries: percentage of the functions known to the project so far (declared in [core/libs/prx](core/libs/prx)), not of every PS5 system function. The total grows as more functions are declared.</sub>
-
-Unsupported or unexpected states throw a C++ exception, usually `std::runtime_error`. An exception that nothing catches prints its `what()` to stderr and ends the process.
-
-The [shader recompiler](core/shader/recompiler/Recompiler.cpp) successfully produces SPIR-V (validated via [Spirv-Tools](3rdparty/SPIRV-Tools) when built with `ANYPS5_ENABLE_SPIRV_TOOLS`).
-
-## Compatibility
-
-Per-game status and test reports live in the [Game bring-up](https://github.com/boykopovar/AnyPS5/discussions/categories/game-bring-up) discussions, one thread per title.
-
-## Input mapping
-
-SDL-mapped game controllers are supported, including analog sticks and triggers. Keyboard and mouse controls can be configured with an `anyps5-input.ini` file. See [input mapping](docs/user/INPUT_MAPPING.md) for the supported devices and configuration format.
-
-## Disclaimer
-
-This project is intended for interoperability, research, preservation, and compatibility purposes. It does not include, distribute, or require copyrighted software, firmware, cryptographic keys, or proprietary libraries. Users are responsible for ensuring that any binaries used with this project are obtained and used in accordance with applicable laws and their respective license terms.
-
-AnyPS5 is an independent project and is not affiliated with, authorized or endorsed by Sony Interactive Entertainment. "PlayStation" and "PS5" are trademarks of Sony Interactive Entertainment Inc.
-
-## License
-
-This project is licensed under the GNU General Public License version 2 only.
+GPL-2.0 ([LICENSE](LICENSE)), as upstream. Credits: [NOTICE](NOTICE).
