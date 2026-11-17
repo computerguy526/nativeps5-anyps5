@@ -35,7 +35,7 @@ cut from any game. Not affiliated with or endorsed by Sony Interactive Entertain
 ```sh
 brew install cmake ninja sdl2-compat zstd glslang freetype vulkan-headers vulkan-loader
 git submodule update --init --depth 1 3rdparty/ZArchive 3rdparty/stb 3rdparty/libjpeg-turbo 3rdparty/zstd \
-    3rdparty/Vulkan-Headers 3rdparty/SPIRV-Headers
+    3rdparty/Vulkan-Headers 3rdparty/SPIRV-Headers 3rdparty/glslang
 cmake -S . -B build-arm64 -G Ninja -DAPS5_HOST_ARM64=ON -DCMAKE_BUILD_TYPE=Release
 cmake --build build-arm64 -j 4 --target libSceAgc libSceAgcDriver libkernel libc nps5_gpu   # -> build-arm64/core/libs/libs/unpatched/
 ```
