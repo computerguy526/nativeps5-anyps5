@@ -2624,3 +2624,19 @@ list(SORT libcTestFragments)
 foreach(libcTestFragment IN LISTS libcTestFragments)
     include(${libcTestFragment})
 endforeach()
+
+if(APS5_HOST_ARM64)
+    # nps5: native arm64 host build. libc is the guest C library; its x87 long double, x86 SSE and
+    # GuestCpu code cannot be compiled for arm64, and the host-side targets (agc driver, replay tools)
+    # do not use it. Only the host support files are kept. See docs/nps5-arm64.md.
+    set(APS5_HOST_ARM64_LIBC_EXCLUDE
+        Bessel DinkumwareInternals Errors FloatBuiltins FloatingPoint Formatting
+        FormattingWide LegacySignals Math MathExact ScanningWide WideConversion
+        J0f J1f Syslog AllocatingStrings SigvecExport)
+    get_target_property(hostArm64LibcSources libc SOURCES)
+    foreach(hostArm64Excluded IN LISTS APS5_HOST_ARM64_LIBC_EXCLUDE)
+        list(FILTER hostArm64LibcSources EXCLUDE REGEX "/src/${hostArm64Excluded}\\.cpp$")
+    endforeach()
+    list(APPEND hostArm64LibcSources ${CMAKE_CURRENT_SOURCE_DIR}/src/specifics/arm64/HostLibcShims.cpp)
+    set_property(TARGET libc PROPERTY SOURCES ${hostArm64LibcSources})
+endif()

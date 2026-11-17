@@ -94,6 +94,12 @@ inline constexpr std::array InputMapping{
 
 InputConfiguration LoadInputMapping(std::string_view titleId = {});
 void ApplyInputMapping(InputConfiguration& configuration, std::istream& input, std::string_view source);
+// nps5: the same mapping written as JSON ({"bindings": {"Cross": ["KEY:Return", "KEY:Space"]}, "settings": {"LeftStickDeadzone": 10}}),
+// read from $NPS5_INPUT_JSON or ~/Library/Application Support/nativeps5/input.json and layered under anyps5-input.ini.
+// InputJsonToIni returns the equivalent INI text; both throw std::runtime_error naming the source on a malformed file.
+std::string InputJsonToIni(std::string_view json, std::string_view source);
+void ApplyInputMappingJson(InputConfiguration& configuration, std::string_view json, std::string_view source);
+std::filesystem::path InputJsonPath();
 std::string InputProfileName(std::string_view titleId);
 bool TryLoadInputMapping(std::string_view titleId, InputConfiguration& configuration, std::string& error);
 struct InputFileStamp {

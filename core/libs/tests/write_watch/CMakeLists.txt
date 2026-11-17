@@ -24,11 +24,12 @@ add_executable(write_watch_tests ../WriteWatch.cpp ../../prx/libc/src/GuestWrite
 target_include_directories(write_watch_tests PRIVATE ../..)
 target_compile_features(write_watch_tests PRIVATE cxx_std_20)
 target_link_libraries(write_watch_tests PRIVATE Threads::Threads)
+target_compile_definitions(write_watch_tests PRIVATE APS5_WRITE_WATCH_TEST_HOOKS=1)
 set_target_properties(write_watch_tests PROPERTIES
     CXX_EXTENSIONS OFF
     RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
 
-foreach(mode collect fresh armed register mapped host empty protection overlaps threads raised fault-ahead read-trap read-trap-threads read-trap-holder read-trap-fault read-trap-late read-trap-fault-bound)
+foreach(mode collect fresh armed register mapped host desync protection-trapped access-trap-race logical empty protection overlaps threads raised fault-ahead read-trap read-trap-threads read-trap-holder read-trap-bypass read-trap-import read-trap-fault read-trap-late read-trap-fault-bound host-runtime unmap-order host-write-store host-write-token protect-keeping-traps layout-resync)
     add_test(NAME write_watch_${mode} COMMAND write_watch_tests ${mode})
     set_tests_properties(write_watch_${mode} PROPERTIES TIMEOUT 30)
 endforeach()
@@ -40,3 +41,20 @@ foreach(mode execute-fault read-fault)
     add_test(NAME write_watch_${mode} COMMAND write_watch_tests ${mode})
     set_tests_properties(write_watch_${mode} PROPERTIES TIMEOUT 30)
 endforeach()
+
+add_executable(write_watch_stress_tests ../WriteWatchStress.cpp ../../prx/libc/src/GuestWriteWatch.cpp)
+target_include_directories(write_watch_stress_tests PRIVATE ../..)
+target_compile_features(write_watch_stress_tests PRIVATE cxx_std_20)
+target_link_libraries(write_watch_stress_tests PRIVATE Threads::Threads)
+set_target_properties(write_watch_stress_tests PROPERTIES
+    CXX_EXTENSIONS OFF
+    RUNTIME_OUTPUT_DIRECTORY "$<1:${ANYPS5_TEST_OUTPUT_DIRECTORY}>")
+
+foreach(mode query edge fuzz race-collect race-query)
+    add_test(NAME write_watch_stress_${mode} COMMAND write_watch_stress_tests ${mode})
+    set_tests_properties(write_watch_stress_${mode} PROPERTIES TIMEOUT 60)
+endforeach()
+add_test(NAME write_watch_stress_fuzz-exact COMMAND write_watch_stress_tests fuzz-exact)
+set_tests_properties(write_watch_stress_fuzz-exact PROPERTIES TIMEOUT 60 ENVIRONMENT APS5_WRITE_WATCH_FAULT_AHEAD=0)
+add_test(NAME write_watch_stress_bench COMMAND write_watch_stress_tests bench)
+set_tests_properties(write_watch_stress_bench PROPERTIES TIMEOUT 120)

@@ -1,6 +1,7 @@
 #include "prx/libSceAudioOut/include/AudioOut.hpp"
 #include "prx/libSceAudioOut/include/OutputDevice.hpp"
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <array>
 #include <atomic>
@@ -301,6 +302,13 @@ static std::vector<float> prepareVibration(const Port& port, const void* data) {
     return pad;
 }
 
+// Pacing and drain timeouts below are measured against real sleeps and the device's real consumption, so they use the host's
+// monotonic clock. The title-visible stamps (lastDataOutputTime) stay on sceKernelGetProcessTime, which a host runtime may hook
+// to its own, not necessarily wall-rate, timeline.
+static std::uint64_t hostMonotonicUs() {
+    return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now().time_since_epoch()).count());
+}
+
 static void sleepUs(std::unique_lock<std::mutex>& lock, std::uint64_t us) {
     lock.unlock();
     PreciseSleepUs(us);
@@ -309,9 +317,9 @@ static void sleepUs(std::unique_lock<std::mutex>& lock, std::uint64_t us) {
 
 static void queueAudio(Port& port, const void* data, std::unique_lock<std::mutex>& lock) {
     if (data == nullptr) {
-        const std::uint64_t waitStart = sceKernelGetProcessTime();
+        const std::uint64_t waitStart = hostMonotonicUs();
         while (SDL_GetQueuedAudioSize(port.device) > 0) {
-            if (sceKernelGetProcessTime() - waitStart > DRAIN_TIMEOUT_US) {
+            if (hostMonotonicUs() - waitStart > DRAIN_TIMEOUT_US) {
                 SDL_ClearQueuedAudio(port.device);
                 break;
             }
@@ -343,10 +351,10 @@ static void queueAudio(Port& port, const void* data, std::unique_lock<std::mutex
         ? static_cast<std::uint32_t>((TARGET_LATENCY_US + bufferUs - 1) / bufferUs)
         : 2u;
     const std::uint32_t minQueued = queueSize * std::clamp(buffers, 2u, 16u);
-    const std::uint64_t waitStart = sceKernelGetProcessTime();
+    const std::uint64_t waitStart = hostMonotonicUs();
 
     while (SDL_GetQueuedAudioSize(port.device) > minQueued) {
-        if (sceKernelGetProcessTime() - waitStart > DRAIN_TIMEOUT_US) {
+        if (hostMonotonicUs() - waitStart > DRAIN_TIMEOUT_US) {
             SDL_ClearQueuedAudio(port.device);
             break;
         }
@@ -360,7 +368,7 @@ static void queueAudio(Port& port, const void* data, std::unique_lock<std::mutex
 }
 
 static void paceVirtualPort(Port& port, bool hasData, std::unique_lock<std::mutex>& lock) {
-    const std::uint64_t now = sceKernelGetProcessTime();
+    const std::uint64_t now = hostMonotonicUs();
     const auto queued = static_cast<std::int64_t>(port.virtualQueueEnd - now);
     if (queued <= 0) port.virtualQueueEnd = now;
     if (!hasData) {
@@ -424,7 +432,7 @@ static int allocatePort(int type, std::uint32_t len, std::uint32_t freq, Format 
             port.channels = channelsForFormat(format);
             port.lastDataOutputTime = 0;
             port.hostGain = HostGainRamp(freq / 100);
-            port.virtualQueueEnd = sceKernelGetProcessTime();
+            port.virtualQueueEnd = hostMonotonicUs();
             port.mixLevel = type == PORT_TYPE_PADSPK ? DEFAULT_PADSPK_MIX_LEVEL : DEFAULT_VOLUME;
             if (type == PORT_TYPE_VIBRATION) {
                 try {

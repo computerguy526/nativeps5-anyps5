@@ -181,6 +181,10 @@ extern "C" {
     ServeMainQueue(nullptr);
 }
 
+void Aps5HostServesMainQueue_nid_no_patch(void) {
+    mainLoopRunning.store(true, std::memory_order_release);
+}
+
 void Aps5RunOnMainThread_nid_no_patch(void (*function)(void*), void* context) {
     if (pthread_main_np() != 0 || !mainLoopRunning.load(std::memory_order_acquire)) {
         function(context);

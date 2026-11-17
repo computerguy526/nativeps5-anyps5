@@ -187,7 +187,12 @@ template <class TValue>
 TValue LoadAddressValue(TValue* address) {
     if (reinterpret_cast<std::uintptr_t>(address) % alignof(TValue) == 0) return std::atomic_ref<TValue>(*address).load();
     TValue value;
+#if defined(__x86_64__)
     asm volatile("mov %1, %0" : "=r"(value) : "m"(*reinterpret_cast<const unsigned char (*)[sizeof(TValue)]>(address)));
+#else
+    // nps5: unaligned plain load; the compiler emits a single ldr/ldur (unaligned access is legal on arm64).
+    __builtin_memcpy(&value, address, sizeof(TValue));
+#endif
     return value;
 }
 

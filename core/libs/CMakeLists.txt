@@ -161,6 +161,19 @@ add_custom_command(
 file(GLOB LIBS_DIRS LIST_DIRECTORIES true CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/prx/*)
 file(GLOB LIBS_CMAKE_LISTS CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/prx/*/CMakeLists.txt)
 list(REMOVE_ITEM LIBS_DIRS ${LIBC_DIR})
+if(APS5_HOST_ARM64)
+    # nps5: the arm64 host configuration builds an explicit allowlist (docs/nps5-arm64.md).
+    # libSceVideoOut, libScePad and libSceUserService come from the nps5-video branch; their nps5_* static targets are for the arm64 link.
+    set(APS5_HOST_ARM64_LIBS libkernel libSceAgcDriver libSceAgc libScePngDec libSceJpegDec libSceVideoOut libScePad libSceUserService CACHE STRING "prx library directories configured when APS5_HOST_ARM64=ON")
+    # Directories configured only for their static nps5_* targets (the shared .prx flavour needs libraries
+    # outside the allowlist, e.g. libSceSystemService, so it is not part of the `libs` target).
+    set(APS5_HOST_ARM64_STATIC_ONLY_LIBS libSceVideoOut libScePad libSceUserService CACHE STRING "allowlisted libraries without a .prx in the libs target")
+    set(hostArm64LibDirs)
+    foreach(hostArm64Lib IN LISTS APS5_HOST_ARM64_LIBS)
+        list(APPEND hostArm64LibDirs ${CMAKE_CURRENT_SOURCE_DIR}/prx/${hostArm64Lib})
+    endforeach()
+    set(LIBS_DIRS ${hostArm64LibDirs})
+endif()
 
 set(PATCHED_OUTPUTS ${LIBC_PATCHED})
 
@@ -178,6 +191,10 @@ foreach(LIB_DIR ${LIBS_DIRS})
             add_library(${LIB_NAME} SHARED EXCLUDE_FROM_ALL ${LIB_DIR}/Export.cpp)
             target_include_directories(${LIB_NAME} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
             configure_windows_unwind(${LIB_NAME})
+        endif()
+
+        if(APS5_HOST_ARM64 AND LIB_NAME IN_LIST APS5_HOST_ARM64_STATIC_ONLY_LIBS)
+            continue()
         endif()
 
         if(WIN32)
@@ -229,6 +246,7 @@ if(WIN32)
     file(GENERATE OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/release-implibs.txt CONTENT "${RELEASE_IMPLIBS}")
 endif()
 
+if(NOT APS5_HOST_ARM64)
 include(prx/libSceFreeType/PostScriptPrivate.cmake)
 
 target_link_libraries(libSceUsbStorageDialog PRIVATE libSceUserService)
@@ -242,6 +260,7 @@ target_include_directories(libwebrtc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${CMAKE
 target_link_libraries(libwebrtc PRIVATE fvad)
 if(MINGW OR CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_options(libwebrtc PRIVATE LINKER:--exclude-libs,ALL)
+endif()
 endif()
 
 if(BUILD_TESTING)
@@ -279,7 +298,9 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+if(NOT APS5_HOST_ARM64)
 include(prx/libSceFreeType/PostScriptInfo.cmake)
+endif()
 
 if(APS5_ENABLE_TRACY)
     set_target_properties(TracyClient PROPERTIES
@@ -331,10 +352,16 @@ elseif(TARGET mimalloc)
     list(APPEND PATCHED_OUTPUTS ${PATCHED_DIR}/${MIMALLOC_NAME})
 endif()
 
+if(NOT APS5_HOST_ARM64)
 include(prx/libSceFreeType/BuildInfo.cmake)
+endif()
 
 include(${CMAKE_SOURCE_DIR}/cmake/PatchedRuntimeTargets.cmake)
 add_patched_runtime_targets(libs ${PATCHED_OUTPUTS})
+if(APS5_HOST_ARM64)
+    # Everything below configures targets or tests of libraries the arm64 host build does not include.
+    return()
+endif()
 include(prx/libSceLibreSsl/ErrorQueue.cmake)
 include(prx/libSceLibreSsl/MemoryBio.cmake)
 include(prx/libSceLibreSsl/Cmac.cmake)

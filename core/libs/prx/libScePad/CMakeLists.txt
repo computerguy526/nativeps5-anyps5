@@ -161,3 +161,13 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libScePad>")
     endif()
 endif()
+
+# nps5: static flavour for the native arm64 macOS link. EXCLUDE_FROM_ALL.
+add_library(nps5_Pad STATIC EXCLUDE_FROM_ALL
+    ${CMAKE_CURRENT_SOURCE_DIR}/Export.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/InventoryExports.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/PadState.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/src/HostVolumeState.cpp
+)
+target_include_directories(nps5_Pad PRIVATE ${LIBS_INCLUDE_DIR})
+set_target_properties(nps5_Pad PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)

@@ -49,6 +49,8 @@ void TestTransferringMountPs4() {
     mount.title_id = &title;
     mount.dir_name = &dir;
     SaveDataMountResult result{};
+    // Fallback off: plain NOT_FOUND.
+    setenv("APS5_SAVEDATA_TRANSFER_FALLBACK", "0", 1);
     std::memset(&result, 0xAA, sizeof(result));
     Check(sceSaveDataTransferringMountPs4(&mount, &result) == SaveDataErrorNotFound, "TransferringMountPs4 returns NOT_FOUND");
     Check(result.mount_point.data[0] == '\0', "TransferringMountPs4 reports no mount point");
@@ -57,6 +59,17 @@ void TestTransferringMountPs4() {
     Check(result.mount_point.data[0] == '\0', "TransferringMount reports no mount point");
     Check(sceSaveDataTransferringMount(nullptr, nullptr) == SaveDataErrorNotFound, "TransferringMount handles null arguments");
     Check(sceSaveDataTransferringMountPs4(nullptr, nullptr) == SaveDataErrorNotFound, "TransferringMountPs4 handles null arguments");
+    // Fallback on (default): mounts the same directory like a create2|rdwr mount3.
+    unsetenv("APS5_SAVEDATA_TRANSFER_FALLBACK");
+    Check(sceSaveDataTransferringMount(nullptr, nullptr) == SaveDataErrorNotFound, "fallback: null arguments stay NOT_FOUND");
+    std::memset(&result, 0xAA, sizeof(result));
+    const int rc = sceSaveDataTransferringMount(&mount, &result);
+    Check(rc == 0, "fallback: TransferringMount mounts the directory");
+    Check(rc != 0 || std::strncmp(result.mount_point.data, "/savedata", 9) == 0, "fallback: a mount point is reported");
+    if (rc == 0) {
+        SaveDataMountPoint point = result.mount_point;
+        Check(sceSaveDataUmount(&point) == 0, "fallback: the mount can be unmounted");
+    }
 }
 
 void TestDirNameSearchPs4() {

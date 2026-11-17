@@ -13,6 +13,7 @@ namespace {
 }
 
 bool CompareExchange16(Uint128* target, Uint128& expected, Uint128 desired) {
+#if defined(__x86_64__)
     std::uint64_t low = static_cast<std::uint64_t>(expected);
     std::uint64_t high = static_cast<std::uint64_t>(expected >> 64);
     bool exchanged;
@@ -22,6 +23,10 @@ bool CompareExchange16(Uint128* target, Uint128& expected, Uint128 desired) {
                  : "memory");
     expected = (static_cast<Uint128>(high) << 64) | low;
     return exchanged;
+#else
+    // nps5: portable 16-byte compare-exchange (casp / ldxp+stxp on arm64), sequentially consistent like lock cmpxchg16b.
+    return __atomic_compare_exchange_n(target, &expected, desired, false, __ATOMIC_SEQ_CST, __ATOMIC_SEQ_CST);
+#endif
 }
 
 Uint128 ReadHalves(const Uint128* target) {

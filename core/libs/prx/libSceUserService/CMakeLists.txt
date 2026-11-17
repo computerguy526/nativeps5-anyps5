@@ -87,3 +87,9 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceUserService>")
     endif()
 endif()
+
+# nps5: static object-library flavour for the native arm64 macOS link (no guest .prx packaging).
+# EXCLUDE_FROM_ALL; the arm64 link wires this target in directly.
+add_library(nps5_UserService STATIC EXCLUDE_FROM_ALL Export.cpp InventoryExports.cpp Inventory1360Exports.cpp LegacyExports.cpp)
+target_include_directories(nps5_UserService PRIVATE ${LIBS_INCLUDE_DIR})
+set_target_properties(nps5_UserService PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)

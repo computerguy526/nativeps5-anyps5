@@ -156,6 +156,168 @@ void CheckRegisterMapped() {
     Require(KernelProtection(region.base + region.page) == PROT_NONE, "registering a protected page reserved again restored its old protection");
 }
 
+// The watch's table is a shadow of the host protection. A mapping changed behind its back must still be seen as written
+// (munmap / MAP_FIXED / raw mprotect that reopens an armed page), and a raw mprotect that closes a page the table thinks is
+// writable must reach the normal fault path instead of retrying forever.
+int PageProtection(const void* page);
+
+void CheckDesync() {
+    {
+        Region region(4);
+        GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+        static_cast<void>(region.Collect());
+        Require(PageProtection(region.base + region.page) == PROT_READ, "an armed page is not host read-only");
+        Require(::mmap(region.base + region.page, region.page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == region.base + region.page, "cannot map over an armed page");
+        region.base[region.page] = 7;
+        Require(::mprotect(region.base + 2 * region.page, region.page, PROT_READ | PROT_WRITE) == 0, "cannot reopen an armed page");
+        region.base[2 * region.page] = 9;
+        Require(region.Collect() == std::set<std::size_t>({1, 2}), "writes to pages the runtime remapped or reopened behind the watch were missed");
+        region.base[region.page] = 8;
+        region.base[3 * region.page] = 1;
+        Require(region.Collect() == std::set<std::size_t>({1, 3}), "pages reported once are not armed again");
+    }
+    for (const bool trapped : {false, true}) {
+        // A page the table thinks is writable (never collected) that the host made read-only: the fault must be delivered.
+        Region region(2);
+        const auto child = ::fork();
+        Require(child >= 0, "cannot fork a faulting child");
+        if (child == 0) {
+            ::alarm(3);
+            GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+            if (trapped) static_cast<void>(region.Collect());
+            if (::mprotect(region.base, region.page, PROT_READ) != 0) ::_exit(2);
+            if (trapped) {
+                // armed pages are host read-only already; the table's writable entry is reopened by a fault, so make the host close it again
+                region.base[0] = 1;
+                if (::mprotect(region.base, region.page, PROT_READ) != 0) ::_exit(2);
+            }
+            *static_cast<volatile std::uint8_t*>(region.base) = 1;
+            ::_exit(3);
+        }
+        int status = 0;
+        Require(::waitpid(child, &status, 0) == child, "cannot wait for a faulting child");
+        Require(WIFSIGNALED(status) && (WTERMSIG(status) == SIGBUS || WTERMSIG(status) == SIGSEGV), "a write to a page the host made read-only behind the table's back hangs instead of faulting");
+    }
+}
+
+void ResolveTrap(std::uintptr_t begin, std::uintptr_t end);
+
+void CheckProtectionTrapped() {
+    Region region(4);
+    std::uintptr_t runEnd = 0;
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    static_cast<void>(region.Collect());
+    Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap), "cannot set the read trap resolver");
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(1), region.page), "cannot set a read trap");
+    Require(GuestWriteWatchProtection_nid_postfix(region.Address(0), region.Address(4), &runEnd) == (PROT_READ | PROT_WRITE) && runEnd == region.Address(1), "a run does not end at a trapped page");
+    Require(GuestWriteWatchProtection_nid_postfix(region.Address(1), region.Address(4), &runEnd) == (PROT_READ | PROT_WRITE | ProtectionTrapped) && runEnd == region.Address(2), "a trapped page is not flagged");
+    GuestWriteWatchReleaseReads_nid_postfix(region.Address(1), region.page);
+    Require(GuestWriteWatchProtection_nid_postfix(region.Address(0), region.Address(4), &runEnd) == (PROT_READ | PROT_WRITE) && runEnd == region.Address(4), "a released page keeps its flag");
+}
+
+// GuestWriteWatchLogical answers from the table alone, and its layout generation tells a caller that kept an answer when it stops
+// holding: it must agree with GuestWriteWatchAccess in every state of a watched page, stay put over arming, write faults and read
+// traps (the guest sees the same protection), and move on mprotect, unregister and register.
+void CheckLogical() {
+    Region region(8);
+    std::uintptr_t begin = 0;
+    std::uintptr_t end = 0;
+    std::uintptr_t runEnd = 0;
+    std::uint64_t generation = 0;
+    Require(GuestWriteWatchLogical_nid_postfix(region.Address(2), &begin, &end, &generation) == -1, "an unwatched page has a logical protection");
+    const auto unwatched = GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(2));
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    Require(GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(2)) != unwatched, "registering a range keeps the layout generation");
+    const auto same = [&](std::size_t page, const char* message) {
+        const int logical = GuestWriteWatchLogical_nid_postfix(region.Address(page), &begin, &end, &generation);
+        const int access = GuestWriteWatchAccess_nid_postfix(region.Address(page), region.Address(page) + region.page, &runEnd);
+        Require(logical >= 0 && logical == (access & (PROT_READ | PROT_WRITE)), message);
+        Require(begin <= region.Address(page) && end > region.Address(page) && begin >= region.Address(0) && end <= region.Address(8), "a logical run does not hold its page inside the range");
+        Require(generation == GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(page)), "a logical answer carries another generation than the block's");
+    };
+    same(2, "a fresh watched page differs from the host");
+    Require(begin == region.Address(0) && end == region.Address(8), "a uniform range is not one run");
+    const auto kept = generation;
+    static_cast<void>(region.Collect());
+    same(2, "an armed page differs from the host");
+    static_cast<volatile std::uint8_t*>(region.base)[2 * region.page] = 1;
+    same(2, "a written page differs from the host");
+    Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap), "cannot set the read trap resolver");
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(3), region.page), "cannot set a read trap");
+    same(3, "a read-trapped page differs from the host");
+    Require(begin == region.Address(0) && end == region.Address(8), "a read trap splits a logical run");
+    GuestWriteWatchReleaseReads_nid_postfix(region.Address(3), region.page);
+    same(3, "a released page differs from the host");
+    Require(GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(2)) == kept, "arming, a write fault or a read trap moved the layout generation");
+    Require(GuestWriteWatchProtect_nid_postfix(reinterpret_cast<void*>(region.Address(4)), 2 * region.page, PROT_READ) == 0, "cannot protect watched pages");
+    Require(GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(2)) != kept, "mprotect of watched pages keeps the layout generation");
+    same(4, "a read-only page differs from the host");
+    Require(GuestWriteWatchLogical_nid_postfix(region.Address(4), &begin, &end, &generation) == PROT_READ && begin == region.Address(4) && end == region.Address(6), "a read-only run is not bounded by its pages");
+    same(3, "the page before a read-only run differs from the host");
+    Require(end == region.Address(4), "a writable run runs into read-only pages");
+    Require(GuestWriteWatchProtect_nid_postfix(reinterpret_cast<void*>(region.Address(6)), region.page, PROT_NONE) == 0, "cannot close a watched page");
+    same(6, "a closed page differs from the host");
+    Require(GuestWriteWatchLogical_nid_postfix(region.Address(6), &begin, &end, &generation) == 0, "a closed page is readable");
+    Require(GuestWriteWatchProtect_nid_postfix(region.base, region.bytes, PROT_READ | PROT_WRITE) == 0, "cannot reopen the range");
+    same(6, "a reopened page differs from the host");
+    const auto reopened = generation;
+    Require(GuestWriteWatchUnregister_nid_postfix(region.base, 4 * region.page), "cannot unregister half the range");
+    Require(GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(6)) != reopened, "unregistering watched pages keeps the layout generation");
+    Require(GuestWriteWatchLogical_nid_postfix(region.Address(2), &begin, &end, &generation) == -1, "an unregistered page has a logical protection");
+    same(5, "a page left watched differs from the host");
+    Require(begin == region.Address(4) && end == region.Address(8), "a run crosses into unregistered pages");
+    const auto half = GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(2));
+    Require(!GuestWriteWatchUnregister_nid_postfix(region.base, 4 * region.page), "unregistered pages unregister again");
+    Require(GuestWriteWatchProtect_nid_postfix(region.base, 4 * region.page, PROT_READ) == 0, "cannot protect unwatched pages");
+    Require(GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(2)) == half, "a change to unwatched pages moved the layout generation");
+    GuestWriteWatchUnregister_nid_postfix(region.base, region.bytes);
+}
+
+std::atomic<std::uintptr_t> g_accessRelease{0};
+std::atomic<std::uintptr_t> g_accessArm{0};
+std::atomic<std::size_t> g_accessBytes{0};
+
+void AccessHook(std::uintptr_t) {
+    if (const auto release = g_accessRelease.exchange(0)) GuestWriteWatchReleaseReads_nid_postfix(release, g_accessBytes.load());
+    if (const auto arm = g_accessArm.exchange(0)) Require(GuestWriteWatchTrapReads_nid_postfix(arm, g_accessBytes.load()), "cannot set a read trap from the access hook");
+}
+
+// A read trap released (or armed) by another thread while the accessibility of its page is being queried. The host mapping and the
+// watch table must be read as one state: a page seen PROT_NONE by the host query and untrapped by the table is the trap released
+// in between, not an unreadable page (the "guest memory is not readable" failure of a still-pending surface).
+void CheckAccessTrapRace() {
+    Region region(4);
+    std::uintptr_t runEnd = 0;
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    static_cast<void>(region.Collect());
+    Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap), "cannot set the read trap resolver");
+    Require(GuestWriteWatchAccess_nid_postfix(region.Address(0), region.Address(4), &runEnd) == (PROT_READ | PROT_WRITE) && runEnd == region.Address(4), "a watched open range is not readable and writable");
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(1), region.page), "cannot set a read trap");
+    Require(GuestWriteWatchAccess_nid_postfix(region.Address(0), region.Address(4), &runEnd) == (PROT_READ | PROT_WRITE) && runEnd == region.Address(1), "an access run does not end at a trapped page");
+    Require(GuestWriteWatchAccess_nid_postfix(region.Address(1), region.Address(4), &runEnd) == (PROT_READ | PROT_WRITE | ProtectionTrapped) && runEnd == region.Address(2), "a trapped page is not readable");
+    GuestWriteWatchSetAccessHook_nid_postfix(&AccessHook);
+    g_accessBytes = region.page;
+    g_accessRelease = region.Address(1);
+    const int released = GuestWriteWatchAccess_nid_postfix(region.Address(1), region.Address(4), &runEnd);
+    Require(g_accessRelease.load() == 0, "the access hook did not run");
+    Require((released & PROT_READ) != 0, "a read trap released during the access query reads as unreadable");
+    Require(released == (PROT_READ | PROT_WRITE), "a read trap released during the access query is not readable and writable");
+    g_accessArm = region.Address(2);
+    const int armed = GuestWriteWatchAccess_nid_postfix(region.Address(2), region.Address(4), &runEnd);
+    Require(g_accessArm.load() == 0, "the access hook did not run");
+    Require((armed & PROT_READ) != 0 && runEnd == region.Address(3), "a read trap armed during the access query reads as unreadable");
+    GuestWriteWatchSetAccessHook_nid_postfix(nullptr);
+    GuestWriteWatchReleaseReads_nid_postfix(region.Address(2), region.page);
+    Require(::mprotect(region.base + 3 * region.page, region.page, PROT_NONE) == 0, "cannot protect a page behind the watch");
+    Require(GuestWriteWatchAccess_nid_postfix(region.Address(3), region.Address(4), &runEnd) == PROT_NONE && runEnd == region.Address(4), "a page made PROT_NONE behind the watch reads as readable");
+    Require(::mprotect(region.base + 3 * region.page, region.page, PROT_READ | PROT_WRITE) == 0, "cannot restore a page behind the watch");
+    Region unwatched(2);
+    Require(GuestWriteWatchAccess_nid_postfix(unwatched.Address(0), unwatched.Address(2), &runEnd) == (PROT_READ | PROT_WRITE) && runEnd == unwatched.Address(2), "an unwatched range does not report its host protection");
+    Require(::munmap(unwatched.base + unwatched.page, unwatched.page) == 0, "cannot unmap a page");
+    Require(GuestWriteWatchAccess_nid_postfix(unwatched.Address(1), unwatched.Address(2), &runEnd) == ProtectionUnmapped && runEnd == unwatched.Address(2), "an unmapped page is not reported unmapped");
+    unwatched.bytes = unwatched.page;
+}
+
 void CheckHostWrite() {
     Region region(4);
     GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
@@ -583,6 +745,126 @@ void CheckReadTrapHolder() {
     ::alarm(0);
 }
 
+// A host import opens host write access over its range while its thread holds the lock the read trap resolver needs (the driver:
+// importRunAt holds the host imports mutex, and the resolver's write-back takes it in HostImportFor). BeginHostWrite resolved the
+// traps over the range on the importing thread, which then waited for itself (PPSA30552 hung at the intro -> gameplay switch), and
+// it waited for a resolver in flight on another thread, which waits for the importer. The trap-keeping host write does neither:
+// the trapped pages are open for the length of the write and closed again after it, and the traps resolve on their next access.
+void CheckReadTrapImport() {
+    ::alarm(20);
+    constexpr std::size_t Pages = 6;
+    Region region(Pages);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    static_cast<void>(region.Collect());
+    Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveHeldTrap), "cannot set the read trap resolver");
+    Traps().fill = 0x5a;
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(1), 2 * region.page) && GuestWriteWatchTrapReads_nid_postfix(region.Address(4), region.page), "cannot set the read traps");
+    const auto trapped = [&](std::size_t index) {
+        std::uintptr_t runEnd = 0;
+        return (GuestWriteWatchProtection_nid_postfix(region.Address(index), region.Address(index) + region.page, &runEnd) & ProtectionTrapped) != 0;
+    };
+    std::unique_lock gate(holderLock);
+    auto keeping = GuestWriteWatchBeginHostWriteKeepingTraps_nid_postfix(region.base, region.bytes);
+    Require(TakeTrapCalls().empty(), "a trap-keeping host write called the read trap resolver");
+    for (std::size_t index = 0; index < Pages; ++index) Require(PageProtection(region.base + index * region.page) == (PROT_READ | PROT_WRITE), "a trap-keeping host write left a page of its range closed");
+    Require(trapped(1) && trapped(2) && trapped(4) && !trapped(0) && !trapped(3) && !trapped(5), "a trap-keeping host write changed which pages are trapped");
+    std::memset(region.base, 0x11, region.bytes);
+    Require(TakeTrapCalls().empty(), "a store within a trap-keeping host write reached the read trap resolver");
+    Require(!GuestWriteWatchTrapReads_nid_postfix(region.Address(5), region.page), "a read trap was set inside an open host write");
+    Require(region.Collect() == std::set<std::size_t>({0, 3, 5}), "a trap-keeping host write must mark its untrapped pages written and leave its trapped pages as they were");
+    for (std::size_t index = 0; index < Pages; ++index) Require(PageProtection(region.base + index * region.page) == (PROT_READ | PROT_WRITE), "a collection closed a page of an open trap-keeping host write");
+    GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(keeping);
+    for (std::size_t index = 0; index < Pages; ++index) {
+        const bool kept = index == 1 || index == 2 || index == 4;
+        Require(trapped(index) == kept, "a trap-keeping host write changed which pages are trapped by its end");
+        Require(PageProtection(region.base + index * region.page) == (kept ? PROT_NONE : PROT_READ | PROT_WRITE), kept ? "a trapped page stayed open after the trap-keeping host write" : "an untrapped page is closed after the trap-keeping host write");
+    }
+    Require(TakeTrapCalls().empty(), "the end of a trap-keeping host write called the read trap resolver");
+    Require(region.Collect() == std::set<std::size_t>({0, 3, 5}), "a trapped page reads as written after the trap-keeping host write");
+    gate.unlock();
+    Require(ReadOnThread(region.base + region.page) == 0x5a, "a read after the trap-keeping host write did not see the bytes its trap stores");
+    Require(TakeTrapCalls().size() == 1, "the kept trap was not resolved exactly once by the read after the host write");
+    Require(!trapped(1) && !trapped(2) && trapped(4) && PageProtection(region.base + 4 * region.page) == PROT_NONE, "resolving one kept trap changed the other");
+    Require(region.Collect() == std::set<std::size_t>({1, 2}), "the stores of the resolver of a kept trap were not recorded");
+
+    // A resolver in flight on another thread, waiting for the lock the importer holds.
+    gate.lock();
+    std::uint8_t seen = 0;
+    std::thread reader([&] { seen = *reinterpret_cast<const volatile std::uint8_t*>(region.base + 4 * region.page); });
+    for (;;) {
+        {
+            const std::lock_guard lock(Traps().mutex);
+            if (!Traps().calls.empty()) break;
+        }
+        std::this_thread::yield();
+    }
+    keeping = GuestWriteWatchBeginHostWriteKeepingTraps_nid_postfix(region.base, region.bytes);
+    Require(PageProtection(region.base + 4 * region.page) == (PROT_READ | PROT_WRITE), "a trap-keeping host write left a page whose trap is being resolved closed");
+    GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(keeping);
+    gate.unlock();
+    reader.join();
+    Require(seen == 0x5a, "a read that waited for its trap across a trap-keeping host write did not see the bytes the trap stores");
+    Require(TakeTrapCalls().size() == 1, "the trap in flight across a trap-keeping host write was not resolved exactly once");
+    Require(!trapped(4) && PageProtection(region.base + 4 * region.page) != PROT_NONE, "a resolved trap is still closed after the trap-keeping host write");
+    ::alarm(0);
+}
+
+thread_local bool bypassing = false;
+
+// A thread that holds the GPU mutex reads a trapped page: the page opens without the pending image (the bypass). The next
+// TrapReads for the same range must close it again, or a later CPU read sees the stale bytes with no fault.
+void CheckReadTrapBypass() {
+    ::alarm(40);
+    constexpr std::size_t Pages = 4;
+    Region region(Pages);
+    // The resolver writes through a second view, so its own stores never fault on the trapped pages.
+    char path[] = "/tmp/anyps5-read-trap-XXXXXX";
+    const int file = ::mkstemp(path);
+    Require(file >= 0, "cannot create the shared backing");
+    ::unlink(path);
+    Require(::ftruncate(file, static_cast<off_t>(region.bytes)) == 0, "cannot size the shared backing");
+    Require(::mmap(region.base, region.bytes, PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED, file, 0) == region.base, "cannot map the shared backing");
+    auto* alias = static_cast<std::uint8_t*>(::mmap(nullptr, region.bytes, PROT_READ | PROT_WRITE, MAP_SHARED, file, 0));
+    Require(alias != MAP_FAILED, "cannot map the second view of the shared backing");
+    ::close(file);
+    Traps().alias = alias - region.base;
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    static_cast<void>(region.Collect());
+    Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap), "cannot set the read trap resolver");
+    GuestWriteWatchSetReadTrapBypass_nid_postfix(+[] { return bypassing; });
+    for (int round = 0; round < 200; ++round) {
+        const auto fill = static_cast<std::uint8_t>(1 + round % 250);
+        std::memset(region.base, 0, region.bytes);
+        Traps().fill = fill;
+        Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(0), region.bytes), "cannot set a read trap");
+        const auto opened = static_cast<std::size_t>(round) % Pages;
+        std::uint8_t holderSaw = 0xff;
+        std::thread([&] {
+            bypassing = true;
+            holderSaw = *reinterpret_cast<const volatile std::uint8_t*>(region.base + opened * region.page);
+        }).join();
+        Require(holderSaw == 0, "the holder of the GPU mutex was made to wait for the resolver");
+        Require(TakeTrapCalls().empty(), "the bypass resolved the trap");
+        // The driver's next idle asks for the same trap again.
+        Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(0), region.bytes), "cannot set the read trap again");
+        std::atomic<std::size_t> stale{0};
+        std::array<std::thread, 4> readers;
+        for (std::size_t index = 0; index < readers.size(); ++index) {
+            readers[index] = std::thread([&, index] {
+                const auto page = (opened + index) % Pages;
+                if (*reinterpret_cast<const volatile std::uint8_t*>(region.base + page * region.page + 1) != fill) stale.fetch_add(1);
+            });
+        }
+        for (auto& reader : readers) reader.join();
+        Require(stale.load() == 0, "a CPU read of a page the bypass opened saw stale bytes: the trap was not re-armed");
+        Require(TakeTrapCalls().size() == 1, "the re-armed trap was not resolved exactly once");
+        GuestWriteWatchReleaseReads_nid_postfix(region.Address(0), region.bytes);
+    }
+    Traps().alias = 0;
+    ::munmap(alias, region.bytes);
+    ::alarm(0);
+}
+
 void CheckReadTrapThreads() {
     ::alarm(20);
     constexpr std::size_t Threads = 4;
@@ -863,6 +1145,423 @@ void CheckFaultAhead(bool enabled) {
 
 }
 
+std::atomic<int> g_unclaimedFaults{0};
+std::atomic<int> g_claimedFaults{0};
+
+void RuntimeFaultHandler(int, siginfo_t* info, void* context) {
+    const auto esr = static_cast<ucontext_t*>(context)->uc_mcontext->__es.__esr;
+    const bool write = ((esr >> 26) == 0x24 || (esr >> 26) == 0x25) && (esr & (1u << 6)) != 0;
+    const auto address = reinterpret_cast<std::uintptr_t>(info->si_addr);
+    if (GuestWriteWatchHandleAccess_nid_postfix(address, write ? 1 : 0)) {
+        g_claimedFaults.fetch_add(1);
+        return;
+    }
+    g_unclaimedFaults.fetch_add(1);
+    const auto page = static_cast<std::uintptr_t>(::getpagesize());
+    ::mprotect(reinterpret_cast<void*>(address & ~(page - 1)), page, PROT_READ | PROT_WRITE);
+}
+
+void CheckHostRuntime() {
+    ::alarm(25);
+    Require(GuestWriteWatchAvailable_nid_postfix(), "write watch is unavailable");
+    struct sigaction action {};
+    action.sa_sigaction = &RuntimeFaultHandler;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    Require(sigaction(SIGBUS, &action, nullptr) == 0 && sigaction(SIGSEGV, &action, nullptr) == 0, "cannot install the runtime's handler above the watch's");
+    const auto page = static_cast<std::size_t>(::getpagesize());
+    {
+        Region region(8);
+        Require(::mprotect(region.base, region.bytes, PROT_NONE) == 0, "cannot take the access to the region");
+        GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+        Require(GuestWriteWatchProtect_nid_postfix(region.base, region.bytes, PROT_READ | PROT_WRITE) == 0, "cannot protect a watched range");
+        Require(region.Collect() == All(8), "a new range is not reported in full");
+        region.base[3 * page + 7] = 9;
+        Require(g_unclaimedFaults.load() == 0 && g_claimedFaults.load() == 1, "a write to a range registered before it became writable is not the watch's");
+        Require(region.Collect() == std::set<std::size_t>({3}), "that write is not reported");
+        Require(GuestWriteWatchProtect_nid_postfix(region.base + page, page, PROT_READ) == 0, "cannot make a watched page read-only");
+        Require(region.Collect() == std::set<std::size_t>({1}), "a protection change is not reported as a possible write");
+        region.base[page] = 1;
+        Require(g_unclaimedFaults.load() == 1, "the watch claimed a write to a page the guest made read-only");
+        Require(GuestWriteWatchProtect_nid_postfix(region.base + page, page, PROT_READ | PROT_WRITE) == 0, "cannot restore the page");
+        Region unwatched(1);
+        Require(::mprotect(unwatched.base, page, PROT_READ) == 0, "cannot protect the unwatched page");
+        unwatched.base[0] = 1;
+        Require(g_unclaimedFaults.load() == 2, "the watch claimed a fault outside every watched range");
+    }
+    g_unclaimedFaults = 0;
+    {
+        constexpr std::size_t Threads = 6;
+        constexpr std::size_t PagesPerThread = 48;
+        constexpr int Rounds = 60;
+        Region region(Threads * PagesPerThread);
+        GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+        Require(region.Collect() == All(Threads * PagesPerThread), "a new range is not reported in full");
+        std::atomic<bool> start{false};
+        std::atomic<std::size_t> finished{0};
+        std::array<std::thread, Threads> writers;
+        for (std::size_t thread = 0; thread < Threads; ++thread) {
+            writers[thread] = std::thread([&, thread] {
+                while (!start.load()) std::this_thread::yield();
+                for (int round = 1; round <= Rounds; ++round)
+                    for (std::size_t index = 0; index < PagesPerThread; ++index) region.base[(thread * PagesPerThread + index) * region.page] = static_cast<std::uint8_t>(round);
+                finished.fetch_add(1);
+            });
+        }
+        std::vector<std::uint8_t> seen(Threads * PagesPerThread, 0);
+        const auto take = [&] {
+            for (const auto index : region.Collect()) seen[index] = region.base[index * region.page];
+        };
+        start.store(true);
+        while (finished.load() != Threads) {
+            take();
+            std::this_thread::yield();
+        }
+        for (auto& writer : writers) writer.join();
+        take();
+        for (std::size_t index = 0; index < seen.size(); ++index) Require(seen[index] == static_cast<std::uint8_t>(Rounds), "a write that raced a collection was not reported through the runtime's handler");
+        Require(g_unclaimedFaults.load() == 0, "a write to a watched page was not claimed on some thread");
+    }
+    {
+        Region region(6);
+        GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+        Require(region.Collect() == All(6), "a new range is not reported in full");
+        Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap), "cannot set the read trap resolver");
+        auto& log = Traps();
+        log.fill = 0x5a;
+        log.bracket = true;
+        Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(1), page), "cannot set a read trap");
+        Require(ReadOnThread(region.base + page + 5) == 0x5a, "a trapped read through the runtime's handler does not see the resolver's bytes");
+        Require(TakeTrapCalls().size() == 1, "the trapped read was not resolved exactly once");
+        Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(3), page), "cannot set a second read trap");
+        std::thread([&] { region.base[3 * page + 1] = 0x77; }).join();
+        Require(region.base[3 * page] == 0x5a && region.base[3 * page + 1] == 0x77, "a write to a trapped page did not land over the resolver's bytes");
+        Require(TakeTrapCalls().size() == 1, "the trapped write was not resolved exactly once");
+        Require(region.Collect().count(3) == 1, "a write to a trapped page is not reported");
+        Require(g_unclaimedFaults.load() == 0, "a trapped access was not claimed");
+        int descriptors[2];
+        Require(::pipe(descriptors) == 0, "cannot create a pipe");
+        Require(::write(descriptors[1], "12345678", 8) == 8, "cannot fill the pipe");
+        Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(4), page), "cannot set a third read trap");
+        errno = 0;
+        Require(::read(descriptors[0], region.base + 4 * page, 8) == -1 && errno == EFAULT, "a system call wrote a trapped page without a host write");
+        GuestWriteWatchBeginHostWrite_nid_postfix(region.base + 4 * page, 8);
+        Require(::read(descriptors[0], region.base + 4 * page, 8) == 8, "a system call cannot write a trapped page under a host write");
+        GuestWriteWatchEndHostWrite_nid_postfix(region.base + 4 * page, 8);
+        Require(std::memcmp(region.base + 4 * page, "12345678", 8) == 0 && region.base[4 * page + 8] == 0x5a, "the host write did not land over the resolver's bytes");
+        Require(region.Collect().count(4) == 1, "the host write to a trapped page is not reported");
+        log.bracket = false;
+        ::close(descriptors[0]);
+        ::close(descriptors[1]);
+    }
+}
+
+// The guest releases or replaces a watched mapping while another thread asks the watch table what it may read (the driver's
+// describePagesHost with APS5_WATCH_RUNS: GuestWriteWatchLogical, kept per thread for as long as the layout generation stands).
+// Resetting the pages first and unregistering after (DirectMemory Unmap, the fixed remaps) left the table calling a page
+// accessible that the host had taken away, with the generation unmoved: the reader read it and faulted. ReplaceMapping
+// unregisters first. The first round is the old order, to show that this test sees the window.
+void CheckUnmapOrder() {
+    ::alarm(20);
+    for (const bool ordered : {false, true}) {
+        Region region(4);
+        GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+        static_cast<void>(region.Collect());
+        std::uintptr_t begin = 0;
+        std::uintptr_t end = 0;
+        std::uint64_t kept = 0;
+        Require(GuestWriteWatchLogical_nid_postfix(region.Address(1), &begin, &end, &kept) == (PROT_READ | PROT_WRITE), "a watched page is not accessible before its mapping goes");
+        bool keptStands = false;
+        bool tableAccessible = false;
+        const auto replace = [&] {
+            Require(::mmap(region.base, region.bytes, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == region.base, "cannot reset the mapping");
+            // Another thread asks now, with the pages gone.
+            std::thread([&] {
+                keptStands = GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(1)) == kept;
+                std::uintptr_t runBegin = 0;
+                std::uintptr_t runEnd = 0;
+                std::uint64_t generation = 0;
+                tableAccessible = GuestWriteWatchLogical_nid_postfix(region.Address(1), &runBegin, &runEnd, &generation) > 0;
+            }).join();
+        };
+        if (ordered) {
+            ReplaceMapping(region.base, region.bytes, replace);
+        } else {
+            replace();
+            GuestWriteWatchUnregister_nid_postfix(region.base, region.bytes);
+        }
+        if (ordered) {
+            // (unregistering after the reset also gave the armed pages their old protection back: the reset pages were open again)
+            Require(PageProtection(region.base + region.page) == PROT_NONE, "the reset mapping did not stay closed");
+            Require(!keptStands, "an answer kept from the watch table still stands after the host mapping was replaced");
+            Require(!tableAccessible, "the watch table calls a page accessible after the host mapping was taken away");
+        } else {
+            Require(keptStands && tableAccessible, "the old order (reset, then unregister) no longer shows the stale answer: this test does not see the window");
+        }
+        std::uintptr_t runEnd = 0;
+        if (ordered) Require((GuestWriteWatchAccess_nid_postfix(region.Address(1), region.Address(2), &runEnd) & (PROT_READ | PROT_WRITE)) == 0, "a reset page is accessible to the host query");
+    }
+    // The fixed remap: new pages with another protection under a registered range. Registered again after the mmap only, an
+    // armed page kept its old (writable) protection in the table.
+    Region region(4);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    static_cast<void>(region.Collect());
+    Require(ReplaceMapping(region.base, region.bytes, [&] { return ::mmap(region.base, region.bytes, PROT_READ, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == region.base; }), "cannot remap the range");
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    std::uintptr_t begin = 0;
+    std::uintptr_t end = 0;
+    std::uint64_t generation = 0;
+    Require(GuestWriteWatchLogical_nid_postfix(region.Address(1), &begin, &end, &generation) == PROT_READ, "a range remapped read-only keeps the protection of the pages it replaced");
+    Require(region.Collect() == All(4), "a remapped range is not reported in full");
+    ::alarm(0);
+}
+
+// A trap-keeping host write (a host import) opens its trapped pages writable: the import needs that (Metal makes a no-copy
+// buffer over a range with a read-only page into one the GPU cannot write through, without an error). A CPU store to such a
+// page inside the write therefore does not fault. With APS5_IMPORT_WINDOW_STORES=1 it is not lost for the watch: the page
+// reads as written from the end of the write on. A trapped page nothing stored to must not (a trapped page that reads as
+// written tells the driver the CPU stored over the pending image).
+void CheckHostWriteStore(char** argv) {
+    if (std::getenv("APS5_IMPORT_WINDOW_STORES") == nullptr) {
+        // The watch reads its switches when the process starts.
+        ::setenv("APS5_IMPORT_WINDOW_STORES", "1", 1);
+        ::execv(argv[0], argv);
+        Require(false, "cannot start the test again with APS5_IMPORT_WINDOW_STORES=1");
+    }
+    ::alarm(20);
+    constexpr std::size_t Pages = 6;
+    Region region(Pages);
+    std::memset(region.base, 0x11, region.bytes);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    static_cast<void>(region.Collect());
+    Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap), "cannot set the read trap resolver");
+    Traps().fill = 0x5a;
+    Traps().limit = 16;
+    for (const std::size_t index : {1u, 3u, 4u}) Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(index), region.page), "cannot set the read traps");
+    const auto trapped = [&](std::size_t index) {
+        std::uintptr_t runEnd = 0;
+        return (GuestWriteWatchProtection_nid_postfix(region.Address(index), region.Address(index) + region.page, &runEnd) & ProtectionTrapped) != 0;
+    };
+    const auto token = GuestWriteWatchBeginHostWriteKeepingTraps_nid_postfix(region.base, region.bytes);
+    Require(token != 0, "a trap-keeping host write has no token");
+    for (const std::size_t index : {1u, 3u, 4u}) Require(PageProtection(region.base + index * region.page) == (PROT_READ | PROT_WRITE), "a trap-keeping host write does not open its armed trapped pages for writing: a host import over them cannot be written by the GPU");
+    region.base[region.page + 100] = 0x42;
+    region.base[3 * region.page + 100] = 0x11;
+    Require(TakeTrapCalls().empty(), "a store within a trap-keeping host write reached the read trap resolver");
+    Require(region.Collect() == std::set<std::size_t>({0, 2, 5}), "a trapped page reads as written inside the trap-keeping host write");
+    GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(token);
+    for (const std::size_t index : {1u, 3u, 4u}) Require(trapped(index) && PageProtection(region.base + index * region.page) == PROT_NONE, "a trapped page stayed open after the trap-keeping host write");
+    Require(TakeTrapCalls().empty(), "the end of a trap-keeping host write called the read trap resolver");
+    Require(region.Collect() == std::set<std::size_t>({0, 1, 2, 5}), "a CPU store to a read-trapped page inside a trap-keeping host write is lost for the watch (or a trapped page nothing stored to reads as written)");
+    Require(trapped(1) && PageProtection(region.base + region.page) == PROT_NONE, "reporting the store opened its trapped page");
+    Require(region.Collect().empty(), "a page reported once is reported again");
+    // The traps resolve as before; the store outside the resolver's bytes is still there.
+    Require(ReadOnThread(region.base + region.page) == 0x5a && TakeTrapCalls().size() == 1, "the kept trap was not resolved by the read after the host write");
+    Require(region.base[region.page + 100] == 0x42, "the store itself was lost");
+    Require(region.Collect() == std::set<std::size_t>({1}), "the resolver's stores are not recorded");
+    region.base[region.page] = 1;
+    Require(region.Collect() == std::set<std::size_t>({1}), "the page is not armed again after its report");
+    // A store on another thread while the write is open, and a second write over the same pages.
+    const auto first = GuestWriteWatchBeginHostWriteKeepingTraps_nid_postfix(region.base, region.bytes);
+    const auto second = GuestWriteWatchBeginHostWriteKeepingTraps_nid_postfix(region.base, region.bytes);
+    for (const std::size_t index : {3u, 4u}) Require(PageProtection(region.base + index * region.page) == (PROT_READ | PROT_WRITE), "a second trap-keeping host write closed a trapped page of the first");
+    std::thread([&] { *static_cast<volatile std::uint8_t*>(region.base + 4 * region.page + 7) = 0x77; }).join();
+    GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(first);
+    Require(PageProtection(region.base + 4 * region.page) == (PROT_READ | PROT_WRITE), "the end of one trap-keeping host write closed a page another still holds");
+    GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(second);
+    Require(TakeTrapCalls().empty(), "a store within two trap-keeping host writes reached the read trap resolver");
+    Require(region.Collect() == std::set<std::size_t>({0, 1, 2, 4, 5}), "a store on another thread inside two trap-keeping host writes is lost for the watch");
+    Require(trapped(3) && trapped(4), "the trap-keeping host writes took a trap off");
+    GuestWriteWatchReleaseReads_nid_postfix(region.Address(3), region.page);
+    GuestWriteWatchReleaseReads_nid_postfix(region.Address(4), region.page);
+    Require(region.base[4 * region.page + 7] == 0x77 && region.Collect().empty(), "a released trap reads as written");
+    // A store racing the begin or the end of the write either faults (and resolves its trap) or is found by its bytes: never lost.
+    for (int round = 0; round < 600; ++round) {
+        static_cast<void>(region.Collect());
+        Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(3), region.page), "cannot set the read trap");
+        const auto value = static_cast<std::uint8_t>(1 + round % 200);
+        std::atomic<bool> go{false};
+        std::thread writer([&] {
+            while (!go.load(std::memory_order_acquire)) {}
+            for (int spin = 0; spin < (round % 7) * 40; ++spin) static_cast<void>(go.load(std::memory_order_relaxed));
+            *static_cast<volatile std::uint8_t*>(region.base + 3 * region.page + 200) = value;
+        });
+        go.store(true, std::memory_order_release);
+        const auto racing = GuestWriteWatchBeginHostWriteKeepingTraps_nid_postfix(region.base, region.bytes);
+        for (int spin = 0; spin < (round % 5) * 30; ++spin) static_cast<void>(go.load(std::memory_order_relaxed));
+        GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(racing);
+        writer.join();
+        Require(region.Collect().count(3) == 1, "a store racing a trap-keeping host write is lost for the watch");
+        GuestWriteWatchReleaseReads_nid_postfix(region.Address(3), region.page);
+        Require(region.base[3 * region.page + 200] == value, "a store racing a trap-keeping host write did not land");
+        static_cast<void>(TakeTrapCalls());
+    }
+    Traps().limit = 0;
+    ::alarm(0);
+}
+
+// A trap-keeping host write is ended by its token only. Matched by range, the end of a plain host write over the same range
+// ended the import's window as well: its trapped pages closed (PROT_NONE) under the running import.
+void CheckHostWriteToken() {
+    ::alarm(20);
+    constexpr std::size_t Pages = 4;
+    Region region(Pages);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    static_cast<void>(region.Collect());
+    Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap), "cannot set the read trap resolver");
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(1), region.page), "cannot set the read trap");
+    const auto first = GuestWriteWatchBeginHostWriteKeepingTraps_nid_postfix(region.base, region.bytes);
+    const auto second = GuestWriteWatchBeginHostWriteKeepingTraps_nid_postfix(region.base, region.bytes);
+    Require(first != 0 && second != 0 && first != second, "two trap-keeping host writes over one range share a token");
+    // The end of a plain host write over the same pages (another thread's, or an unpaired one).
+    GuestWriteWatchEndHostWrite_nid_postfix(region.base, region.bytes);
+    GuestWriteWatchEndHostWrite_nid_postfix(region.base, region.bytes);
+    Require(PageProtection(region.base + region.page) == (PROT_READ | PROT_WRITE), "the end of a plain host write closed a trapped page under a trap-keeping host write of the same range");
+    Require(!GuestWriteWatchTrapReads_nid_postfix(region.Address(2), region.page), "the end of a plain host write ended a trap-keeping host write: a read trap was set inside it");
+    static_cast<void>(region.Collect());
+    Require(PageProtection(region.base + region.page) == (PROT_READ | PROT_WRITE), "a collection closed a trapped page of a trap-keeping host write after the end of a plain one");
+    // A plain host write over the same range, begun and ended inside: it resolves the trap (the page joins the open write).
+    GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(first);
+    Require(PageProtection(region.base + region.page) == (PROT_READ | PROT_WRITE), "the end of one trap-keeping host write closed a page another still holds");
+    Require(!GuestWriteWatchTrapReads_nid_postfix(region.Address(2), region.page), "a read trap was set inside the remaining trap-keeping host write");
+    GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(first);
+    Require(PageProtection(region.base + region.page) == (PROT_READ | PROT_WRITE), "a token ended twice ended another host write");
+    GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(second);
+    Require(PageProtection(region.base + region.page) == PROT_NONE, "the last trap-keeping host write left its trapped page open");
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(2), region.page), "a read trap cannot be set after every host write ended");
+    GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(0);
+    // A plain write is still ended by its range, with a trap-keeping one of the same range open.
+    GuestWriteWatchReleaseReads_nid_postfix(region.Address(1), region.page);
+    GuestWriteWatchReleaseReads_nid_postfix(region.Address(2), region.page);
+    static_cast<void>(region.Collect());
+    const auto third = GuestWriteWatchBeginHostWriteKeepingTraps_nid_postfix(region.base, region.bytes);
+    GuestWriteWatchBeginHostWrite_nid_postfix(region.base, region.bytes);
+    GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(third);
+    Require(!GuestWriteWatchTrapReads_nid_postfix(region.Address(2), region.page), "the end of a trap-keeping host write ended the plain one of the same range");
+    GuestWriteWatchEndHostWrite_nid_postfix(region.base, region.bytes);
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(2), region.page), "a plain host write is not ended by its range");
+    GuestWriteWatchReleaseReads_nid_postfix(region.Address(2), region.page);
+    ::alarm(0);
+}
+
+// The guest's mprotect runs inside a mutation of the allocation registry. GuestWriteWatchProtect resolves the read traps over the
+// range on the calling thread, and the resolver needs the lock of an importer that is itself waiting for the registry: neither
+// moved. ProtectKeepingTraps takes the watch lock only; the trap stays armed and takes the new protection when it resolves.
+// `registry` and holderLock stand in for the registry mutex and the host imports mutex. Dies on its alarm with
+// GuestWriteWatchProtect in place of GuestWriteWatchProtectKeepingTraps.
+void CheckProtectKeepingTraps() {
+    ::alarm(20);
+    constexpr std::size_t Pages = 4;
+    Region region(Pages);
+    GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+    static_cast<void>(region.Collect());
+    Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveHeldTrap), "cannot set the read trap resolver");
+    Traps().fill = 0x5a;
+    // Before the registry is locked the traps resolve on the calling thread.
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(2), region.page), "cannot set a read trap");
+    GuestWriteWatchResolveReadTraps_nid_postfix(region.Address(0), region.bytes);
+    Require(TakeTrapCalls().size() == 1 && PageProtection(region.base + 2 * region.page) != PROT_NONE && region.base[2 * region.page] == 0x5a, "the read traps over a range were not resolved on request");
+    static_cast<void>(region.Collect());
+
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(1), region.page), "cannot set the read trap");
+    std::mutex registry;
+    std::unique_lock mutation(registry);
+    std::atomic<bool> importing{false};
+    std::thread importer([&] {
+        const std::lock_guard imports(holderLock);
+        importing.store(true);
+        const std::lock_guard lease(registry);
+    });
+    while (!importing.load()) std::this_thread::yield();
+    const auto logical = [&](std::size_t index) {
+        std::uintptr_t begin = 0;
+        std::uintptr_t end = 0;
+        std::uint64_t generation = 0;
+        return GuestWriteWatchLogical_nid_postfix(region.Address(index), &begin, &end, &generation);
+    };
+    const auto trapped = [&](std::size_t index) {
+        std::uintptr_t runEnd = 0;
+        return (GuestWriteWatchProtection_nid_postfix(region.Address(index), region.Address(index) + region.page, &runEnd) & ProtectionTrapped) != 0;
+    };
+    const auto before = GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(1));
+    Require(GuestWriteWatchProtectKeepingTraps_nid_postfix(region.base, region.bytes, PROT_READ) == 0, "cannot protect a range with an armed read trap");
+    Require(TakeTrapCalls().empty(), "a protect that keeps read traps called the resolver");
+    Require(GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(1)) != before, "a protect that keeps read traps kept the layout generation");
+    Require(trapped(1) && PageProtection(region.base + region.page) == PROT_NONE, "a protect that keeps read traps opened a trapped page");
+    for (const std::size_t index : {0u, 2u, 3u}) Require(PageProtection(region.base + index * region.page) == PROT_READ, "a protect that keeps read traps did not protect the untrapped pages");
+    for (std::size_t index = 0; index < Pages; ++index) Require(logical(index) == PROT_READ, "a protect that keeps read traps did not change the logical protection of every page");
+    Require(region.Collect() == std::set<std::size_t>({0, 2, 3}), "a protect that keeps read traps must report its untrapped pages and leave the trapped one as it was");
+    Require(GuestWriteWatchProtectKeepingTraps_nid_postfix(region.base, region.bytes, PROT_READ | PROT_WRITE) == 0, "cannot reopen a range with an armed read trap");
+    Require(trapped(1) && PageProtection(region.base + region.page) == PROT_NONE && logical(1) == (PROT_READ | PROT_WRITE), "reopening a range changed its trapped page");
+    Require(TakeTrapCalls().empty(), "a protect that keeps read traps called the resolver");
+    mutation.unlock();
+    importer.join();
+    static_cast<void>(region.Collect());
+    Require(ReadOnThread(region.base + region.page) == 0x5a, "a read after the protect did not see the bytes the kept trap stores");
+    Require(TakeTrapCalls().size() == 1 && !trapped(1), "the kept trap was not resolved exactly once by the read after the protect");
+    Require(region.Collect() == std::set<std::size_t>({1}), "the stores of the resolver of a kept trap were not recorded after the protect");
+    Require(PageProtection(region.base + region.page) == PROT_READ, "a page whose trap resolved after the protect is not armed");
+    region.base[region.page + 1] = 7;
+    Require(region.Collect() == std::set<std::size_t>({1}), "a store to a page whose trap resolved after the protect is not recorded");
+    // A kept trap takes a closing protection when it resolves.
+    Require(GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTrap), "cannot set the read trap resolver");
+    Require(GuestWriteWatchTrapReads_nid_postfix(region.Address(3), region.page), "cannot set the read trap");
+    Require(GuestWriteWatchProtectKeepingTraps_nid_postfix(region.base + 3 * region.page, region.page, PROT_READ) == 0, "cannot protect a trapped page");
+    GuestWriteWatchReleaseReads_nid_postfix(region.Address(3), region.page);
+    Require(PageProtection(region.base + 3 * region.page) == PROT_READ && logical(3) == PROT_READ, "a trap released after the protect does not leave the new protection");
+    ::alarm(0);
+}
+
+std::atomic<int> g_resyncFaults{0};
+
+void ResyncFaultHandler(int, siginfo_t* info, void*) {
+    const auto address = reinterpret_cast<std::uintptr_t>(info->si_addr);
+    if (GuestWriteWatchHandleFault_nid_postfix(address)) return;
+    g_resyncFaults.fetch_add(1);
+    const auto page = static_cast<std::uintptr_t>(::getpagesize());
+    ::mprotect(reinterpret_cast<void*>(address & ~(page - 1)), page, PROT_READ | PROT_WRITE);
+}
+
+// Two ways the table changed the protection the guest sees without telling the callers that keep answers (layout generation),
+// or kept a protection that no longer holds.
+void CheckLayoutResync() {
+    ::alarm(20);
+    struct sigaction action {};
+    action.sa_sigaction = &ResyncFaultHandler;
+    action.sa_flags = SA_SIGINFO;
+    sigemptyset(&action.sa_mask);
+    Require(sigaction(SIGBUS, &action, nullptr) == 0 && sigaction(SIGSEGV, &action, nullptr) == 0, "cannot install the fault handler above the watch's");
+    std::uintptr_t begin = 0;
+    std::uintptr_t end = 0;
+    std::uint64_t generation = 0;
+    {
+        // A write fault on a page the table calls writable and the host does not (a raw mprotect behind the table): the fault
+        // path takes the host's protection into the table. Kept answers for the page must go with it.
+        Region region(2);
+        GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+        Require(GuestWriteWatchLogical_nid_postfix(region.Address(0), &begin, &end, &generation) == (PROT_READ | PROT_WRITE), "a fresh page is not writable");
+        const auto kept = generation;
+        Require(::mprotect(region.base, region.page, PROT_READ) == 0, "cannot protect the page behind the table");
+        *static_cast<volatile std::uint8_t*>(region.base) = 1;
+        Require(g_resyncFaults.load() == 1, "the watch claimed a write to a page the host made read-only");
+        Require(GuestWriteWatchLogical_nid_postfix(region.Address(0), &begin, &end, &generation) == PROT_READ, "the fault did not take the host protection into the table");
+        Require(GuestWriteWatchLayoutGeneration_nid_postfix(region.Address(0)) != kept, "the table changed a page's protection on a fault and kept the layout generation");
+    }
+    {
+        // Registering over an entry whose range now has a hole: the hole must not keep the protection of the mapping that is gone.
+        Region region(4);
+        GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+        static_cast<void>(region.Collect());
+        Require(::munmap(region.base + 2 * region.page, region.page) == 0, "cannot unmap a page of the range");
+        GuestWriteWatchRegister_nid_postfix(region.base, region.bytes);
+        Require(GuestWriteWatchLogical_nid_postfix(region.Address(2), &begin, &end, &generation) == 0, "an unmapped page inside a range registered again keeps its old protection");
+        Require(begin == region.Address(2) && end == region.Address(3), "the hole's run runs into mapped pages");
+        Require(GuestWriteWatchLogical_nid_postfix(region.Address(1), &begin, &end, &generation) == (PROT_READ | PROT_WRITE) && GuestWriteWatchLogical_nid_postfix(region.Address(3), &begin, &end, &generation) == (PROT_READ | PROT_WRITE), "the pages around a hole lost their protection");
+        Require(::mmap(region.base + 2 * region.page, region.page, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON | MAP_FIXED, -1, 0) == region.base + 2 * region.page, "cannot map the hole again");
+    }
+    ::alarm(0);
+}
+
 int main(int argc, char** argv) {
     try {
         Require(argc == 2, "expected collect, fresh, armed, register, mapped, host, empty, protection, overlaps, threads, raised, fault-ahead, fault-ahead-off, read-trap, read-trap-threads, read-trap-fault, read-trap-late or read-trap-fault-bound");
@@ -884,10 +1583,22 @@ int main(int argc, char** argv) {
         else if (mode == "fault-ahead-off") CheckFaultAhead(false);
         else if (mode == "read-trap") CheckReadTrap();
         else if (mode == "read-trap-threads") CheckReadTrapThreads();
+        else if (mode == "desync") CheckDesync();
+        else if (mode == "protection-trapped") CheckProtectionTrapped();
+        else if (mode == "access-trap-race") CheckAccessTrapRace();
+        else if (mode == "logical") CheckLogical();
         else if (mode == "read-trap-holder") CheckReadTrapHolder();
+        else if (mode == "read-trap-bypass") CheckReadTrapBypass();
+        else if (mode == "read-trap-import") CheckReadTrapImport();
         else if (mode == "read-trap-fault") CheckReadTrapFaults();
         else if (mode == "read-trap-late") CheckReadTrapLateFaults();
         else if (mode == "read-trap-fault-bound") CheckReadTrapFaultBound();
+        else if (mode == "host-runtime") CheckHostRuntime();
+        else if (mode == "unmap-order") CheckUnmapOrder();
+        else if (mode == "host-write-store") CheckHostWriteStore(argv);
+        else if (mode == "host-write-token") CheckHostWriteToken();
+        else if (mode == "protect-keeping-traps") CheckProtectKeepingTraps();
+        else if (mode == "layout-resync") CheckLayoutResync();
         else throw std::runtime_error("unknown write watch test");
         std::printf("write watch %s passed\n", argv[1]);
         return 0;

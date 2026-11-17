@@ -1607,12 +1607,21 @@ int APS5_VABI sceSaveDataTerminate(void) {
 }
 
 static int transferringMount(const SaveDataTransferringMount* mount, SaveDataMountResult* mount_result) {
-    (void)mount;
     if (mount_result != nullptr) {
         std::memset(mount_result, 0, sizeof(*mount_result));
     }
-    // No PS4-to-PS5 transfer data exists on this console.
-    return SAVE_DATA_ERROR_NOT_FOUND;
+    // PS4-to-PS5 transfer data does not exist here, but some titles (ASTRO BOT 01.007) make this their first save mount and
+    // treat NOT_FOUND as "no save". Fall back to a normal create-or-open read/write mount of the same directory.
+    // APS5_SAVEDATA_TRANSFER_FALLBACK=0 restores the plain NOT_FOUND.
+    const char* flag = std::getenv("APS5_SAVEDATA_TRANSFER_FALLBACK");
+    if (flag != nullptr && std::strcmp(flag, "0") == 0) return SAVE_DATA_ERROR_NOT_FOUND;
+    if (mount == nullptr || mount_result == nullptr || mount->dir_name == nullptr) return SAVE_DATA_ERROR_NOT_FOUND;
+    SaveDataMount3 converted{};
+    converted.user_id = mount->user_id;
+    converted.dir_name = mount->dir_name;
+    converted.mount_mode = SAVE_DATA_MOUNT_MODE_CREATE2 | SAVE_DATA_MOUNT_MODE_RDWR;
+    const int rc = mount3(&converted, mount_result);
+    return rc == SAVE_DATA_OK ? rc : SAVE_DATA_ERROR_NOT_FOUND;
 }
 
 int APS5_VABI sceSaveDataTransferringMount(const SaveDataTransferringMount* mount, SaveDataMountResult* mount_result) {

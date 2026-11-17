@@ -13,7 +13,10 @@
 #include "prx/libc/include/GuestTime.hpp"
 #include "prx/libkernel/KernelErrors.hpp"
 #include "prx/libkernel/Pthread/include/Pthread.hpp"
+#include <atomic>
 #include <algorithm>
+#include <chrono>
+#include <pthread.h>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
@@ -29,7 +32,24 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#if defined(__x86_64__)
 #include "prx/libc/include/GuestCpu.hpp"
+#else
+// nps5: arm64 host build. GuestCpu.hpp is x86-64 only. The guest-visible "TSC" is the architectural
+// generic counter (cntvct_el0) and its frequency (cntfrq_el0), which stay consistent with each other.
+namespace GuestCpu {
+inline std::uint64_t ReadTsc() {
+    std::uint64_t ticks;
+    asm volatile("isb\n\tmrs %0, cntvct_el0" : "=r"(ticks) : : "memory");
+    return ticks;
+}
+inline std::uint64_t CounterFrequency() {
+    std::uint64_t frequency;
+    asm volatile("mrs %0, cntfrq_el0" : "=r"(frequency));
+    return frequency;
+}
+}
+#endif
 
 #ifdef _WIN32
 #include <windows.h>
@@ -241,19 +261,37 @@ private:
 
 extern "C" {
 
+// The hook is published as a pointer to an immutable heap copy: a reader loads it once and uses that snapshot, so installing or
+// clearing the hook while other threads read clocks can neither call a null member nor mix two clocks' units inside one call.
+// Replaced copies are leaked on purpose (readers may still hold them; installs are rare, normally one per process).
+static std::atomic<const KernelGuestClock*> g_guestClock{nullptr};
+
+static const KernelGuestClock* GuestClock() {
+    return g_guestClock.load(std::memory_order_acquire);
+}
+
+void KernelSetGuestClock_nid_postfix(const KernelGuestClock* clock) {
+    g_guestClock.store(clock != nullptr ? new KernelGuestClock(*clock) : nullptr, std::memory_order_release);
+}
+
 std::uint64_t APS5_VABI sceKernelGetProcessTime() {
+    if (const auto* clock = GuestClock(); clock != nullptr && clock->processTime != nullptr) return clock->processTime();
     const std::uint64_t start = GetStartNanos();
     return (GetMonotonicNanos() - start) / 1000ULL;
 }
 
 std::uint64_t APS5_VABI sceKernelGetProcessTimeCounter() {
+    const auto* clock = GuestClock();
+    if (clock != nullptr && clock->processTimeCounter != nullptr) return clock->processTimeCounter();
     const std::uint64_t nanos = GetMonotonicNanos() - GetStartNanos();
-    const std::uint64_t frequency = sceKernelGetTscFrequency();
+    const std::uint64_t frequency = clock != nullptr && clock->tscFrequency != nullptr ? clock->tscFrequency() : sceKernelGetTscFrequency();
     return nanos / 1000000000ULL * frequency + nanos % 1000000000ULL * frequency / 1000000000ULL;
 }
 
 std::uint64_t APS5_VABI sceKernelGetProcessTimeCounterFrequency() {
-    return sceKernelGetTscFrequency();
+    const auto* clock = GuestClock();
+    if (clock != nullptr && clock->counterFrequency != nullptr) return clock->counterFrequency();
+    return clock != nullptr && clock->tscFrequency != nullptr ? clock->tscFrequency() : sceKernelGetTscFrequency();
 }
 
 static std::string DescribeCallSite(const void* caller) {
@@ -310,6 +348,17 @@ static void TraceSleep(const void* caller, std::uint64_t microseconds) {
 }
 
 void KernelTraceWait_nid_postfix(const char* kind, const void* caller, std::uint64_t waitedNanos, bool timedOut) {
+    // APS5_TRACE_SLOWWAIT=<ms>: one stderr line per blocking wait (event flag, semaphore, condition variable,
+    // equeue) that took at least that long, with the steady-clock time it ended at (same clock as [flip] lines).
+    static const std::uint64_t slowNanos = [] {
+        const char* v = std::getenv("APS5_TRACE_SLOWWAIT");
+        return v == nullptr ? std::uint64_t{0} : static_cast<std::uint64_t>(std::atof(v) * 1e6);
+    }();
+    if (slowNanos != 0 && waitedNanos >= slowNanos) {
+        const double end = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr, "[slowwait] %s caller=%s ms=%.0f end=%.0f tid=%llu%s\n", kind, DescribeCallSite(caller).c_str(), waitedNanos / 1e6, end,
+                     reinterpret_cast<unsigned long long>(pthread_self()), timedOut ? " TIMEDOUT" : "");
+    }
     if (!KernelTraceWaitEnabled()) return;
     struct Site { std::uint64_t calls = 0; std::uint64_t timeouts = 0; std::uint64_t nanos = 0; std::uint64_t longest = 0; unsigned long lastThread = 0; };
     static std::mutex mutex;
@@ -881,10 +930,14 @@ int APS5_VABI sceKernelGettimezone(KernelTimezone* tz) {
 }
 
 uint64_t APS5_VABI sceKernelReadTsc(void) {
+    if (const auto* clock = GuestClock(); clock != nullptr && clock->readTsc != nullptr) return clock->readTsc();
     return GuestCpu::ReadTsc();
 }
 
 std::uint64_t APS5_VABI HostTscFrequency_nid_no_patch() {
+#if !defined(__x86_64__)
+    return GuestCpu::CounterFrequency();
+#endif
     static const std::uint64_t frequency = [] {
         const CurrentCpuPin pin;
         const std::uint64_t startNanos = RawMonotonicNanos();
@@ -898,6 +951,7 @@ std::uint64_t APS5_VABI HostTscFrequency_nid_no_patch() {
 }
 
 uint64_t APS5_VABI sceKernelGetTscFrequency(void) {
+    if (const auto* clock = GuestClock(); clock != nullptr && clock->tscFrequency != nullptr) return clock->tscFrequency();
     static const std::uint64_t frequency = static_cast<std::uint64_t>(static_cast<double>(HostTscFrequency_nid_no_patch()) / TimeScale());
     return frequency;
 }

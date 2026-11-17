@@ -180,6 +180,7 @@ void State() {
 
 void TriggerStateClears() {
     PadTriggerEffectStateInformation state{};
+    Reset();
     PadPublishTriggerStatus_nid_postfix(0, 1, 0, 2, 1);
     Require(scePadGetTriggerEffectState(handle, &state) == 0, "the stale trigger state is read");
     Require(state.state[0] == 1 && state.state[1] == 4, "the stale trigger state is mapped");
@@ -192,6 +193,24 @@ void TriggerStateClears() {
     Require(scePadInit_nid_postfix() == 0, "scePadInit is called again");
     Require(scePadGetTriggerEffectState(handle, &state) == 0, "the reinitialized trigger state is read");
     Require(state.state[0] == 0 && state.state[1] == 0, "reinitializing clears the trigger state");
+}
+
+void ComputedState() {
+    PadTriggerEffectStateInformation state{};
+    PadClearTriggerStatus_nid_postfix(0);
+    Reset();
+    Require(scePadGetTriggerEffectState(handle, &state) == 0 && state.state[0] == 0 && state.state[1] == 0, "computed: no command means no effect");
+    Set(0x01, 0, 1, {3, 5});
+    Set(0x02, 1, 2, {2, 6, 4});
+    Require(scePadGetTriggerEffectState(handle, &state) == 0, "computed: state is read");
+    Require(state.state[0] == 1 && state.state[1] == 3, "computed: feedback and weapon report an active effect at rest");
+    Set(0x01, 0, 3, {3, 5, 10});
+    Require(scePadGetTriggerEffectState(handle, &state) == 0 && state.state[0] == 6, "computed: vibration reports active");
+    Require(scePadDisableTriggerEffect(handle, true) == 0, "computed: effects disabled");
+    Require(scePadGetTriggerEffectState(handle, &state) == 0 && state.state[0] == 0 && state.state[1] == 0, "computed: disabled reports no effect");
+    Require(scePadDisableTriggerEffect(handle, false) == 0, "computed: effects enabled");
+    Reset();
+    Require(scePadGetTriggerEffectState(handle, &state) == 0 && state.state[0] == 0 && state.state[1] == 0, "computed: reset reports no effect");
 }
 
 }
@@ -211,6 +230,7 @@ int main() {
     Disable();
     State();
     TriggerStateClears();
+    ComputedState();
     std::puts("guest pad trigger effects tests passed");
     return 0;
 }

@@ -8,13 +8,15 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
-#ifdef __EMSCRIPTEN__
+// nps5: the register-context code is x86-64 specific (RegisterFrame, fxsave, segment registers).
+// Other targets, including the arm64 host build, get the NotImplemented exports.
+#if defined(__EMSCRIPTEN__) || !defined(__x86_64__)
 #include "prx/libc/include/General.hpp"
 #else
 #include <immintrin.h>
 #endif
 
-#ifdef __EMSCRIPTEN__
+#if defined(__EMSCRIPTEN__) || !defined(__x86_64__)
 extern "C" {
 
 int APS5_VABI getcontext_nid_postfix(UserUcontext* context) {

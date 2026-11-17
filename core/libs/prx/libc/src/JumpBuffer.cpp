@@ -46,6 +46,7 @@ void APS5_VABI JumpBufferRestoreMask_nid_no_patch(const unsigned char* buffer) {
 // return address, rbx, rsp, rbp, r12-r15, MXCSR, the x87 control word and, as FreeBSD's do, the
 // signal mask at 72 with the flag sigsetjmp keeps at 88, once libkernel has registered sigprocmask.
 
+#if defined(__x86_64__)
 #if defined(_WIN32) || defined(__APPLE__)
 #define APS5_JUMP_ASM_CALL(name) "    call " APS5_ASM_SYMBOL(name) "\n"
 #else
@@ -146,3 +147,22 @@ asm(".text\n"
     "    mov 56(%rdi), %r15\n"
     "    fldcw 68(%rdi)\n"
     "    jmp *0(%rdi)\n");
+
+#else // !__x86_64__
+// nps5: native arm64 host build. The guest jmp_buf layout above is the x86-64 System V one, so there is no
+// portable implementation. A call is a hard error at run time instead of silently corrupting the stack.
+#include <cstdio>
+#include <cstdlib>
+namespace {
+[[noreturn]] void JumpBufferUnsupported(const char* name) {
+    std::fprintf(stderr, "libc: %s is not implemented for the arm64 host build (guest x86-64 jmp_buf ABI); see docs/nps5-arm64.md\n", name);
+    std::abort();
+}
+}
+extern "C" {
+int setjmp_nid_postfix(std::uint64_t*) { JumpBufferUnsupported("setjmp"); }
+int _setjmp_nid_postfix(std::uint64_t*) { JumpBufferUnsupported("_setjmp"); }
+void longjmp_nid_postfix(std::uint64_t*, int) { JumpBufferUnsupported("longjmp"); }
+void _longjmp_nid_postfix(std::uint64_t*, int) { JumpBufferUnsupported("_longjmp"); }
+}
+#endif

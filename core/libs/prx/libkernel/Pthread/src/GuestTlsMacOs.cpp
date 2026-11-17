@@ -41,8 +41,12 @@ void Release(void* threadPointer) {
 extern "C" {
 
 std::uint8_t Aps5GuestTlsAvx_nid_no_patch = [] {
+#if defined(__x86_64__)
     __builtin_cpu_init();
     return __builtin_cpu_supports("avx") ? 1 : 0;
+#else
+    return 0; // nps5: no AVX state to preserve on arm64
+#endif
 }();
 
 void Aps5GuestTlsRegister_nid_no_patch(GuestTlsDescriptor* descriptor) {
@@ -79,6 +83,7 @@ void* Aps5GuestTlsGetAddr_nid_no_patch(const TlsIndex* index) {
 
 }
 
+#if defined(__x86_64__)
 asm(R"(
     .text
     .globl _Aps5GuestTlsAllocate_nid_no_patch
@@ -179,5 +184,14 @@ _Aps5GuestTlsAllocate_nid_no_patch:
     pop %rbp
     ret
 )");
+#else
+// nps5: arm64 host build. The x86 stub above is the %rax-convention TLS allocator for guest x86 code
+// (gs-based TLS). The arm64 equivalent belongs to the memory/thread work; see docs/nps5-arm64.md.
+#include <cstdio>
+extern "C" void Aps5GuestTlsAllocate_nid_no_patch() {
+    std::fprintf(stderr, "libkernel: Aps5GuestTlsAllocate is not implemented for the arm64 host build\n");
+    std::abort();
+}
+#endif
 
 #endif

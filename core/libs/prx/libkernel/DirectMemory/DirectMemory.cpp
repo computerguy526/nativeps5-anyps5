@@ -806,6 +806,11 @@ bool WriteSharedBacking(std::uintptr_t address, const void* source, std::size_t 
 void AddMapping(std::uintptr_t address, std::size_t len, std::uint64_t phys, int nativeProt, bool records = true) {
     ValidatePhysicalRange(phys, len);
     if (records) EraseMappings(address, address + len);
+#if defined(__linux__) || defined(__APPLE__)
+    // The backing replaces whatever is mapped here (MAP_FIXED): the watch forgets the range first (GuestWriteWatch::ReplaceMapping)
+    // and WatchMapping registers the new pages below.
+    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(address), len);
+#endif
 #ifdef __EMSCRIPTEN__
     if (records && !MappingsSharingPhys(phys, phys + len).empty()) throw std::system_error(ENOTSUP, std::generic_category(), "WebAssembly memory cannot map one direct memory range at two addresses");
 #endif
@@ -888,7 +893,10 @@ bool RemapFixedIntoRegistered(GuestAllocations::Mutation& mutation, void* addr, 
             GuestArena::GuestArenaReset_nid_postfix(addr, len);
             GuestArena::GuestArenaCommit_nid_postfix(addr, len, 0x04, PS5_PAGE_SIZE);
 #else
-            if (::mmap(addr, len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
+            // The watch forgets the range before the pages are replaced: registered after the mmap, the table held the old
+            // protection of pages that were already new (and Register kept it where the old page was armed).
+            const bool remapped = GuestWriteWatch::ReplaceMapping(addr, len, [&] { return ::mmap(addr, len, nativeProtection, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0) != MAP_FAILED; });
+            if (!remapped) throw std::system_error(errno, std::generic_category(), "remap anonymous memory");
             GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(addr, len);
 #endif
         }
@@ -917,11 +925,15 @@ void ArenaForget(void* addr, size_t len) {
 
 void Unmap(void* addr, size_t len) {
 #if defined(__linux__) || defined(__EMSCRIPTEN__) || defined(__APPLE__)
-    if (ArenaAvailable() && GuestArena::GuestArenaContains_nid_postfix(addr, len))
-        GuestArena::GuestArenaReset_nid_postfix(addr, len);
-    else if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
+    // The watch forgets the range before the pages go (the reset is an mmap MAP_FIXED PROT_NONE on macOS): see
+    // GuestWriteWatch::ReplaceMapping. This is also the unmap that every fixed mapping over a registered range goes
+    // through first (ReplaceFixedOverlap -> UnmapRegistered).
+    GuestWriteWatch::ReplaceMapping(addr, len, [&] {
+        if (ArenaAvailable() && GuestArena::GuestArenaContains_nid_postfix(addr, len))
+            GuestArena::GuestArenaReset_nid_postfix(addr, len);
+        else if (munmap(addr, len) != 0) throw std::system_error(errno, std::generic_category(), "munmap failed");
+    });
     ArenaForget(addr, len);
-    GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(addr, len);
 #else
     if (KernelArena::Get().Contains(addr, len)) munmap(addr, len);
     else munmap_release(addr);
@@ -1546,6 +1558,13 @@ int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) 
         RecordProtection(insidePointer, insideBytes, prot);
         return 0;
     }
+#ifdef __APPLE__
+    // The read traps over the range resolve here, before the registry is locked: the resolver stores GPU results under the
+    // driver's host imports mutex, and an import holds that mutex while it asks the registry for its ranges (ImportMappedRanges
+    // -> GuestAllocationsAcquire). Resolving inside the mutation below (GuestWriteWatchProtect) waited for that mutex with the
+    // registry locked: each thread held what the other needed. A trap armed between here and the protect is kept, not resolved.
+    GuestWriteWatch::GuestWriteWatchResolveReadTraps_nid_postfix(first, bytes);
+#endif
     GuestAllocations::Mutation mutation;
 #ifdef _WIN32
     for (auto cursor = first; cursor < end;) {
@@ -1577,7 +1596,7 @@ int DoMprotect(const void* addr, size_t len, int prot, bool requireMappedStart) 
     for (const auto& [span, spanBytes] : spans) {
         mutation.Protect(span, spanBytes, (prot & 3) != 0, (prot & 2) != 0, (prot & GuestProtGpuReadWrite) != 0, [&] {
 #ifdef __APPLE__
-            if (const int error = GuestWriteWatch::GuestWriteWatchProtect_nid_postfix(const_cast<void*>(span), spanBytes, nativeProtection); error != 0)
+            if (const int error = GuestWriteWatch::GuestWriteWatchProtectKeepingTraps_nid_postfix(const_cast<void*>(span), spanBytes, nativeProtection); error != 0)
                 throw std::system_error(error, std::generic_category(), "mprotect failed");
 #else
             if (mprotect(const_cast<void*>(span), spanBytes, nativeProtection) != 0) throw std::system_error(errno, std::generic_category(), "mprotect failed");

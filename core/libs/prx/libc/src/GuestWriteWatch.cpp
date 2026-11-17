@@ -489,6 +489,7 @@ public:
         std::vector<std::uint8_t> pages((end - begin) / _page, Written | Fresh);
         std::vector<bool> queried(pages.size(), false);
         const Lock lock(_lock);
+        layoutChanged(begin, end, false);
         for (auto cursor = begin; cursor < end;) {
             mach_vm_address_t address = cursor;
             mach_vm_size_t size = 0;
@@ -509,7 +510,10 @@ public:
             auto& entry = pages[(page - begin) / _page];
             const std::uint8_t recorded = state & ProtectionMask;
             const bool armed = (state & Protected) != 0 && (entry & ProtectionMask) == (recorded & ~PROT_WRITE);
-            if (armed || (state & ReadTrapped) != 0 || !queried[(page - begin) / _page]) entry = static_cast<std::uint8_t>(Written | Fresh | recorded);
+            // A page the host does not map (a hole in the range) keeps protection 0, whatever the table recorded for it before:
+            // the recorded protection is the one of a mapping that is gone, and the page would read as accessible.
+            if (!queried[(page - begin) / _page]) return;
+            if (armed || (state & ReadTrapped) != 0) entry = static_cast<std::uint8_t>(Written | Fresh | recorded);
             else state = static_cast<std::uint8_t>(state & ~Protected);
         });
         dropTraps(begin, end);
@@ -523,6 +527,7 @@ public:
         end = pageEnd(end);
         if (end <= begin) return false;
         const Lock lock(_lock);
+        layoutChanged(begin, end);
         dropTraps(begin, end);
         return erase(begin, end);
     }
@@ -540,8 +545,38 @@ public:
         return (next != _ranges.begin() && std::prev(next)->second.end > begin) || (next != _ranges.end() && next->first < end);
     }
 
+    // One answer under one lock acquisition (design note: Kyty's TrackImage asks "tracked, and are the edge pages shared" before it
+    // trusts the write watch, KytyPS5 textureCache.cpp:295-317, GPL-2.0; re-implemented here). Reads only; nothing is collected.
+    bool QueryRange(std::uintptr_t begin, std::uintptr_t end, GuestWriteWatchRangeInfo& info) {
+        info = {};
+        info.pageBytes = _page;
+        if (!_available || end <= begin) return false;
+        info.headShared = (begin % _page) != 0;
+        info.tailShared = (end % _page) != 0;
+        const auto first = pageStart(begin);
+        const auto last = pageEnd(end);
+        const Lock lock(_lock);
+        info.covered = covers(first, last);
+        forEachPage(first, last, [&](std::uintptr_t page, std::uint8_t& state) {
+            ++info.watchedPages;
+            if ((state & Written) != 0) {
+                ++info.writtenPages;
+                if (page == first) info.headWritten = true;
+                if (page + _page == last) info.tailWritten = true;
+            }
+            if ((state & ReadTrapped) != 0) ++info.trappedPages;
+        });
+        return info.covered;
+    }
+
     bool HandleFault(std::uintptr_t address) {
         return _available && record(address);
+    }
+
+    bool HandleAccess(std::uintptr_t address, bool write) {
+        if (!_available) return false;
+        if (resolveTrap(address, write)) return true;
+        return write && record(address);
     }
 
     enum class Take { All, Armed, Fresh };
@@ -555,15 +590,31 @@ public:
         {
             const Lock lock(_lock);
             if (take != Take::Fresh && !covers(begin, end)) return false;
+            // The table says which pages are armed (host read-only). A mapping replaced or reopened without telling the watch (munmap /
+            // MAP_FIXED / mprotect) leaves such a page host-writable: its writes never faulted, so count it as written.
+            std::uintptr_t regionBegin = 0;
+            std::uintptr_t regionEnd = 0;
+            bool regionWritable = false;
+            const auto hostWritable = [&](std::uintptr_t page) {
+                if (page < regionBegin || page >= regionEnd) {
+                    int host = 0;
+                    regionBegin = page;
+                    regionEnd = page + _page;
+                    if (!hostProtection(page, host, &regionBegin, &regionEnd)) return false;
+                    regionWritable = (host & PROT_WRITE) != 0;
+                }
+                return regionWritable;
+            };
             forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
+                if (_validate && (state & Protected) != 0 && (state & ReadTrapped) == 0 && hostWritable(page)) state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh | ReadTrapped)) | Written);
                 if ((state & Written) == 0) return;
                 const bool fresh = (state & Fresh) != 0;
                 if ((take == Take::Armed && fresh) || (take == Take::Fresh && !fresh)) return;
                 state &= static_cast<std::uint8_t>(~Fresh);
                 if (!runs.empty() && runs.back().second == page) runs.back().second = page + _page;
                 else runs.emplace_back(page, page + _page);
-                for (const auto& [first, last] : _hostWrites)
-                    if (page >= first && page < last) return;
+                for (const auto& write : _hostWrites)
+                    if (page >= write.begin && page < write.end) return;
                 state &= static_cast<std::uint8_t>(~Written);
                 if ((state & PROT_WRITE) != 0) state |= Protected;
             });
@@ -579,6 +630,7 @@ public:
         end = pageEnd(end);
         if (end <= begin) return;
         withoutTraps(begin, end, false, [&] {
+            layoutChanged(begin, end);
             forEachPage(begin, end, [&](std::uintptr_t, std::uint8_t& state) {
                 state = static_cast<std::uint8_t>(Written | (state & Fresh) | (protection & ProtectionMask));
             });
@@ -590,6 +642,7 @@ public:
         const auto first = pageStart(begin);
         const auto last = pageEnd(end);
         return withoutTraps(first, last, true, [&] {
+            layoutChanged(first, last);
             if (::mprotect(reinterpret_cast<void*>(begin), end - begin, protection) != 0) return errno;
             if (first < last) {
                 forEachPage(first, last, [&](std::uintptr_t, std::uint8_t& state) {
@@ -600,18 +653,112 @@ public:
         });
     }
 
+    // Protect for a caller that holds a lock the read trap resolver needs (the guest's mprotect inside a mutation of the allocation
+    // registry: the resolver stores GPU results under the driver's host imports mutex, and an import holds that mutex while it
+    // asks the registry for its ranges). Nothing is resolved and nothing is waited for: only the watch lock is taken. A page whose
+    // read trap is armed keeps the trap and stays closed; its logical protection changes, and the page takes the new protection
+    // when the trap resolves. Such a page is not marked written (the bytes behind a trap are stale, see BeginHostWriteKeepingTraps);
+    // when the new protection lets the CPU write it, it is armed so the first store after the trap is recorded. Resolve the traps
+    // before taking the lock (ResolveReadTraps) so that a kept trap is the exception.
+    int ProtectKeepingTraps(std::uintptr_t begin, std::uintptr_t end, int protection) {
+        if (!_available) return ::mprotect(reinterpret_cast<void*>(begin), end - begin, protection) == 0 ? 0 : errno;
+        const auto first = pageStart(begin);
+        const auto last = pageEnd(end);
+        const Lock lock(_lock);
+        layoutChanged(first, last);
+        // The host protection of every page but the closed trapped ones.
+        auto cursor = begin;
+        int error = 0;
+        const auto apply = [&](std::uintptr_t stop) {
+            if (error == 0 && stop > cursor && ::mprotect(reinterpret_cast<void*>(cursor), stop - cursor, protection) != 0) error = errno;
+        };
+        forEachPage(first, last, [&](std::uintptr_t page, std::uint8_t& state) {
+            if ((state & ReadTrapped) == 0 || trapKeptOpen(page)) return;
+            apply(std::min(page, end));
+            cursor = std::max(cursor, page + _page);
+        });
+        apply(end);
+        if (error != 0) return error;
+        forEachPage(first, last, [&](std::uintptr_t, std::uint8_t& state) {
+            if ((state & ReadTrapped) == 0) {
+                state = static_cast<std::uint8_t>(Written | (state & Fresh) | (protection & ProtectionMask));
+                return;
+            }
+            const bool arm = (state & Written) == 0 && (protection & PROT_WRITE) != 0;
+            state = static_cast<std::uint8_t>((state & (Fresh | ReadTrapped | Written)) | (protection & ProtectionMask) | (arm ? Protected : 0));
+        });
+        return 0;
+    }
+
+    // Resolves the read traps over the range on the calling thread, as Protect and BeginHostWrite do before they change the pages.
+    // For a caller that is about to take a lock under which it cannot run the resolver (see ProtectKeepingTraps).
+    void ResolveReadTraps(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin || !_trapping.load(std::memory_order_acquire)) return;
+        waitForResolving(begin, end);
+        resolve(begin, end);
+    }
+
     void BeginHostWrite(std::uintptr_t begin, std::uintptr_t end) {
         if (!_available || end <= begin) return;
         begin = pageStart(begin);
         end = pageEnd(end);
         if (end <= begin) return;
         withoutTraps(begin, end, true, [&] {
-            _hostWrites.emplace_back(begin, end);
+            _hostWrites.push_back({begin, end, 0, false, {}});
             forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
                 if ((state & Protected) != 0) ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
                 state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
             });
         });
+    }
+
+    // The host write of a host import (the driver's ImportWatched): the pages have to be accessible while the import is made, but
+    // nothing reads or keeps their bytes. BeginHostWrite resolves the read traps over the range first, and the resolver stores
+    // GPU results into guest memory, which needs the lock the importing thread holds (the driver's host imports mutex): the
+    // thread waited for itself, or for a resolver on another thread that waited for it. Here nothing is resolved and nothing
+    // is waited for. A trapped page is only opened for the length of the write: its trap, its ReadTrapped bit and its write
+    // state stay as they are, so it does not read as written afterwards (the bytes behind a trap are stale, and a page that
+    // reads as written tells the driver the CPU stored over the pending image), and EndHostWrite closes it again unless the
+    // trap was resolved or released meanwhile. While the page is open a CPU access to it does not fault and a store to it
+    // is not recorded, as with a page the GPU-mutex bypass opened. Untrapped pages are opened and marked as in BeginHostWrite.
+    //
+    // A trapped page is opened with its full logical protection, write included, also when it is armed for write detection.
+    // Opening it without write would make a CPU store fault into the trap, but the import needs every page of its range
+    // writable while it is made: Metal builds a no-copy buffer over a range with one read-only page without an error, and
+    // what the GPU then writes through that buffer never reaches the range (measured on macOS 26, M4 Pro: GPU -> CPU lost for the
+    // whole buffer, CPU -> GPU kept; a PROT_NONE page fails the import outright). So a store inside the window cannot fault.
+    // With APS5_IMPORT_WINDOW_STORES=1 it is found by its bytes instead: a trapped page that holds no write is hashed when
+    // it is opened and again when the write ends, each time while it is readable only (a store at that moment faults and
+    // waits for the watch lock), and a page whose bytes changed is marked written, as a store that faulted would have marked
+    // it. A store of the bytes the page already held is not seen, and does not matter. Off by default: what the GPU writes
+    // into such a page through a host import inside the window changes its bytes as well, and would read as a CPU store
+    // over the pending image; whether that happens on a title is not known.
+    //
+    // The window is named by the token returned here, and only EndHostWriteKeepingTraps with that token ends it: a plain host
+    // write over the same range (EndHostWrite matches its windows by range) cannot end it and close the pages under the import.
+    std::uint64_t BeginHostWriteKeepingTraps(std::uintptr_t begin, std::uintptr_t end) {
+        if (!_available || end <= begin) return 0;
+        begin = pageStart(begin);
+        end = pageEnd(end);
+        if (end <= begin) return 0;
+        const Lock lock(_lock);
+        const auto token = ++_hostWriteTokens;
+        std::vector<std::pair<std::uintptr_t, std::uint64_t>> opened;
+        forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
+            if ((state & ReadTrapped) != 0) {
+                if (_windowStores && (state & Written) == 0 && (state & PROT_READ) != 0) {
+                    // (a page another trap-keeping write holds open stays writable for that import: hashed as it is)
+                    std::uint64_t hash = 0;
+                    if ((trapKeptOpen(page) || ::mprotect(reinterpret_cast<void*>(page), _page, PROT_READ) == 0) && hashPage(page, hash)) opened.emplace_back(page, hash);
+                }
+                ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
+                return;
+            }
+            if ((state & Protected) != 0) ::mprotect(reinterpret_cast<void*>(page), _page, state & ProtectionMask);
+            state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
+        });
+        _hostWrites.push_back({begin, end, token, true, std::move(opened)});
+        return token;
     }
 
     void EndHostWrite(std::uintptr_t begin, std::uintptr_t end) {
@@ -620,8 +767,43 @@ public:
         end = pageEnd(end);
         if (end <= begin) return;
         const Lock lock(_lock);
-        const auto found = std::find(_hostWrites.begin(), _hostWrites.end(), std::pair{begin, end});
+        // Plain windows over one range are interchangeable; a trap-keeping window is never ended from here.
+        const auto found = std::find_if(_hostWrites.begin(), _hostWrites.end(), [&](const HostWrite& write) { return !write.keepsTraps && write.begin == begin && write.end == end; });
         if (found != _hostWrites.end()) _hostWrites.erase(found);
+    }
+
+    void EndHostWriteKeepingTraps(std::uint64_t token) {
+        if (!_available || token == 0) return;
+        const Lock lock(_lock);
+        const auto found = std::find_if(_hostWrites.begin(), _hostWrites.end(), [&](const HostWrite& write) { return write.keepsTraps && write.token == token; });
+        if (found == _hostWrites.end()) return;
+        const auto begin = found->begin;
+        const auto end = found->end;
+        const auto opened = std::move(found->opened);
+        _hostWrites.erase(found);
+        // The CPU stores that landed in the trapped pages while they were open (see BeginHostWriteKeepingTraps).
+        for (const auto& [page, before] : opened) {
+            auto* state = pageState(page);
+            if (state == nullptr || (*state & (ReadTrapped | Written)) != ReadTrapped) continue;
+            std::uint64_t after = 0;
+            if (!trapKeptOpen(page) && ::mprotect(reinterpret_cast<void*>(page), _page, PROT_READ) != 0) continue;
+            if (hashPage(page, after) && after != before) *state = static_cast<std::uint8_t>((*state & (ProtectionMask | Fresh | ReadTrapped)) | Written);
+        }
+        // Close the pages whose trap outlived the write (a resolved or released trap cleared ReadTrapped and left its pages open).
+        std::uintptr_t runStart = 0;
+        std::uintptr_t runEnd = 0;
+        const auto close = [&] {
+            if (runEnd > runStart) ::mprotect(reinterpret_cast<void*>(runStart), runEnd - runStart, PROT_NONE);
+        };
+        forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
+            if ((state & ReadTrapped) == 0 || trapKeptOpen(page)) return;
+            if (page != runEnd) {
+                close();
+                runStart = page;
+            }
+            runEnd = page + _page;
+        });
+        close();
     }
 
     int Protection(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* runEnd) {
@@ -631,15 +813,103 @@ public:
         if (_available && it != _ranges.begin() && page < std::prev(it)->second.end) {
             --it;
             const auto& pages = it->second.pages;
-            const std::uint8_t protection = pages[(page - it->first) / _page] & ProtectionMask;
+            constexpr std::uint8_t Key = ProtectionMask | ReadTrapped;
+            const std::uint8_t key = pages[(page - it->first) / _page] & Key;
             auto end = page + _page;
-            while (end < it->second.end && end < limit && (pages[(end - it->first) / _page] & ProtectionMask) == protection) end += _page;
+            while (end < it->second.end && end < limit && (pages[(end - it->first) / _page] & Key) == key) end += _page;
             *runEnd = std::min(end, limit);
-            return protection;
+            return (key & ProtectionMask) | ((key & ReadTrapped) != 0 ? ProtectionTrapped : 0);
         }
         *runEnd = it != _ranges.end() ? std::min(it->first, limit) : limit;
         return -1;
     }
+
+    // The host query runs under the watch lock: every protection change the watch makes (arming, releasing or resolving a read trap,
+    // write protection) holds it, so the host mapping and the table describe one state. Queried apart, a trap released in between
+    // left a page PROT_NONE to the host and untrapped to the table: an unreadable page that was readable all along.
+    int Access(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* runEnd) {
+        const auto page = pageStart(address);
+#ifdef APS5_WRITE_WATCH_TEST_HOOKS
+        if (const auto hook = _accessHook.load(std::memory_order_acquire)) hook(address);
+#endif
+        const Lock lock(_lock);
+        mach_vm_address_t region = address;
+        mach_vm_size_t regionSize = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        const auto status = mach_vm_region(mach_task_self(), &region, &regionSize, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        if (status == KERN_INVALID_ADDRESS) {
+            *runEnd = limit;
+            return ProtectionUnmapped;
+        }
+        if (status != KERN_SUCCESS || regionSize == 0) return -1;
+        if (region > address) {
+            *runEnd = std::min<std::uintptr_t>(limit, region);
+            return ProtectionUnmapped;
+        }
+        auto end = std::min<std::uintptr_t>(limit, region + regionSize);
+        bool readable = (info.protection & VM_PROT_READ) != 0;
+        bool writable = readable && (info.protection & VM_PROT_WRITE) != 0;
+        bool trapped = false;
+        auto it = _ranges.upper_bound(page);
+        if (_available && it != _ranges.begin() && page < std::prev(it)->second.end) {
+            --it;
+            const auto& pages = it->second.pages;
+            constexpr std::uint8_t Key = ProtectionMask | ReadTrapped;
+            const std::uint8_t key = pages[(page - it->first) / _page] & Key;
+            auto keyEnd = page + _page;
+            while (keyEnd < it->second.end && keyEnd < end && (pages[(keyEnd - it->first) / _page] & Key) == key) keyEnd += _page;
+            end = std::min(end, keyEnd);
+            trapped = (key & ReadTrapped) != 0;
+            readable = (readable || trapped) && (key & PROT_READ) != 0;
+            writable = readable && (key & PROT_WRITE) != 0;
+        } else if (_available && it != _ranges.end()) {
+            end = std::min(end, it->first);
+        }
+        *runEnd = end;
+        return (readable ? PROT_READ : 0) | (writable ? PROT_WRITE : 0) | (trapped ? ProtectionTrapped : 0);
+    }
+
+    // The logical protection of the watched page at `address`, from the table alone. The watch owns the host protection of every
+    // page it covers (write protection, read traps, and the guest's own mprotect, which comes through Protect), so the table is
+    // what the guest sees there and no host query is needed. [*runBegin, *runEnd) is the run of pages around `address` with that
+    // protection, kept inside the page's RunBlock so the scan under the lock stays short. -1 when the page is not watched.
+    int Logical(std::uintptr_t address, std::uintptr_t* runBegin, std::uintptr_t* runEnd, std::uint64_t* generation) {
+        if (!_available) return -1;
+        const auto page = pageStart(address);
+        const Lock lock(_lock);
+        auto it = _ranges.upper_bound(page);
+        if (it == _ranges.begin() || page >= std::prev(it)->second.end) return -1;
+        --it;
+        const auto& pages = it->second.pages;
+        const std::uint8_t key = pages[(page - it->first) / _page] & ProtectionMask;
+        const auto blockBegin = std::max(it->first, page & ~(RunBlock - 1));
+        const auto blockEnd = std::min(it->second.end, (page & ~(RunBlock - 1)) + RunBlock);
+        auto begin = page;
+        while (begin > blockBegin && (pages[(begin - _page - it->first) / _page] & ProtectionMask) == key) begin -= _page;
+        auto end = page + _page;
+        while (end < blockEnd && (pages[(end - it->first) / _page] & ProtectionMask) == key) end += _page;
+        *runBegin = begin;
+        *runEnd = end;
+        *generation = layoutSlot(page).load(std::memory_order_relaxed);
+        const bool readable = (key & PROT_READ) != 0;
+        return (readable ? PROT_READ : 0) | (readable && (key & PROT_WRITE) != 0 ? PROT_WRITE : 0);
+    }
+
+    std::uint64_t LayoutChanges() const {
+        return _layoutChanges.load(std::memory_order_relaxed);
+    }
+
+    std::uint64_t LayoutGeneration(std::uintptr_t address) {
+        return layoutSlot(address).load(std::memory_order_acquire);
+    }
+
+#ifdef APS5_WRITE_WATCH_TEST_HOOKS
+    void SetAccessHook(void (*hook)(std::uintptr_t)) {
+        _accessHook.store(hook, std::memory_order_release);
+    }
+#endif
 
     bool SetReadTrapResolver(void (*resolver)(std::uintptr_t, std::uintptr_t)) {
         if (!_available || resolver == nullptr) return false;
@@ -660,9 +930,24 @@ public:
         const Lock lock(_lock);
         if (!covers(first, last)) return false;
         const auto [same, other] = _traps.equal_range(begin);
-        if (std::any_of(same, other, [&](const auto& trap) { return trap.second == end; })) return true;
-        for (const auto& [hostBegin, hostEnd] : _hostWrites)
-            if (hostBegin < last && first < hostEnd) return false;
+        const bool known = std::any_of(same, other, [&](const auto& trap) { return trap.second == end; });
+        for (const auto& write : _hostWrites)
+            if (write.begin < last && first < write.end) return false;
+        if (known) {
+            // A page of a known trap can have been opened behind the entry's back (the GPU-mutex bypass in resolveTrap clears ReadTrapped
+            // and opens the page but keeps the entry). Reporting "trapped" for it would let a CPU read see stale bytes with no fault.
+            std::vector<std::pair<std::uintptr_t, std::uintptr_t>> opened;
+            forEachPage(first, last, [&](std::uintptr_t page, std::uint8_t& state) {
+                if ((state & ReadTrapped) != 0) return;
+                if (!opened.empty() && opened.back().second == page) opened.back().second = page + _page;
+                else opened.emplace_back(page, page + _page);
+            });
+            for (const auto& [openBegin, openEnd] : opened) {
+                if (::mprotect(reinterpret_cast<void*>(openBegin), openEnd - openBegin, PROT_NONE) != 0) return false;
+                forEachPage(openBegin, openEnd, [](std::uintptr_t, std::uint8_t& state) { state |= ReadTrapped; });
+            }
+            return true;
+        }
         if (::mprotect(reinterpret_cast<void*>(first), last - first, PROT_NONE) != 0) return false;
         _traps.emplace(begin, end);
         forEachPage(first, last, [](std::uintptr_t, std::uint8_t& state) { state |= ReadTrapped; });
@@ -701,6 +986,8 @@ private:
     static constexpr std::uint8_t Fresh = 0x40;
     static constexpr std::uintptr_t FaultAheadBlock = 65536;
     static constexpr std::uint8_t ReadTrapped = 0x80;
+    static constexpr std::uintptr_t RunBlock = 2u << 20;
+    static constexpr std::size_t LayoutSlots = 4096;
     static constexpr std::size_t ResolveSlots = 32;
     static constexpr std::size_t ResolvingCapacity = 4096;
     static constexpr std::size_t RetrySlots = 64;
@@ -735,6 +1022,16 @@ private:
         std::vector<std::uint8_t> pages;
     };
 
+    // An open host write. `token` names a trap-keeping one (0 for a plain one, which is ended by its range); `opened` holds the
+    // hash of each trapped page a trap-keeping one opened without a write on record.
+    struct HostWrite {
+        std::uintptr_t begin;
+        std::uintptr_t end;
+        std::uint64_t token;
+        bool keepsTraps;
+        std::vector<std::pair<std::uintptr_t, std::uint64_t>> opened;
+    };
+
     struct Mutex {
         Mutex() {
             pthread_mutexattr_t attributes;
@@ -747,14 +1044,25 @@ private:
         pthread_mutex_t mutex;
         pthread_cond_t idle;
         std::atomic<unsigned> faulting{0};
+        // The thread holding `mutex` (null when free). A fault taken by that thread while it holds the
+        // lock (a store or load of a watched page inside the watch itself) must not lock again: the
+        // mutex is not recursive, so that would hang the thread in its own signal handler. The fault
+        // handler declines such a fault instead (rps5e memory/lock.rs), and it becomes a crash report.
+        std::atomic<pthread_t> owner{nullptr};
+        bool OwnedBySelf() const {
+            const auto held = owner.load(std::memory_order_acquire);
+            return held != nullptr && pthread_equal(held, pthread_self()) != 0;
+        }
     };
 
     struct Lock {
         explicit Lock(Mutex& mutex) : _mutex(mutex) {
             pthread_mutex_lock(&_mutex.mutex);
             while (_mutex.faulting.load(std::memory_order_acquire) != 0) pthread_cond_wait(&_mutex.idle, &_mutex.mutex);
+            _mutex.owner.store(pthread_self(), std::memory_order_release);
         }
         ~Lock() {
+            _mutex.owner.store(nullptr, std::memory_order_release);
             pthread_mutex_unlock(&_mutex.mutex);
         }
         Mutex& _mutex;
@@ -764,17 +1072,57 @@ private:
         explicit FaultLock(Mutex& mutex) : _mutex(mutex) {
             _mutex.faulting.fetch_add(1, std::memory_order_acq_rel);
             pthread_mutex_lock(&_mutex.mutex);
+            _mutex.owner.store(pthread_self(), std::memory_order_release);
         }
         ~FaultLock() {
+            _mutex.owner.store(nullptr, std::memory_order_release);
             if (_mutex.faulting.fetch_sub(1, std::memory_order_acq_rel) == 1) pthread_cond_broadcast(&_mutex.idle);
             pthread_mutex_unlock(&_mutex.mutex);
         }
         Mutex& _mutex;
     };
 
+    // Under the watch lock, before the watched ranges or the logical protection of watched pages change inside [begin, end): an
+    // answer of Logical that a caller kept for a page there is stale from here on. One generation per RunBlock (hashed), so the
+    // driver unwatching and rewatching one buffer does not drop what callers kept about the rest of guest memory.
+    void layoutChanged(std::uintptr_t begin, std::uintptr_t end, bool watchedOnly = true) {
+        if (end <= begin) return;
+        // Nothing is kept about pages the table does not hold, so a change to unwatched pages only (the driver unwatching a
+        // buffer it has unwatched already, the guest's mprotect of unwatched memory) leaves every kept answer true.
+        if (watchedOnly) {
+            const auto next = _ranges.upper_bound(begin);
+            if (!((next != _ranges.begin() && std::prev(next)->second.end > begin) || (next != _ranges.end() && next->first < end))) return;
+        }
+        _layoutChanges.fetch_add(1, std::memory_order_relaxed);
+        const auto first = begin / RunBlock;
+        const auto last = (end - 1) / RunBlock;
+        if (last - first >= LayoutSlots) {
+            for (auto& slot : _layout) slot.fetch_add(1, std::memory_order_release);
+            return;
+        }
+        for (auto block = first; block <= last; ++block) _layout[block % LayoutSlots].fetch_add(1, std::memory_order_release);
+    }
+
+    std::atomic<std::uint64_t>& layoutSlot(std::uintptr_t address) {
+        return _layout[(address / RunBlock) % LayoutSlots];
+    }
+
+    // A fault on the thread that holds the watch lock: declined (async-signal-safe note, once).
+    bool declineReentrantFault() {
+        if (!_lock.OwnedBySelf()) return false;
+        static std::atomic<bool> noted{false};
+        if (!noted.exchange(true, std::memory_order_relaxed)) {
+            static const char message[] = "[write-watch] fault taken while this thread holds the watch lock: declined (not re-entered)\n";
+            [[maybe_unused]] const auto written = ::write(2, message, sizeof(message) - 1);
+        }
+        return true;
+    }
+
     Watch() {
         if (const char* ahead = std::getenv("APS5_WRITE_WATCH_FAULT_AHEAD")) _faultAhead = static_cast<std::size_t>(std::strtoul(ahead, nullptr, 0));
         if (std::getenv("APS5_NO_WRITE_WATCH") != nullptr) return;
+        if (const char* validate = std::getenv("APS5_WRITE_WATCH_VALIDATE")) _validate = std::strcmp(validate, "0") != 0;
+        if (const char* stores = std::getenv("APS5_IMPORT_WINDOW_STORES")) _windowStores = std::strcmp(stores, "0") != 0;
         struct sigaction action {};
         action.sa_sigaction = &Watch::fault;
         action.sa_flags = SA_SIGINFO | SA_RESTART;
@@ -823,6 +1171,7 @@ private:
     }
 
     bool record(std::uintptr_t address) {
+        if (declineReentrantFault()) return false;
         const auto page = pageStart(address);
         const FaultLock lock(_lock);
         auto it = _ranges.upper_bound(page);
@@ -845,14 +1194,69 @@ private:
             for (std::size_t at = index; at < index + count; ++at) pages[at] = static_cast<std::uint8_t>((pages[at] & (ProtectionMask | Fresh)) | Written);
             return true;
         }
-        if ((state & PROT_WRITE) == 0) return false;
-        std::uint8_t value = 0;
+        if ((state & PROT_WRITE) == 0 || (state & ReadTrapped) != 0) return false;
+        // The table says this page is open for writing and not armed. A fault means the host disagrees: either a racing thread just
+        // reopened it (retry) or the mapping was changed behind the table's back (raw mprotect / remap). Retrying the latter forever is a
+        // hang, so resync the table to the host and let the fault take its normal course.
+        int host = 0;
+        if (!hostProtection(page, host)) return false;
+        if ((host & PROT_WRITE) != 0) {
+            // (a page whose backing is gone, e.g. a truncated file, is "writable" and still faults: only a readable one is retried)
+            std::uint8_t value = 0;
+            mach_vm_size_t copied = 0;
+            return mach_vm_read_overwrite(mach_task_self(), address, sizeof(value), reinterpret_cast<mach_vm_address_t>(&value), &copied) == KERN_SUCCESS && copied == sizeof(value);
+        }
+        // The logical protection of the page changes here: what callers kept about its block (Logical) is stale.
+        layoutChanged(page, page + _page);
+        state = static_cast<std::uint8_t>((state & Fresh) | Written | host);
+        return false;
+    }
+
+    // The host protection of the page at `page` (PROT_NONE for an unmapped page); false when the query itself fails.
+    static bool hostProtection(std::uintptr_t page, int& protection, std::uintptr_t* regionBegin = nullptr, std::uintptr_t* regionEnd = nullptr) {
+        mach_vm_address_t address = page;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        const auto status = mach_vm_region(mach_task_self(), &address, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        if (status == KERN_INVALID_ADDRESS) {
+            protection = 0;
+            return true;
+        }
+        if (status != KERN_SUCCESS) return false;
+        if (address > page) {
+            protection = 0;
+            if (regionEnd != nullptr) *regionEnd = address;
+            return true;
+        }
+        protection = ((info.protection & VM_PROT_READ) ? PROT_READ : 0) | ((info.protection & VM_PROT_WRITE) ? PROT_WRITE : 0) | ((info.protection & VM_PROT_EXECUTE) ? PROT_EXEC : 0);
+        if (regionBegin != nullptr) *regionBegin = address;
+        if (regionEnd != nullptr) *regionEnd = address + size;
+        return true;
+    }
+
+    // The bytes of the readable page at `page`, hashed from a copy the kernel makes (no fault if the page went away meanwhile).
+    bool hashPage(std::uintptr_t page, std::uint64_t& hash) const {
+        std::array<std::uint64_t, 16384 / sizeof(std::uint64_t)> words;
+        if (_page > sizeof(words)) return false;
         mach_vm_size_t copied = 0;
-        return mach_vm_read_overwrite(mach_task_self(), address, sizeof(value), reinterpret_cast<mach_vm_address_t>(&value), &copied) == KERN_SUCCESS && copied == sizeof(value);
+        if (mach_vm_read_overwrite(mach_task_self(), page, _page, reinterpret_cast<mach_vm_address_t>(words.data()), &copied) != KERN_SUCCESS || copied != _page) return false;
+        std::array<std::uint64_t, 4> lanes{0x9e3779b97f4a7c15ull, 0xbf58476d1ce4e5b9ull, 0x94d049bb133111ebull, 0xd6e8feb86659fd93ull};
+        const auto count = _page / sizeof(std::uint64_t);
+        for (std::size_t index = 0; index + 4 <= count; index += 4) {
+            for (std::size_t lane = 0; lane < 4; ++lane) {
+                lanes[lane] = (lanes[lane] ^ words[index + lane]) * 0xff51afd7ed558ccdull;
+                lanes[lane] ^= lanes[lane] >> 29;
+            }
+        }
+        hash = lanes[0] ^ (lanes[1] * 3) ^ (lanes[2] * 5) ^ (lanes[3] * 7);
+        return true;
     }
 
     bool resolveTrap(std::uintptr_t address, bool write) {
         if (!_trapping.load(std::memory_order_acquire)) return false;
+        if (declineReentrantFault()) return false;
         const auto page = pageStart(address);
         {
             const FaultLock lock(_lock);
@@ -862,6 +1266,10 @@ private:
             const bool own = resolvingCovers(page, page + _page, Owner::Self) || pthread_equal(pthread_self(), _resolverThread);
             const auto bypass = _bypass.load(std::memory_order_acquire);
             if (own || (bypass != nullptr && bypass()) || (!trapCovers(page, page + _page) && !resolvingCovers(page, page + _page, Owner::Any))) {
+                // A page a trap-keeping host write holds open is accessible already (the fault came from before the write, or from
+                // one of its two hashes): the access is retried on the open page. Opening it here would write-protect an armed
+                // page in the middle of the import, which needs it writable.
+                if (trapKeptOpen(page) && (*state & (write ? PROT_WRITE : PROT_READ)) != 0) return true;
                 if (own) deferCovering(page);
                 *state = static_cast<std::uint8_t>(*state & ~ReadTrapped);
                 ++_untrapGeneration;
@@ -1041,6 +1449,11 @@ private:
         untrap(begin, end);
     }
 
+    // Whether a host write that keeps read traps (BeginHostWriteKeepingTraps) holds the page open.
+    bool trapKeptOpen(std::uintptr_t page) const {
+        return std::any_of(_hostWrites.begin(), _hostWrites.end(), [&](const HostWrite& write) { return write.keepsTraps && write.begin <= page && page < write.end; });
+    }
+
     bool trapCovers(std::uintptr_t begin, std::uintptr_t end) const {
         return std::any_of(_traps.begin(), _traps.end(), [&](const auto& trap) { return trap.first < end && begin < trap.second; });
     }
@@ -1056,6 +1469,8 @@ private:
             if (std::any_of(remaining.begin(), remaining.end(), [&](const auto& trap) { return trap.first < page + _page && page < trap.second; })) return;
             if (resolvingCovers(page, page + _page, Owner::Others)) return;
             state = static_cast<std::uint8_t>(state & ~ReadTrapped);
+            // Inside an open trap-keeping host write the page joins the write: open and written, as its untrapped pages are.
+            if (trapKeptOpen(page)) state = static_cast<std::uint8_t>((state & (ProtectionMask | Fresh)) | Written);
             ::mprotect(reinterpret_cast<void*>(page), _page, untrappedProtection(state));
             ++_untrapGeneration;
         });
@@ -1101,7 +1516,7 @@ private:
             runProtection = -1;
         };
         forEachPage(begin, end, [&](std::uintptr_t page, std::uint8_t& state) {
-            const int wanted = (state & ReadTrapped) != 0 ? PROT_NONE : (state & Protected) != 0 ? (state & ProtectionMask & ~PROT_WRITE) : -1;
+            const int wanted = (state & ReadTrapped) != 0 ? (trapKeptOpen(page) ? -1 : PROT_NONE) : (state & Protected) != 0 ? (state & ProtectionMask & ~PROT_WRITE) : -1;
             if (wanted != runProtection || page != previous) {
                 flush(previous);
                 runStart = page;
@@ -1153,9 +1568,12 @@ private:
     const std::uintptr_t _page = static_cast<std::uintptr_t>(::getpagesize());
     std::size_t _faultAhead = 32;
     bool _available = false;
+    bool _validate = true;
+    bool _windowStores = false;
     Mutex _lock;
     std::map<std::uintptr_t, Range> _ranges;
-    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> _hostWrites;
+    std::vector<HostWrite> _hostWrites;
+    std::uint64_t _hostWriteTokens = 0;
     std::multimap<std::uintptr_t, std::uintptr_t> _traps;
     std::vector<Resolving> _resolving;
     std::vector<Resolving> _deferred;
@@ -1165,8 +1583,13 @@ private:
     unsigned _generationRetries = 0;
     std::uint64_t _untrapGeneration = 0;
     std::atomic<bool> _trapping{false};
+    std::array<std::atomic<std::uint64_t>, LayoutSlots> _layout{};
+    std::atomic<std::uint64_t> _layoutChanges{0};
     std::atomic<void (*)(std::uintptr_t, std::uintptr_t)> _resolver{nullptr};
     std::atomic<bool (*)()> _bypass{nullptr};
+#ifdef APS5_WRITE_WATCH_TEST_HOOKS
+    std::atomic<void (*)(std::uintptr_t)> _accessHook{nullptr};
+#endif
     std::once_flag _resolverStarted;
     std::atomic<bool> _resolverRunning{false};
     pthread_t _resolverThread{};
@@ -1241,11 +1664,38 @@ bool GuestWriteWatchOverlaps_nid_postfix(std::uintptr_t address, std::size_t byt
 #endif
 }
 
+bool GuestWriteWatchQueryRange_nid_postfix(std::uintptr_t address, std::size_t bytes, GuestWriteWatchRangeInfo* info) {
+    GuestWriteWatchRangeInfo local;
+    if (info == nullptr) info = &local;
+#if defined(__APPLE__)
+    if (bytes == 0 || address + bytes < address) {
+        *info = {};
+        return false;
+    }
+    return Watch::Get().QueryRange(address, address + bytes, *info);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+    *info = {};
+    return false;
+#endif
+}
+
 bool GuestWriteWatchHandleFault_nid_postfix(std::uintptr_t address) {
 #if defined(__APPLE__)
     return Watch::Get().HandleFault(address);
 #else
     static_cast<void>(address);
+    return false;
+#endif
+}
+
+bool GuestWriteWatchHandleAccess_nid_postfix(std::uintptr_t address, int write) {
+#if defined(__APPLE__)
+    return Watch::Get().HandleAccess(address, write != 0);
+#else
+    static_cast<void>(address);
+    static_cast<void>(write);
     return false;
 #endif
 }
@@ -1270,6 +1720,25 @@ void GuestWriteWatchBeginHostWrite_nid_postfix(const void* pointer, std::size_t 
 #else
     static_cast<void>(pointer);
     static_cast<void>(bytes);
+#endif
+}
+
+std::uint64_t GuestWriteWatchBeginHostWriteKeepingTraps_nid_postfix(const void* pointer, std::size_t bytes) {
+#if defined(__APPLE__)
+    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    return Watch::Get().BeginHostWriteKeepingTraps(begin, begin + bytes);
+#else
+    static_cast<void>(pointer);
+    static_cast<void>(bytes);
+    return 0;
+#endif
+}
+
+void GuestWriteWatchEndHostWriteKeepingTraps_nid_postfix(std::uint64_t token) {
+#if defined(__APPLE__)
+    Watch::Get().EndHostWriteKeepingTraps(token);
+#else
+    static_cast<void>(token);
 #endif
 }
 
@@ -1306,6 +1775,27 @@ int GuestWriteWatchProtect_nid_postfix(void* pointer, std::size_t bytes, int pro
 #endif
 }
 
+int GuestWriteWatchProtectKeepingTraps_nid_postfix(void* pointer, std::size_t bytes, int protection) {
+#if defined(__APPLE__)
+    const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    return Watch::Get().ProtectKeepingTraps(begin, begin + bytes, protection);
+#else
+    static_cast<void>(pointer);
+    static_cast<void>(bytes);
+    static_cast<void>(protection);
+    return ENOSYS;
+#endif
+}
+
+void GuestWriteWatchResolveReadTraps_nid_postfix(std::uintptr_t address, std::size_t bytes) {
+#if defined(__APPLE__)
+    if (bytes != 0 && address + bytes > address) Watch::Get().ResolveReadTraps(address, address + bytes);
+#else
+    static_cast<void>(address);
+    static_cast<void>(bytes);
+#endif
+}
+
 int GuestWriteWatchProtection_nid_postfix(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* runEnd) {
 #if defined(__APPLE__)
     return Watch::Get().Protection(address, limit, runEnd);
@@ -1315,6 +1805,52 @@ int GuestWriteWatchProtection_nid_postfix(std::uintptr_t address, std::uintptr_t
     return -1;
 #endif
 }
+
+int GuestWriteWatchAccess_nid_postfix(std::uintptr_t address, std::uintptr_t limit, std::uintptr_t* runEnd) {
+#if defined(__APPLE__)
+    return Watch::Get().Access(address, limit, runEnd);
+#else
+    static_cast<void>(address);
+    static_cast<void>(limit);
+    static_cast<void>(runEnd);
+    return -1;
+#endif
+}
+
+int GuestWriteWatchLogical_nid_postfix(std::uintptr_t address, std::uintptr_t* runBegin, std::uintptr_t* runEnd, std::uint64_t* generation) {
+#if defined(__APPLE__)
+    return Watch::Get().Logical(address, runBegin, runEnd, generation);
+#else
+    static_cast<void>(address);
+    static_cast<void>(runBegin);
+    static_cast<void>(runEnd);
+    static_cast<void>(generation);
+    return -1;
+#endif
+}
+
+std::uint64_t GuestWriteWatchLayoutChanges_nid_postfix() {
+#if defined(__APPLE__)
+    return Watch::Get().LayoutChanges();
+#else
+    return 0;
+#endif
+}
+
+std::uint64_t GuestWriteWatchLayoutGeneration_nid_postfix(std::uintptr_t address) {
+#if defined(__APPLE__)
+    return Watch::Get().LayoutGeneration(address);
+#else
+    static_cast<void>(address);
+    return 0;
+#endif
+}
+
+#if defined(__APPLE__) && defined(APS5_WRITE_WATCH_TEST_HOOKS)
+void GuestWriteWatchSetAccessHook_nid_postfix(void (*hook)(std::uintptr_t address)) {
+    Watch::Get().SetAccessHook(hook);
+}
+#endif
 
 bool GuestWriteWatchCollectFresh_nid_postfix(std::uintptr_t address, std::size_t bytes, void (*written)(void* context, std::uintptr_t begin, std::uintptr_t end), void* context) {
 #if defined(__linux__) && defined(PAGEMAP_SCAN) && defined(UFFD_FEATURE_WP_ASYNC)

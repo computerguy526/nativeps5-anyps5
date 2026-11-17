@@ -920,6 +920,7 @@ void ThreadCancel::EndWait() {
 
 extern "C" void* APS5_VABI Aps5CallGuestEntry_nid_no_patch(PthreadEntry entry, void* arg);
 
+#if defined(__x86_64__)
 asm(".text\n"
     APS5_ASM_FUNCTION("Aps5CallGuestEntry_nid_no_patch") R"(
     .cfi_startproc
@@ -942,6 +943,14 @@ asm(".text\n"
     ret
     .cfi_endproc
 )" APS5_ASM_FUNCTION_END("Aps5CallGuestEntry_nid_no_patch"));
+#else
+// nps5: arm64 host build. The x86 trampoline above only builds a frame-pointer-terminated frame for the
+// unwinder and calls the entry; on arm64 a plain call keeps the frame chain intact. This is NOT the
+// guest-ABI thread entry (that belongs to the memory/thread work, see docs/nps5-arm64.md).
+extern "C" void* APS5_VABI Aps5CallGuestEntry_nid_no_patch(PthreadEntry entry, void* arg) {
+    return entry(arg);
+}
+#endif
 
 static void RunThread(std::unique_ptr<ThreadArgs> args) {
     APS5_LOG_OUT("RunThread entry=0x%llx arg=%p self=%p", static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(args->entry)), args->arg, static_cast<void*>(args->self));
@@ -951,7 +960,9 @@ static void RunThread(std::unique_ptr<ThreadArgs> args) {
     BindHostCpuClock(self);
     TimedWait::BindThreadWaitState(&self->waitCount);
     CurrentGuestState().current = self;
+#if defined(__x86_64__)
     asm volatile("fldcw %0" : : "m"(GUEST_THREAD_FPU_CONTROL));
+#endif
     RegisterStack(self);
     sigprocmask_nid_postfix(3, &args->guestSignalMask, nullptr);
 #ifndef _WIN32

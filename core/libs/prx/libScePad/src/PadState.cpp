@@ -10,10 +10,12 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <deque>
 #include <mutex>
+#include "prx/libScePad/include/LatTrace.hpp"
 #include <stdexcept>
 
 namespace {
@@ -328,6 +330,11 @@ std::uint64_t LatchExpiry(const PadSlot& slot) {
 }
 
 PadData Pad::ReadState(int port) {
+    LatTrace::gGuestReads.fetch_add(1, std::memory_order_relaxed);
+    if (LatTrace::Enabled()) {
+        static std::uint64_t calls = 0;
+        if (++calls % 300 == 0) std::fprintf(stderr, "[lat] scePadReadState calls=%llu\n", static_cast<unsigned long long>(calls));
+    }
     if (port < 0 || port >= PAD_MAX_CONTROLLERS) throw std::invalid_argument("Pad: invalid port");
     std::lock_guard lock(stateMutex);
     if (failure) std::rethrow_exception(failure);
@@ -343,12 +350,14 @@ PadData Pad::ReadState(int port) {
         if (slot.pressedSinceRead & 0x200u) data.analog_buttons_r2 = std::max(data.analog_buttons_r2, slot.pressedAnalogR2);
     }
     slot.pressedSinceRead = 0;
+    if (data.buttons != 0) LatTrace::Read(now - slot.timestamp);
     if (slot.lastReadAt != 0) slot.readInterval = now - slot.lastReadAt;
     slot.lastReadAt = now;
     return data;
 }
 
 int Pad::Read(PadData* data, int num, int port) {
+    LatTrace::gGuestReads.fetch_add(1, std::memory_order_relaxed);
     if (data == nullptr || num <= 0) throw std::invalid_argument("Pad: invalid read buffer");
     if (port < 0 || port >= PAD_MAX_CONTROLLERS) throw std::invalid_argument("Pad: invalid port");
     std::lock_guard lock(stateMutex);
@@ -367,11 +376,34 @@ int Pad::Read(PadData* data, int num, int port) {
         data[0] = BuildData(slot, slot.state, now, now, injected, port);
         return 1;
     }
+    // nps5: more queued samples than the caller asked for would be served oldest first, a backlog the title
+    // never catches up on when it reads one sample per frame. Drop the oldest samples that only differ in
+    // sticks, triggers, touch or motion from the next one (every button transition is kept) so the newest
+    // state is within reach. OPT-IN (APS5_PAD_THIN_BACKLOG=1): it discards intermediate stick, trigger, touch and motion samples, which a
+    // title that integrates motion or reads touch gestures from the stream would miss. The default is the plain FIFO.
+    static const bool thinBacklog = std::getenv("APS5_PAD_THIN_BACKLOG") != nullptr && std::getenv("APS5_PAD_KEEP_BACKLOG") == nullptr;
+    if (thinBacklog) {
+        auto& q = slot.queue;
+        while (q.size() > static_cast<std::size_t>(num)) {
+            std::size_t victim = q.size();
+            for (std::size_t i = 0; i + 1 < q.size(); ++i) {
+                if (q[i].input.buttons == q[i + 1].input.buttons && q[i].input.intercepted == q[i + 1].input.intercepted) { victim = i; break; }
+            }
+            if (victim == q.size()) break;
+            q.erase(q.begin() + static_cast<std::ptrdiff_t>(victim));
+        }
+    }
+    if (LatTrace::Enabled()) {
+        static std::uint64_t calls = 0, served = 0, depth = 0;
+        ++calls; served += std::min<std::size_t>(slot.queue.size(), static_cast<std::size_t>(num)); depth += slot.queue.size();
+        if (calls % 300 == 0) std::fprintf(stderr, "[lat] scePadRead calls=%llu avg_queue=%.2f avg_served=%.2f num=%d\n", static_cast<unsigned long long>(calls), static_cast<double>(depth) / calls, static_cast<double>(served) / calls, num);
+    }
     int count = 0;
     while (count < num && !slot.queue.empty()) {
         const QueuedInput& entry = slot.queue.front();
         const std::uint64_t sample = port == 0 ? std::max(entry.timestamp, injectedTimestamp) : entry.timestamp;
         data[count++] = BuildData(slot, entry.input, sample, sample, injected, port);
+        if (entry.input.buttons != 0) LatTrace::Read(now - entry.timestamp);
         slot.queue.pop_front();
     }
     return count;
@@ -597,6 +629,7 @@ extern "C" void PadPublishInputForPort_nid_postfix(int port, const PadInputState
         if (pressed & 0x100u) slot.pressedAnalogL2 = input.analogButtonsL2;
         if (pressed & 0x200u) slot.pressedAnalogR2 = input.analogButtonsR2;
     }
+    if (pressed != 0) LatTrace::Publish();
     slot.state = input;
     if (slot.queue.size() == kQueueCapacity) slot.queue.pop_front();
     slot.queue.push_back({input, slot.timestamp});
@@ -664,8 +697,33 @@ extern "C" void PadGetTriggerEffectState_nid_postfix(int port, std::int32_t* sta
     std::lock_guard lock(stateMutex);
     auto& slot = slots[port];
     if (!slot.liveTriggerStatusValid) {
-        states[0] = 0;
-        states[1] = 0;
+        // No status report from a real controller: compute one from the last trigger command and the trigger
+        // travel so titles that gate L2/R2 on "an effect is active" keep reading the triggers. APS5_PAD_TRIGGER_STATE=0 disables.
+        static const bool computed = [] { const char* e = std::getenv("APS5_PAD_TRIGGER_STATE"); return e == nullptr || std::strcmp(e, "0") != 0; }();
+        for (int t = 0; t < 2; ++t) {
+            states[t] = 0;
+            const auto& req = slot.output.trigger[t];
+            if (!computed || !req.valid || slot.output.triggerDisabled) continue;
+            const std::uint8_t travel = t == 0 ? slot.state.analogButtonsL2 : slot.state.analogButtonsR2;
+            const bool pushing = travel >= 8;
+            switch (req.mode) {
+                case 1: case 4: case 5:  // feedback: 1 = idle, 2 = pushing
+                    states[t] = pushing ? 2 : 1;
+                    break;
+                case 2: {  // weapon: 3 = before start, 4 = in the click zone, 5 = past it
+                    const unsigned mask = req.effect[1] | (req.effect[2] << 8);
+                    int lo = 0, hi = 0;
+                    for (int b = 0; b < 16; ++b) if (mask & (1u << b)) { if (!lo) lo = b; hi = b; }
+                    const int zone = travel * 10 / 256;
+                    states[t] = zone < lo ? 3 : zone < hi ? 4 : 5;
+                    break;
+                }
+                case 3: case 6:  // vibration: 6 = idle, 7 = pushing
+                    states[t] = pushing ? 7 : 6;
+                    break;
+                default: break;
+            }
+        }
         return;
     }
     states[0] = triggerState(slot.liveTriggerEffects[0], slot.liveTriggerStatuses[0]);
