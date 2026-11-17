@@ -20,6 +20,7 @@
 #include <array>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
@@ -77,6 +78,22 @@ struct Registration {
 
 std::mutex g_mutex;
 std::vector<Registration> g_registrations;
+
+// ---- motion sensors (ABI 1.5 publish_pad_motion) ----
+// The library publishes a pad's SDL-normalised sensors (accel m/s^2 incl. gravity, gyro rad/s) separately from its
+// buttons; they are merged into the next published pad state. A sample older than kMotionMaxAgeMs is dropped (the
+// pad went away or stopped reporting), which gives the game its resting pose.
+constexpr int kMotionPorts = 4;
+constexpr std::uint64_t kMotionMaxAgeMs = 250;
+struct MotionSlot {
+    bool valid = false;
+    std::array<float, 3> accel{};
+    std::array<float, 3> gyro{};
+    std::chrono::steady_clock::time_point time{};
+};
+std::mutex g_motionMutex;
+MotionSlot g_motion[kMotionPorts];
+std::atomic<std::uint64_t> g_motionSamples{0};
 std::atomic<std::uint64_t> g_flips{0};
 
 std::int16_t FilterOf(std::uint32_t kind) { return kind == EventFlip ? FilterVideoOut : FilterGraphicsCore; }
@@ -261,9 +278,37 @@ __attribute__((visibility("default"))) void Nps5KytyHostPublishPad(int port, con
         input.touch[i].y = state->touch[i].y;
         input.touch[i].id = state->touch[i].id;
     }
+    if (port >= 0 && port < kMotionPorts) {
+        std::lock_guard lock(g_motionMutex);
+        const MotionSlot& m = g_motion[port];
+        if (m.valid && std::chrono::steady_clock::now() - m.time < std::chrono::milliseconds(kMotionMaxAgeMs)) {
+            input.hasMotion = true;
+            input.accel = m.accel;
+            input.gyro = m.gyro;
+        }
+    }
     PadPublishInputForPort_nid_postfix(port, input);
 } catch (...) {
     LogFailure("PublishPad");
+}
+
+// motion: 6 floats, accel x y z (m/s^2), gyro x y z (rad/s), SDL axes. Non-finite samples are ignored.
+__attribute__((visibility("default"))) void Nps5KytyHostPublishPadMotion(int port, const float* motion) try {
+    if (motion == nullptr || port < 0 || port >= kMotionPorts) return;
+    for (int i = 0; i < 6; ++i) {
+        if (!std::isfinite(motion[i])) return;
+    }
+    std::lock_guard lock(g_motionMutex);
+    MotionSlot& m = g_motion[port];
+    m.valid = true;
+    for (int i = 0; i < 3; ++i) {
+        m.accel[static_cast<std::size_t>(i)] = motion[i];
+        m.gyro[static_cast<std::size_t>(i)] = motion[3 + i];
+    }
+    m.time = std::chrono::steady_clock::now();
+    g_motionSamples.fetch_add(1);
+} catch (...) {
+    LogFailure("PublishPadMotion");
 }
 
 // Version of this interface; *padStateBytes (may be null) receives the size of the pad state PublishPad reads. A

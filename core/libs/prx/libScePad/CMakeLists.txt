@@ -171,3 +171,17 @@ add_library(nps5_Pad STATIC EXCLUDE_FROM_ALL
 )
 target_include_directories(nps5_Pad PRIVATE ${LIBS_INCLUDE_DIR})
 set_target_properties(nps5_Pad PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+
+if(BUILD_TESTING)
+    # Motion in ScePadData: layout, gravity at rest per controller type, orientation, reset / sensor state, shake, trace replay, threads.
+    add_test_executable(guest_pad_motion_tests ${LIBS_INCLUDE_DIR}/tests/GuestPadMotion.cpp)
+    target_include_directories(guest_pad_motion_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(guest_pad_motion_tests PRIVATE libScePad libc)
+    target_compile_definitions(guest_pad_motion_tests PRIVATE PAD_MOTION_TRACE="${LIBS_INCLUDE_DIR}/tests/data/pad_motion_trace.txt")
+    configure_windows_unwind(guest_pad_motion_tests)
+    add_test(NAME guest_pad_motion COMMAND guest_pad_motion_tests)
+    if(WIN32)
+        set_tests_properties(guest_pad_motion PROPERTIES ENVIRONMENT_MODIFICATION
+            "PATH=path_list_prepend:$<TARGET_FILE_DIR:libScePad>")
+    endif()
+endif()
