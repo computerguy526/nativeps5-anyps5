@@ -493,6 +493,7 @@ int OverdrawBenchmark() {
     _putenv("APS5_PROFILE_GPU=1");
 #else
     setenv("APS5_PROFILE_GPU", "1", 1);
+    setenv("NPS5_ALLOW_GPU_PROFILE", "1", 1);   // macOS: timestamp profiling is opt-in (SelfGuard.hpp)
 #endif
     const auto device = OpenVulkanTestDevice();
     if (!device) return VulkanTestSkipped;

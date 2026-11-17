@@ -1,5 +1,6 @@
 #include "prx/libSceAgcDriver/Execution/include/SelfGuard.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -9,6 +10,7 @@
 #include <thread>
 #if defined(__APPLE__)
 #include <mach/mach.h>
+#include <sys/sysctl.h>
 #include <unistd.h>
 #endif
 
@@ -31,7 +33,7 @@ std::uint32_t Max() {
 void DisableOnce(const char* why, const char* where, std::uint32_t live) {
     if (!g_disabled.exchange(true))
         std::fprintf(stderr, "[RED] gpu timestamp profiling OFF for the rest of the run: %s at %s (%u timestamp query pools live). "
-                     "More counter heaps can panic the Mac (IOGPUFamily, 2026-11-16).\n", why, where, live);
+                     "More counter heaps can panic the machine (IOGPUFamily).\n", why, where, live);
 }
 }  // namespace
 
@@ -78,18 +80,44 @@ void TimestampBudget::ResetForTest(std::uint32_t max) {
     g_max.store(max);
 }
 
+bool GpuProfileAllowed(const char* allow, bool applePlatform) {
+    // The counter heaps behind timestamp query pools are a hazard of Apple's GPU driver only.
+    return !applePlatform || (allow != nullptr && std::strcmp(allow, "1") == 0);
+}
+
 bool GpuProfileBlocked() {
     static const bool blocked = [] {
-        const char* title = std::getenv("NPS5_TITLE_ID");
-        const char* allow = std::getenv("NPS5_ALLOW_GPU_PROFILE");
-        const bool astro = title != nullptr && std::strcmp(title, "PPSA21564") == 0;
         const bool wants = std::getenv("APS5_PROFILE_GPU") != nullptr || std::getenv("APS5_PROFILE_PASSES") != nullptr;
-        const bool block = astro && !(allow != nullptr && std::strcmp(allow, "1") == 0);
+#if defined(__APPLE__)
+        const bool apple = true;
+#else
+        const bool apple = false;
+#endif
+        const bool block = !GpuProfileAllowed(std::getenv("NPS5_ALLOW_GPU_PROFILE"), apple);
         if (block && wants)
-            std::fprintf(stderr, "[RED] APS5_PROFILE_GPU/APS5_PROFILE_PASSES ignored for ASTRO BOT (timestamp counter heaps panicked the Mac on 2026-11-16); NPS5_ALLOW_GPU_PROFILE=1 overrides\n");
+            std::fprintf(stderr, "[RED] APS5_PROFILE_GPU/APS5_PROFILE_PASSES ignored: GPU timestamp counter heaps can panic the machine "
+                         "(IOGPUFamily); NPS5_ALLOW_GPU_PROFILE=1 turns them on\n");
         return block;
     }();
     return blocked;
+}
+
+std::uint32_t DefaultMemoryLimitMiB(std::uint64_t physicalBytes) {
+    const std::uint64_t total = physicalBytes >> 20;
+    const std::uint64_t reserve = std::max<std::uint64_t>(5632, total / 5);
+    if (total <= reserve + 1024) return 0;   // unknown or very small machine: no limit of our own
+    return static_cast<std::uint32_t>(std::min<std::uint64_t>(total - reserve, 0xffffffffu));
+}
+
+std::uint64_t PhysicalMemoryBytes() {
+#if defined(__APPLE__)
+    std::uint64_t bytes = 0;
+    std::size_t size = sizeof(bytes);
+    if (sysctlbyname("hw.memsize", &bytes, &size, nullptr, 0) != 0) return 0;
+    return bytes;
+#else
+    return 0;
+#endif
 }
 
 std::uint64_t FootprintMiB() {
@@ -106,9 +134,9 @@ std::uint64_t FootprintMiB() {
 void StartSelfMemoryLimit(void (*requestExit)(int code)) {
     static std::once_flag once;
     std::call_once(once, [requestExit] {
-        const auto limit = ParseLimit(std::getenv("NPS5_SELF_MEM_LIMIT_MB"), 18944);
+        const auto limit = ParseLimit(std::getenv("NPS5_SELF_MEM_LIMIT_MB"), DefaultMemoryLimitMiB(PhysicalMemoryBytes()));
         if (limit == 0) return;
-        std::fprintf(stderr, "[selfguard] self memory limit %u MiB (NPS5_SELF_MEM_LIMIT_MB, 0 = off); GPU timestamp pool budget %u\n", limit, Max() == 0xffffffffu ? 0u : Max());
+        std::fprintf(stderr, "[selfguard] self memory limit %u MiB (NPS5_SELF_MEM_LIMIT_MB, 0 = off; default = physical memory less the larger of 5.5 GiB and a fifth); GPU timestamp pool budget %u\n", limit, Max() == 0xffffffffu ? 0u : Max());
         std::thread([limit, requestExit] {
             for (;;) {
                 const auto mib = FootprintMiB();

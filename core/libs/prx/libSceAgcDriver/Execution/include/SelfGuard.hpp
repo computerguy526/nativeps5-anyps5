@@ -1,17 +1,17 @@
 #pragma once
-// Machine-safety self protection (nps5-safety, after the 2026-11-16 kernel panic in IOGPUFamily).
+// Machine-safety self protection (nps5-safety, after a kernel panic in IOGPUFamily).
 //
 //  * Timestamp query pool budget: KosmicKrisp makes one Metal counter heap per timestamp query pool; Metal refuses
 //    new heaps once the process (or system) holds too many ("too many heaps already allocated"), and Apple's GPU kernel
-//    driver then took the whole Mac down. TimestampBudget caps the live pools (NPS5_TS_POOL_MAX, default 48) and turns
+//    driver then took the whole machine down. TimestampBudget caps the live pools (NPS5_TS_POOL_MAX, default 48) and turns
 //    ALL timestamp profiling off for the rest of the run on the first refusal or vkCreateQueryPool failure.
 //  * Self memory limit: a 1 s sampler thread reads phys_footprint and exits the process cleanly (exit code 86, log line
-//    "[RED] self memory limit") above NPS5_SELF_MEM_LIMIT_MB (default 18944 = 18.5 GB, 0 = off), before the machine
-//    guard (20 GB) has to SIGKILL a process that still has GPU work in flight. The exit goes through the runtime's own
+//    "[RED] self memory limit") above NPS5_SELF_MEM_LIMIT_MB (0 = off; default: physical memory less the larger of
+//    5.5 GiB and a fifth, see DefaultMemoryLimitMiB), before the system runs out of memory with GPU work in flight. The exit goes through the runtime's own
 //    request-exit path (LibcRequestExit: shutdown token, guest threads unwind, GPU queues drain); a plain exit() from
 //    the sampler thread crashed ("recursive crash") with guest threads still running. A hard _Exit(86) follows after 10 s.
-//  * GPU profile block: APS5_PROFILE_GPU / APS5_PROFILE_PASSES are ignored for ASTRO BOT (NPS5_TITLE_ID=PPSA21564)
-//    unless NPS5_ALLOW_GPU_PROFILE=1.
+//  * GPU profile block: APS5_PROFILE_GPU / APS5_PROFILE_PASSES are ignored on macOS unless
+//    NPS5_ALLOW_GPU_PROFILE=1 (every title: the counter heaps are a property of Apple's driver, not of a game).
 #include <cstdint>
 
 namespace AgcDriver::SelfGuard {
@@ -32,7 +32,12 @@ public:
     static void ResetForTest(std::uint32_t max);
 };
 
-bool GpuProfileBlocked();                // ASTRO BOT without NPS5_ALLOW_GPU_PROFILE=1 (logged once)
+bool GpuProfileAllowed(const char* allow, bool applePlatform);   // on Apple platforms only NPS5_ALLOW_GPU_PROFILE "1" allows
+bool GpuProfileBlocked();                // macOS: GPU timestamp profiling without NPS5_ALLOW_GPU_PROFILE=1 (logged once)
+// Default of NPS5_SELF_MEM_LIMIT_MB for a machine: physical memory less the larger of 5.5 GiB and a fifth; 0 (no
+// limit) when the size is unknown or too small for that.
+std::uint32_t DefaultMemoryLimitMiB(std::uint64_t physicalBytes);
+std::uint64_t PhysicalMemoryBytes();     // 0 when unavailable
 std::uint64_t FootprintMiB();            // task phys_footprint; 0 when unavailable
 void StartSelfMemoryLimit(void (*requestExit)(int code));   // idempotent; starts the sampler thread when the limit is on
 

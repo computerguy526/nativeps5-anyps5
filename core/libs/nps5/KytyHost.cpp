@@ -7,6 +7,10 @@
 //   Nps5KytyHostPublishPad                                    pad state read by the GPU library's window
 //   Nps5KytyHostStartPadScript                                NPS5_VPAD_SCRIPT without this tree's window (which normally plays it)
 //   Nps5KytyHostRequestExit                                   LibcRequestExit, as this tree's own window close does
+//   Nps5KytyHostAbi                                           version of these functions and size of the pad state they read
+//
+// These functions are called from C: no C++ exception leaves them (an input failure reported by the pad library, an
+// allocation failure). A function that returns a status reports ErrorInternal instead.
 //
 // The event and pad-publish callbacks are a port of AstroHybrid's libAstroHybridHost (AnyPS5 patches 0021/0022 of the
 // pcportastrobot project, GPL-2.0, a derivative of this tree): same filters, idents and trigger behaviour. Nothing here
@@ -42,6 +46,9 @@ constexpr std::int16_t FilterGraphicsCore = -14;
 constexpr std::int16_t FilterVideoOut = -13;
 constexpr std::uintptr_t VideoOutEventFlip = 0;
 constexpr int ErrorBadQueue = static_cast<int>(0x80020009u);
+constexpr int ErrorInternal = static_cast<int>(0x80020016u);
+// Version of the functions exported here. The pad state layout below belongs to it.
+constexpr std::uint32_t HostAbi = 2;
 
 // kytyGpuApi.h KytyGpuPadState (ABI 1.2).
 struct KytyPadTouch {
@@ -76,9 +83,15 @@ std::int16_t FilterOf(std::uint32_t kind) { return kind == EventFlip ? FilterVid
 std::uintptr_t IdentOf(std::uint32_t kind, std::int64_t ident) { return kind == EventFlip ? VideoOutEventFlip : static_cast<std::uintptr_t>(ident); }
 
 // ---- scripted pad (NPS5_VPAD_SCRIPT) ----
-std::vector<Pad::VirtualPadEvent> g_script;
-std::atomic<bool> g_scriptStarted{false};
+// The script thread owns its events (it is detached and may outlive the globals of this library at process exit).
+std::mutex g_scriptMutex;
+int g_scriptResult = 0;  // 0 = not started yet, 1 = running, -1 = rejected; under g_scriptMutex
 std::atomic<bool> g_scriptStop{false};
+
+void LogFailure(const char* where) noexcept {
+    static std::atomic<int> logged{0};
+    if (logged.fetch_add(1) < 8) std::fprintf(stderr, "[nps5] kyty-host: %s failed with a C++ exception (ignored)\n", where);
+}
 
 std::uint32_t ButtonBit(int sdlButton) {
     switch (sdlButton) {
@@ -106,6 +119,7 @@ void ApplyScriptEvent(PadInputState& state, const Pad::VirtualPadEvent& event) {
         state.buttons = event.value != 0 ? (state.buttons | bit) : (state.buttons & ~bit);
         return;
     }
+    if (event.index < 0 || event.index > 5) return;
     if (event.index < 4) {
         state.sticks[static_cast<std::size_t>(event.index)] = static_cast<std::uint8_t>(std::clamp((static_cast<int>(event.value) + 32768) >> 8, 0, 255));
         return;
@@ -116,7 +130,7 @@ void ApplyScriptEvent(PadInputState& state, const Pad::VirtualPadEvent& event) {
     state.buttons = analog != 0 ? (state.buttons | bit) : (state.buttons & ~bit);
 }
 
-void RunScript() {
+void RunScript(std::vector<Pad::VirtualPadEvent> script) try {
     const bool log = std::getenv("NPS5_PAD_LOG") != nullptr;
     PadInputState state{};
     PadPublishInputForPort_nid_postfix(0, state);  // the pad is connected from the start
@@ -125,13 +139,13 @@ void RunScript() {
     std::size_t next = 0;
     auto lastPublish = start;
     std::array<std::chrono::steady_clock::time_point, 32> pressedAt{};
-    while (!g_scriptStop.load() && next < g_script.size()) {
+    while (!g_scriptStop.load() && next < script.size()) {
         const auto now = std::chrono::steady_clock::now();
         const auto elapsedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
         const std::uint64_t elapsedFrames = g_flips.load() - startFrame;
         bool changed = false;
-        while (next < g_script.size()) {
-            const auto& event = g_script[next];
+        while (next < script.size()) {
+            const auto& event = script[next];
             if ((event.byFrame ? elapsedFrames : elapsedMs) < event.when) break;
             const auto slot = static_cast<std::size_t>(event.index) % pressedAt.size();
             // A tap stays down at least 100 ms so the title samples it (a frame-counted tap can be a few ms long).
@@ -150,13 +164,15 @@ void RunScript() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     PadPublishInputForPort_nid_postfix(0, state);
+} catch (...) {
+    LogFailure("pad script");  // the script stops; the process goes on
 }
 
 }
 
 extern "C" {
 
-__attribute__((visibility("default"))) int Nps5KytyHostAddGpuEvent(std::int64_t equeue, std::uint32_t kind, std::int64_t ident, void* udata) {
+__attribute__((visibility("default"))) int Nps5KytyHostAddGpuEvent(std::int64_t equeue, std::uint32_t kind, std::int64_t ident, void* udata) try {
     const auto eq = static_cast<KernelEqueue>(equeue);
     if (equeue == 0 || !EqueuePin_nid_postfix(eq)) return ErrorBadQueue;
     if (kind != EventEopInterrupt && kind != EventFlip) return ErrorBadQueue;
@@ -199,9 +215,12 @@ __attribute__((visibility("default"))) int Nps5KytyHostAddGpuEvent(std::int64_t 
         g_registrations.push_back({eq, kind, ident});
     }
     return 0;
+} catch (...) {
+    LogFailure("AddGpuEvent");
+    return ErrorInternal;
 }
 
-__attribute__((visibility("default"))) int Nps5KytyHostDeleteGpuEvent(std::int64_t equeue, std::uint32_t kind, std::int64_t ident) {
+__attribute__((visibility("default"))) int Nps5KytyHostDeleteGpuEvent(std::int64_t equeue, std::uint32_t kind, std::int64_t ident) try {
     const auto eq = static_cast<KernelEqueue>(equeue);
     {
         std::lock_guard lock(g_mutex);
@@ -209,9 +228,12 @@ __attribute__((visibility("default"))) int Nps5KytyHostDeleteGpuEvent(std::int64
     }
     const int result = EqueueDeleteEvent_nid_postfix(eq, IdentOf(kind, ident), FilterOf(kind));
     return result == EQUEUE_OK ? 0 : result;
+} catch (...) {
+    LogFailure("DeleteGpuEvent");
+    return ErrorInternal;
 }
 
-__attribute__((visibility("default"))) void Nps5KytyHostDeliverEvent(std::uint32_t kind, std::int64_t ident, std::uint64_t data) {
+__attribute__((visibility("default"))) void Nps5KytyHostDeliverEvent(std::uint32_t kind, std::int64_t ident, std::uint64_t data) try {
     if (kind == EventFlip) g_flips.fetch_add(1);  // frame clock of the scripted pad
     std::vector<Registration> registrations;
     {
@@ -222,9 +244,11 @@ __attribute__((visibility("default"))) void Nps5KytyHostDeliverEvent(std::uint32
         if (registration.kind != kind || (kind == EventEopInterrupt && registration.ident != ident)) continue;
         EqueueTriggerEvent_nid_postfix(registration.eq, IdentOf(kind, registration.ident), FilterOf(kind), reinterpret_cast<void*>(static_cast<uintptr_t>(data)));
     }
+} catch (...) {
+    LogFailure("DeliverEvent");
 }
 
-__attribute__((visibility("default"))) void Nps5KytyHostPublishPad(int port, const KytyPadState* state) {
+__attribute__((visibility("default"))) void Nps5KytyHostPublishPad(int port, const KytyPadState* state) try {
     if (state == nullptr) return;
     PadInputState input{};
     input.buttons = state->buttons;
@@ -238,19 +262,32 @@ __attribute__((visibility("default"))) void Nps5KytyHostPublishPad(int port, con
         input.touch[i].id = state->touch[i].id;
     }
     PadPublishInputForPort_nid_postfix(port, input);
+} catch (...) {
+    LogFailure("PublishPad");
+}
+
+// Version of this interface; *padStateBytes (may be null) receives the size of the pad state PublishPad reads. A
+// caller built for another layout must not call PublishPad.
+__attribute__((visibility("default"))) std::uint32_t Nps5KytyHostAbi(std::uint32_t* padStateBytes) {
+    if (padStateBytes != nullptr) *padStateBytes = static_cast<std::uint32_t>(sizeof(KytyPadState));
+    return HostAbi;
 }
 
 // Returns 1 when a script was started (the GPU library then need not publish a pad), 0 without NPS5_VPAD_SCRIPT, -1 on
 // a script that cannot be read or parsed.
-__attribute__((visibility("default"))) int Nps5KytyHostStartPadScript(void) {
+__attribute__((visibility("default"))) int Nps5KytyHostStartPadScript(void) try {
     const char* text = std::getenv("NPS5_VPAD_SCRIPT");
     if (text == nullptr || *text == '\0') return 0;
-    if (g_scriptStarted.exchange(true)) return g_script.empty() ? -1 : 1;  // once per process
+    // Once per process; a second caller waits for the first one's result instead of reading a half-parsed script.
+    std::lock_guard lock(g_scriptMutex);
+    if (g_scriptResult != 0) return g_scriptResult;
+    g_scriptResult = -1;
+    std::vector<Pad::VirtualPadEvent> script;
     std::string source = text;
     if (source.front() == '@') {
         std::ifstream file(source.substr(1));
         if (!file) {
-            std::fprintf(stderr, "[pad] kyty-host: NPS5_VPAD_SCRIPT cannot read '%s'\n", source.c_str() + 1);
+            std::fprintf(stderr, "[pad] kyty-host: NPS5_VPAD_SCRIPT cannot read its file\n");
             return -1;
         }
         std::ostringstream content;
@@ -258,19 +295,24 @@ __attribute__((visibility("default"))) int Nps5KytyHostStartPadScript(void) {
         source = content.str();
     }
     std::string error;
-    if (!Pad::ParseVirtualPadScript(source, g_script, error)) {
+    if (!Pad::ParseVirtualPadScript(source, script, error)) {
         std::fprintf(stderr, "[pad] kyty-host: NPS5_VPAD_SCRIPT rejected: %s\n", error.c_str());
-        g_script.clear();
         return -1;
     }
-    std::fprintf(stderr, "[pad] kyty-host: scripted pad on port 0 (%zu events)\n", g_script.size());
-    std::thread(RunScript).detach();
+    std::fprintf(stderr, "[pad] kyty-host: scripted pad on port 0 (%zu events)\n", script.size());
+    std::thread(RunScript, std::move(script)).detach();
+    g_scriptResult = 1;
     return 1;
+} catch (...) {
+    LogFailure("StartPadScript");
+    return -1;
 }
 
-__attribute__((visibility("default"))) void Nps5KytyHostRequestExit(int code) {
+__attribute__((visibility("default"))) void Nps5KytyHostRequestExit(int code) try {
     g_scriptStop.store(true);
     LibcRequestExit_nid_postfix(code);
+} catch (...) {
+    LogFailure("RequestExit");
 }
 
 }

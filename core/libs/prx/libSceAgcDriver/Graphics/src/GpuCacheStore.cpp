@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -87,11 +88,18 @@ struct Statement {
 
 constexpr const char* EntryColumns = "id,kind,name,source_hash,content_hash,v_recompiler,v_mesa,v_macos,v_metalc,v_gpu,raw_bytes,stored_bytes,created,last_used,use_count,warm,meta";
 
-Entry readEntry(const Statement& st) {
-    Entry e;
+// The store file may come from somebody else (bundle import) or be damaged: nothing read from a row is trusted.
+// An artefact larger than this is refused before any allocation.
+constexpr std::uint64_t MaxRawBytes = std::uint64_t{4} << 30;
+
+// Reads one row. False when the row is not usable (kind outside the enum, name that is not a plain file name):
+// such a row is never handed out, and Invalidate removes it.
+bool readEntry(const Statement& st, Entry& e) {
     e.id = st.num(0);
-    e.kind = static_cast<Kind>(st.num(1));
+    const auto kind = st.num(1);
     e.name = st.col(2);
+    if (!ValidKind(kind) || !ValidName(e.name)) return false;
+    e.kind = static_cast<Kind>(kind);
     e.sourceHash = st.col(3);
     e.contentHash = st.col(4);
     for (int i = 0; i < StageCount; ++i) e.versions.value[static_cast<std::size_t>(i)] = st.col(5 + i);
@@ -102,7 +110,7 @@ Entry readEntry(const Statement& st) {
     e.useCount = st.num(14);
     e.warm = st.num(15) != 0;
     e.meta = st.col(16);
-    return e;
+    return true;
 }
 
 constexpr const char* Schema =
@@ -136,7 +144,21 @@ bool dependsOnChange(Kind kind, const StageVersions& recorded, const StageVersio
 
 }
 
-const char* KindName(Kind kind) { return KindNames[static_cast<int>(kind)]; }
+const char* KindName(Kind kind) { return ValidKind(static_cast<int>(kind)) ? KindNames[static_cast<int>(kind)] : "invalid"; }
+bool ParseMegabytes(const char* text, std::uint64_t& bytes) {
+    if (text == nullptr || *text == '\0') return false;
+    char* end = nullptr;
+    const double mb = std::strtod(text, &end);
+    if (end == text || *end != '\0' || !(mb >= 0.0) || mb > 1099511627776.0) return false;  // !(>=) also refuses NaN
+    bytes = static_cast<std::uint64_t>(mb * 1048576.0);
+    return true;
+}
+bool ValidKind(std::int64_t kind) { return kind >= 0 && kind < KindCount; }
+bool ValidName(const std::string& name) {
+    if (name.empty() || name.size() > 200 || name == "." || name == "..") return false;
+    for (const unsigned char c : name) if (c < 0x20 || c == 0x7f || c == '/' || c == '\\') return false;
+    return true;
+}
 bool ParseKind(const std::string& text, Kind& kind) {
     for (int i = 0; i < KindCount; ++i) if (text == KindNames[i]) { kind = static_cast<Kind>(i); return true; }
     return false;
@@ -221,7 +243,8 @@ InvalidationReport Store::Preview(const StageVersions& current) const {
     Statement st(impl->db, (std::string("SELECT ") + EntryColumns + " FROM artefact").c_str());
     if (!st) return report;
     while (sqlite3_step(st.s) == SQLITE_ROW) {
-        const auto e = readEntry(st);
+        Entry e;
+        if (!readEntry(st, e)) { ++report.invalid; continue; }
         if (dependsOnChange(e.kind, e.versions, current, &report.changed)) ++report.removed[static_cast<std::size_t>(e.kind)];
         else ++report.kept[static_cast<std::size_t>(e.kind)];
     }
@@ -236,7 +259,12 @@ InvalidationReport Store::Invalidate(const StageVersions& current) {
         Statement st(impl->db, (std::string("SELECT ") + EntryColumns + " FROM artefact").c_str());
         if (!st) return report;
         while (sqlite3_step(st.s) == SQLITE_ROW) {
-            const auto e = readEntry(st);
+            Entry e;
+            if (!readEntry(st, e)) {  // unusable row: remove it
+                drop.push_back(e.id);
+                ++report.invalid;
+                continue;
+            }
             if (dependsOnChange(e.kind, e.versions, current, &report.changed)) {
                 drop.push_back(e.id);
                 ++report.removed[static_cast<std::size_t>(e.kind)];
@@ -258,6 +286,7 @@ InvalidationReport Store::Invalidate(const StageVersions& current) {
 
 bool Store::Put(Kind kind, const std::string& name, const void* data, std::size_t size, const std::string& sourceHash,
                 const StageVersions& versions, const std::string& meta, int zstdLevel) {
+    if (!ValidKind(static_cast<int>(kind)) || !ValidName(name) || size > MaxRawBytes) return false;
     if (zstdLevel == 0) zstdLevel = kind == Kind::Metallib || kind == Kind::PipelineArchive || kind == Kind::VkPipelineCache ? 6 : 12;
     std::vector<char> packed(ZSTD_compressBound(size));
     std::size_t packedSize = ZSTD_compress(packed.data(), packed.size(), data, size, zstdLevel);
@@ -304,11 +333,21 @@ bool Store::Get(Kind kind, const std::string& name, std::vector<std::byte>& out,
         st.text(2, name);
         if (sqlite3_step(st.s) != SQLITE_ROW) return false;
         const auto packedSize = static_cast<std::size_t>(sqlite3_column_bytes(st.s, 0));
-        const auto rawSize = static_cast<std::size_t>(st.num(1));
-        out.resize(rawSize);
-        const auto got = ZSTD_decompress(out.data(), rawSize, sqlite3_column_blob(st.s, 0), packedSize);
-        // A truncated or bit-flipped blob can still decompress to the right length: the content hash decides.
-        if (ZSTD_isError(got) || got != rawSize || Sha256Hex16(out.data(), out.size()) != st.col(2)) corrupt = true;
+        const void* packed = sqlite3_column_blob(st.s, 0);
+        const auto declared = st.num(1);
+        // The recorded size is checked against the zstd frame before anything is allocated: a damaged or
+        // hostile row must not be able to ask for an arbitrary allocation.
+        const auto frame = packed != nullptr ? ZSTD_getFrameContentSize(packed, packedSize) : ZSTD_CONTENTSIZE_ERROR;
+        if (declared < 0 || static_cast<std::uint64_t>(declared) > MaxRawBytes || frame == ZSTD_CONTENTSIZE_ERROR ||
+            frame == ZSTD_CONTENTSIZE_UNKNOWN || frame != static_cast<std::uint64_t>(declared)) {
+            corrupt = true;
+        } else {
+            const auto rawSize = static_cast<std::size_t>(declared);
+            out.resize(rawSize);
+            const auto got = ZSTD_decompress(out.data(), rawSize, packed, packedSize);
+            // A truncated or bit-flipped blob can still decompress to the right length: the content hash decides.
+            if (ZSTD_isError(got) || got != rawSize || Sha256Hex16(out.data(), out.size()) != st.col(2)) corrupt = true;
+        }
     }
     if (corrupt) {
         // Never hand out a damaged artefact; drop the row so the next run rebuilds it.
@@ -360,7 +399,10 @@ std::vector<Entry> Store::List(int kindFilter, bool prewarmOrder) const {
     Statement st(impl->db, sql.c_str());
     std::vector<Entry> out;
     if (!st) return out;
-    while (sqlite3_step(st.s) == SQLITE_ROW) out.push_back(readEntry(st));
+    while (sqlite3_step(st.s) == SQLITE_ROW) {
+        Entry e;
+        if (readEntry(st, e)) out.push_back(std::move(e));
+    }
     return out;
 }
 
@@ -450,7 +492,8 @@ std::size_t Store::Materialize(Kind kind, const std::filesystem::path& dir, cons
     std::uint64_t bytes = 0;
     double ms = 0;
     for (const auto& entry : List(static_cast<int>(kind), true)) {
-        if (limitBytes != 0 && bytes + entry.rawBytes > limitBytes) continue;
+        if (limitBytes != 0 && (entry.rawBytes > limitBytes || bytes > limitBytes - entry.rawBytes)) continue;
+        if (!ValidName(entry.name)) continue;  // List already filters; the file name must never leave dir
         const auto file = dir / (entry.name + extension);
         std::error_code sizeError;
         if (std::filesystem::file_size(file, sizeError) == entry.rawBytes && !sizeError) { bytes += entry.rawBytes; continue; }

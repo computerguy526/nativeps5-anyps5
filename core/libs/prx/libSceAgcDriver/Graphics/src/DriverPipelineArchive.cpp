@@ -97,7 +97,7 @@ void finalize() {
                     r.store->MarkWarm(GpuCache::Kind::Metallib, entry.path().stem().string());
             }
         }
-        if (const char* cap = std::getenv("APS5_GPUCACHE_MAX_MB"); cap != nullptr && std::atof(cap) > 0) r.store->Trim(static_cast<std::uint64_t>(std::atof(cap) * 1048576.0));
+        if (std::uint64_t cap = 0; GpuCache::ParseMegabytes(std::getenv("APS5_GPUCACHE_MAX_MB"), cap) && cap > 0) r.store->Trim(cap);
         std::error_code ec;
         fs::remove_all(r.runDir, ec);
         r.store->Checkpoint();
@@ -161,7 +161,8 @@ bool ConfigureDriverGpuCacheStore(const std::filesystem::path& cacheDir, const G
     if (std::getenv("KK_METALLIB_DIR") == nullptr && (metallibOff == nullptr || std::strcmp(metallibOff, "0") != 0)) {
         rt->metallibDir = rt->runDir / "kk-metallib";
         double decompressMs = 0;
-        const auto limit = std::getenv("APS5_GPUCACHE_MATERIALIZE_MB") != nullptr ? static_cast<std::uint64_t>(std::atof(std::getenv("APS5_GPUCACHE_MATERIALIZE_MB")) * 1048576.0) : 0;
+        std::uint64_t limit = 0;  // 0 = everything; a value that is not a size leaves it there
+        if (!GpuCache::ParseMegabytes(std::getenv("APS5_GPUCACHE_MATERIALIZE_MB"), limit)) limit = 0;
         const auto n = store->Materialize(GpuCache::Kind::Metallib, rt->metallibDir, ".metallib", limit, &decompressMs);
         fs::create_directories(rt->metallibDir, ec);
         // Usage tracking: push each file's access time behind its modification time so that a later read by the driver

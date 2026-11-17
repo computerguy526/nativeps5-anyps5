@@ -97,6 +97,7 @@ int main() {
         _putenv_s("APS5_PROFILE_GPU", "1");
 #else
         setenv("APS5_PROFILE_GPU", "1", 1);
+        setenv("NPS5_ALLOW_GPU_PROFILE", "1", 1);   // macOS: timestamp profiling is opt-in (SelfGuard.hpp)
 #endif
         {
             const auto probe = OpenVulkanTestDevice();

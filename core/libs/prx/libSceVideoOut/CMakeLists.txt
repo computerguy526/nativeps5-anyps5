@@ -622,6 +622,18 @@ target_link_libraries(nps5_gpu PRIVATE
 set_target_properties(nps5_gpu PROPERTIES CXX_EXTENSIONS OFF
     LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/core/libs/libs/unpatched BUILD_RPATH "@loader_path")
 
+# nps5: C boundary of KytyHost.cpp against stand-ins for the libraries behind it (no window, no queues).
+if(APPLE)
+    add_executable(kyty_host_unit_tests EXCLUDE_FROM_ALL ${CMAKE_SOURCE_DIR}/core/libs/nps5/KytyHost.cpp ${CMAKE_SOURCE_DIR}/core/libs/nps5/tests/KytyHostUnit.cpp)
+    target_include_directories(kyty_host_unit_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR})
+    set_target_properties(kyty_host_unit_tests PROPERTIES CXX_EXTENSIONS OFF)
+    if(BUILD_TESTING)
+        set_target_properties(kyty_host_unit_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+        add_test(NAME kyty_host_unit COMMAND kyty_host_unit_tests)
+        set_tests_properties(kyty_host_unit PROPERTIES TIMEOUT 30)
+    endif()
+endif()
+
 # nps5: SDL controller host test (virtual joysticks stand in for DualSense / Switch Pro / Xbox). Needs no hardware or window.
 add_executable(nps5_pad_host_tests EXCLUDE_FROM_ALL ${NPS5_VIDEO_SRC}/tests/Nps5PadHost.cpp ${NPS5_VIDEO_SRC}/smoke/HostStubs.cpp)
 target_include_directories(nps5_pad_host_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/Decoder/Png/include)

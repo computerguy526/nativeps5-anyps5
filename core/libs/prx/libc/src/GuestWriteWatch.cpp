@@ -1615,6 +1615,7 @@ bool GuestWriteWatchAvailable_nid_postfix() {
 void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes) {
 #ifdef APS5_GUEST_WRITE_WATCH
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    if (begin + bytes < begin) return;  // a range that wraps the address space is not a range
     Watch::Get().Register(begin, begin + bytes);
 #else
     static_cast<void>(pointer);
@@ -1625,6 +1626,7 @@ void GuestWriteWatchRegister_nid_postfix(const void* pointer, std::size_t bytes)
 bool GuestWriteWatchUnregister_nid_postfix(const void* pointer, std::size_t bytes) {
 #ifdef APS5_GUEST_WRITE_WATCH
     const auto begin = reinterpret_cast<std::uintptr_t>(pointer);
+    if (begin + bytes < begin) return false;
     return Watch::Get().Unregister(begin, begin + bytes);
 #else
     static_cast<void>(pointer);

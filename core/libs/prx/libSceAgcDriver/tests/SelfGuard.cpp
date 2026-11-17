@@ -33,6 +33,23 @@ int main() {
     TimestampBudget::NoteCreateFailure("t", -2);
     CHECK(TimestampBudget::Live() == 0 && TimestampBudget::Disabled());
     CHECK(!TimestampBudget::TryAcquire("t"));
+    // the profile switch is off unless asked for with exactly "1", for every title
+    CHECK(!GpuProfileAllowed(nullptr, true) && !GpuProfileAllowed("", true) && !GpuProfileAllowed("0", true) && !GpuProfileAllowed("yes", true) && !GpuProfileAllowed("11", true));
+    CHECK(GpuProfileAllowed("1", true));
+    CHECK(GpuProfileAllowed(nullptr, false) && GpuProfileAllowed("0", false));   // other platforms: no block
+    // the default memory limit follows the machine
+    const std::uint64_t GiB = 1ull << 30;
+    CHECK(DefaultMemoryLimitMiB(0) == 0);
+    CHECK(DefaultMemoryLimitMiB(4 * GiB) == 0);
+    CHECK(DefaultMemoryLimitMiB(8 * GiB) == 8192 - 5632);
+    CHECK(DefaultMemoryLimitMiB(16 * GiB) == 16384 - 5632);
+    CHECK(DefaultMemoryLimitMiB(24 * GiB) == 18944);
+    CHECK(DefaultMemoryLimitMiB(64 * GiB) == 65536 - 65536 / 5);
+    CHECK(DefaultMemoryLimitMiB(~0ull) == 0xffffffffu);
+    for (std::uint64_t g = 1; g <= 512; ++g) { const auto l = DefaultMemoryLimitMiB(g * GiB); CHECK(l == 0 || (l >= 1024 && l < g * 1024)); }
+#if defined(__APPLE__)
+    CHECK(PhysicalMemoryBytes() >= GiB);
+#endif
     // release never underflows
     TimestampBudget::ResetForTest(10);
     TimestampBudget::Release();

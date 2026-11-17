@@ -43,7 +43,10 @@ constexpr std::uint32_t FileFormat = 1;
 std::uint64_t cacheCapBytes() {
     const char* text = std::getenv("APS5_VK_PIPELINE_CACHE_MAX_MIB");
     if (text == nullptr || *text < '0' || *text > '9') return 512ull << 20u;
-    return std::strtoull(text, nullptr, 10) << 20u;
+    char* end = nullptr;
+    const auto mib = std::strtoull(text, &end, 10);
+    if (*end != '\0') return 512ull << 20u;                 // not a number: the default
+    return mib > (~0ull >> 20u) ? ~0ull : mib << 20u;       // no wrap to a tiny cap
 }
 
 // Temporary files of a save a killed process left behind (name.tmp.<id>): the atomic write names them so, so an interrupted save is

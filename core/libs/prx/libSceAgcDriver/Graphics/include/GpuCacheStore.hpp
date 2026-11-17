@@ -20,6 +20,13 @@ namespace GpuCache {
 enum class Kind : int { SpirV = 0, Msl = 1, Metallib = 2, PipelineArchive = 3, VkPipelineCache = 4 };
 inline constexpr int KindCount = 5;
 const char* KindName(Kind kind);
+// A size in megabytes from the environment ("512", "0.5") as bytes. False for anything else (empty, text, negative,
+// not finite, above 2^40 MB): the caller keeps its default.
+bool ParseMegabytes(const char* text, std::uint64_t& bytes);
+// A kind value read from a file is inside the enum.
+bool ValidKind(std::int64_t kind);
+// An entry name is a plain file name: 1 to 200 bytes, no path separator, no control character, not "." or "..".
+bool ValidName(const std::string& name);
 bool ParseKind(const std::string& text, Kind& kind);
 
 enum class Stage : int { Recompiler = 0, Mesa = 1, MacOs = 2, MetalCompiler = 3, Gpu = 4 };
@@ -57,6 +64,7 @@ struct InvalidationReport {
     std::array<std::int64_t, KindCount> removed{};
     std::array<std::int64_t, KindCount> kept{};
     std::array<bool, StageCount> changed{};  // stage whose version differs from what the entries recorded
+    std::int64_t invalid = 0;                // unusable rows (kind outside the enum, name that is not a file name): removed
     std::int64_t RemovedTotal() const { std::int64_t n = 0; for (auto r : removed) n += r; return n; }
 };
 

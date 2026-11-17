@@ -192,6 +192,62 @@ int main() {
         const auto written = store->Materialize(Kind::Msl, outDir, ".metal");
         CHECK(written == 1);  // only msl2 is left intact
     }
+    {   // hostile or damaged rows (a store file can come from somebody else through a bundle import)
+        std::uint64_t mb = 7;
+        CHECK(ParseMegabytes("512", mb) && mb == 512ull << 20);
+        CHECK(ParseMegabytes("0.5", mb) && mb == 512ull << 10);
+        CHECK(ParseMegabytes("0", mb) && mb == 0);
+        mb = 7;
+        for (const char* bad : {"", "abc", "12x", "-1", "nan", "inf", "1e30", " "}) CHECK(!ParseMegabytes(bad, mb) && mb == 7);
+        CHECK(!ParseMegabytes(nullptr, mb));
+        CHECK(ValidKind(0) && ValidKind(KindCount - 1) && !ValidKind(-1) && !ValidKind(KindCount) && !ValidKind(99));
+        CHECK(ValidName("a") && ValidName("0123abcd.v2-x_y") && ValidName(std::string(200, 'n')));
+        CHECK(!ValidName("") && !ValidName(".") && !ValidName("..") && !ValidName("../x") && !ValidName("a/b") &&
+              !ValidName("a\\b") && !ValidName(std::string("a\0b", 3)) && !ValidName("a\nb") && !ValidName(std::string(201, 'n')));
+        CHECK(std::string(KindName(static_cast<Kind>(99))) == "invalid");
+        const auto file = dir / "hostile.sqlite";
+        const auto v = base();
+        auto store = Store::Open(file);
+        CHECK(store != nullptr);
+        const auto t = text(7);
+        CHECK(!store->Put(static_cast<Kind>(99), "k", t.data(), t.size(), "", v));
+        CHECK(!store->Put(Kind::Msl, "../escape", t.data(), t.size(), "", v));
+        CHECK(!store->Put(Kind::Msl, "", t.data(), t.size(), "", v));
+        for (const char* n : {"good", "badkind", "badname", "hugesize", "negsize", "smallsize"}) CHECK(store->Put(Kind::Msl, n, t.data(), t.size(), "", v));
+        store.reset();
+        sqlite3* db = nullptr;
+        CHECK(sqlite3_open(file.string().c_str(), &db) == SQLITE_OK);
+        auto exec = [&](const char* sql) { CHECK(sqlite3_exec(db, sql, nullptr, nullptr, nullptr) == SQLITE_OK); };
+        exec("UPDATE artefact SET kind=99 WHERE name='badkind'");
+        exec("UPDATE artefact SET name='../../escape' WHERE name='badname'");
+        exec("UPDATE artefact SET raw_bytes=1152921504606846976 WHERE name='hugesize'");  // 2^60: must not be allocated
+        exec("UPDATE artefact SET raw_bytes=-5 WHERE name='negsize'");
+        exec("UPDATE artefact SET raw_bytes=3 WHERE name='smallsize'");
+        sqlite3_close(db);
+        store = Store::Open(file);
+        CHECK(store != nullptr);
+        CHECK(store->List(-1, false).size() == 4);  // the two unusable rows are never listed
+        const auto preview = store->Preview(v);
+        CHECK(preview.invalid == 2 && preview.kept[static_cast<int>(Kind::Msl)] == 4);
+        std::vector<std::byte> out;
+        CHECK(!store->Get(Kind::Msl, "hugesize", out) && out.empty());
+        CHECK(!store->Get(Kind::Msl, "negsize", out) && out.empty());
+        CHECK(!store->Get(Kind::Msl, "smallsize", out) && out.empty());
+        CHECK(!store->Has(Kind::Msl, "hugesize") && !store->Has(Kind::Msl, "negsize") && !store->Has(Kind::Msl, "smallsize"));
+        // Materialize writes nothing outside its directory.
+        const auto outDir = dir / "hostile_mat" / "deep";
+        CHECK(store->Materialize(Kind::Msl, outDir, ".metal") == 1);
+        CHECK(std::filesystem::exists(outDir / "good.metal"));
+        CHECK(!std::filesystem::exists(dir / "escape.metal") && !std::filesystem::exists(dir / "hostile_mat" / "escape.metal"));
+        // A bundle with such rows imports only the usable ones.
+        auto target = Store::Open(dir / "hostile_target.sqlite");
+        CHECK(target->ImportBundle(file) == 1);
+        CHECK(target->Has(Kind::Msl, "good") && target->List(-1, false).size() == 1);
+        // Invalidate (run at every start) removes the unusable rows and does not index outside its report.
+        const auto report = store->Invalidate(v);
+        CHECK(report.invalid == 2 && report.RemovedTotal() == 0 && report.kept[static_cast<int>(Kind::Msl)] == 1);
+        CHECK(store->Preview(v).invalid == 0);
+    }
     {   // concurrent writers and readers (the run's exit write-back and the prewarm pool share one store)
         auto store = Store::Open(dir / "conc.sqlite");
         const auto v = base();
