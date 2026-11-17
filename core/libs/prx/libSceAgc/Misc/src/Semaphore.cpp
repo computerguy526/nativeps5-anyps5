@@ -1,5 +1,6 @@
 #include "prx/libSceAgc/Misc/include/Semaphore.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
+#include "prx/libSceAgc/include/GuestPtr.hpp"
 
 #include <cstdint>
 #include <cstddef>
@@ -61,7 +62,8 @@ int APS5_VABI sceAgcGetSemaphoreLabel(std::uint32_t index, void** label) {
     if (semaphoreBytes == 0) return GRAPHICS5_ERROR_SEMAPHORE_MEMORY_UNREGISTERED;
     if (index >= semaphoreBytes / semaphoreLabelBytes) return GRAPHICS5_ERROR_OUT_OF_RANGE;
     Agc::Command::Require(label != nullptr, __func__, "null semaphore label output");
-    *label = semaphoreMemory + static_cast<std::uint64_t>(index) * semaphoreLabelBytes;
+    // The label slot is GPU-visible guest memory: hand back the guest address of the label.
+    *label = Agc::Guest::Guest(semaphoreMemory + static_cast<std::uint64_t>(index) * semaphoreLabelBytes);
     return 0;
 }
 

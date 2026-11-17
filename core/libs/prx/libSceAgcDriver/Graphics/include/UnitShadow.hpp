@@ -44,6 +44,9 @@ struct HostImport;
 // Shadows -> tracker).
 bool UnitShadowEnabled();
 std::uint64_t UnitShadowBudget(const VkPhysicalDeviceMemoryProperties& memory, const VkPhysicalDeviceMemoryBudgetPropertiesEXT* reported);
+// WP0 memprobe: live slab bytes and the budget in force.
+std::uint64_t UnitShadowLiveBytes();
+std::uint64_t UnitShadowBudgetBytes(const Context& context);
 
 // None: a device-facing caller (a storage upload reads the slab itself); Whole: a reader of every
 // byte of the range; PartialUnits: a writer of the range (only units it covers partly are published,

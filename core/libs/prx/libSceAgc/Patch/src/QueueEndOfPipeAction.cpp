@@ -1,4 +1,5 @@
 #include "prx/libSceAgc/Patch/include/QueueEndOfPipeAction.hpp"
+#include "prx/libSceAgc/include/GuestPtr.hpp"
 
 #include "prx/libSceAgc/Command/include/Memory.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
@@ -11,7 +12,7 @@ extern "C" {
 
 int APS5_VABI sceAgcQueueEndOfPipeActionPatchAddress(std::uint32_t* cmd, const volatile Label* address) {
     Agc::Command::CheckAddress(reinterpret_cast<std::uintptr_t>(cmd), 4, __func__);
-    const auto guestAddress = reinterpret_cast<std::uintptr_t>(address);
+    const auto guestAddress = Agc::Guest::Address(address);
     const auto opcode = (cmd[0] >> 8u) & 0xffu;
     if (opcode == 0x49u) {
         Agc::Command::ValidatePacket(cmd, opcode, 8, __func__);

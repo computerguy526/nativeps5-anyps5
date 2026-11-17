@@ -15,7 +15,9 @@
 #include <cstddef>
 #include <functional>
 #include <map>
+#include "prx/libSceAgcDriver/Graphics/include/NoInitAllocator.hpp"
 #include <memory>
+#include <type_traits>
 #include <mutex>
 #include <optional>
 #include <functional>
@@ -23,6 +25,7 @@
 #include <tuple>
 #include <utility>
 #include <vector>
+
 
 namespace AgcDriver::Graphics {
 
@@ -309,6 +312,20 @@ public:
     VkImageView AttachmentProxyView();
     void RecordAttachmentProxyLoad(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
     void RecordAttachmentProxyStore(VkCommandBuffer commands, VkImageLayout attachmentLayout) const;
+    static const char*& UseTag();
+    struct RtAliasCounts {
+        std::uint64_t handOvers;
+        std::uint64_t superseded;
+        std::uint64_t storedAtClear;
+        std::uint64_t violations;
+        std::uint64_t observations;
+    };
+    static bool RtAlias();
+    static void SetRtAlias(bool enabled);
+    static bool RtAliasVerify();
+    static RtAliasCounts RtAliasCounters();
+    static void VerifyObserve(const char* kind, std::uint64_t address, std::size_t bytes);
+    static void VerifyFinal();
     void WriteBack();
     // Deferred write-back (APS5_EAGER_WRITEBACK=1 stores at once instead).
     void MarkDirty();
@@ -346,6 +363,12 @@ public:
     static std::size_t StoreDrawnLinearTouching(const char* reason, const std::function<bool(std::uint64_t, std::uint64_t)>& touches, bool all);
     static bool AnyPending();
     static void FlushDumpSelected(const char* reason);
+    // Debug aid (APS5_STAT_TARGETS=all|<hex address list>): prints the mean, maximum and zero fraction of a live image's first mip.
+    static void PrintStatsAt(std::uint64_t address, const char* tag);
+    // PrintStatsAt without the APS5_STAT_TARGETS selection (APS5_TRACE_VOLUME uses it for the 32^3 tonemap LUT).
+    static void PrintStatsForced(std::uint64_t address, const char* tag);
+    // APS5_TRACE_VOLUME: the address of the last 32^3 volume colour target drawn to (the tonemap LUT), 0 before the first.
+    static std::atomic<std::uint64_t>& TraceLutAddress();
     static bool StoreAtFlipRequested(const char* value);
     static bool StoreAtLabelRequested(const char* value);
     // See PendingSerial: a change of a surface's source outside the registry (a unit shadow
@@ -421,6 +444,15 @@ public:
     static void SetFlushFailureForTest(bool fail);
     static int TakeFlushFailureForTest();
     static bool OrderedFlushArmedForTest();
+    // Arms the GPU-ordered flush for this thread (FlushPending may skip the CPU wait for the pending
+    // results' producer when the next consumer is recorded on the same recorder); restores on exit.
+    struct GpuOrderedFlushScope {
+        explicit GpuOrderedFlushScope(bool on);
+        ~GpuOrderedFlushScope();
+        GpuOrderedFlushScope(const GpuOrderedFlushScope&) = delete;
+        GpuOrderedFlushScope& operator=(const GpuOrderedFlushScope&) = delete;
+        bool previous;
+    };
     // A consumer found the image current and used it (Refresh, the fast revalidation).
     void NoteProved() const;
     // Whether the storage cache holds this image (set and cleared by the cache under its mutex, the
@@ -535,6 +567,17 @@ public:
     static std::uint64_t OccasionalLabelStores();
     std::uint64_t GuestBytes() const;
     std::uint64_t BudgetBytes() const;
+    // WP0 memprobe: totals over every live storage image (APS5_MEM_PROBE). `ranges` lists the guest
+    // range of each image when asked for.
+    struct MemoryTotalsResult {
+        std::uint64_t images = 0;
+        std::uint64_t imageBytes = 0;
+        std::uint64_t guestBytes = 0;
+        std::uint64_t originalBytes = 0;
+        std::uint64_t baselineBytes = 0;
+        std::vector<std::pair<std::uint64_t, std::uint64_t>> ranges;
+    };
+    static MemoryTotalsResult MemoryTotals(bool ranges);
     std::size_t OriginalSnapshotBytes() const { return original.capacity(); }
     VkDeviceSize AllocationBytes() const { return memoryBytes; }
     bool AnyLayerPending() const;
@@ -600,6 +643,8 @@ private:
     void cancelStoredSave(std::uint32_t unit);
     void cancelStoredSaves();
     void releaseUnheldOriginal();
+    // Sizes `original` to guestBytes; a grown tail is zeroed unless the caller overwrites every byte.
+    void sizeOriginal(bool zeroGrowth);
     // Lets the batches holding the saves of the units `layers` selects (every unit for none) complete.
     void awaitStoredSave(const std::vector<bool>* layers);
     bool guestBytesSettled() const;
@@ -728,6 +773,7 @@ private:
     // (markLayersPending). APS5_NO_ALIAS_BORROW=1 stores and re-reads as before.
     std::shared_ptr<StorageTexture> pendingAlias() const;
     std::optional<DccKeys> clearHandOver();
+    std::uint64_t handedWrites = 0;
     void supersedeHandedOver(std::uint32_t first, std::uint32_t count);
     // The pending images FlushPending(address, bytes) would store (not the one a Refresh validates,
     // a pending unit inside the range), kept alive across the caller's use.
@@ -775,7 +821,8 @@ private:
     std::uint64_t guestBytes = 0;
     std::uint64_t sliceLinearBytes = 0;
     SurfaceGeometry geometry;
-    std::vector<std::byte> original;
+    // Guest byte copy: growing it does not zero-fill (every byte is read from guest memory right after, or zeroed by the grower).
+    std::vector<std::byte, NoInitAllocator<std::byte>> original;
     struct ComparedRange {
         std::uint64_t address = 0;
         std::size_t bytes = 0;
@@ -839,6 +886,17 @@ private:
     // write here bumps the pending serial although the image was pending already.
     bool lent = false;
     VkImage image = VK_NULL_HANDLE;
+    // What this image was last fast-cleared to (see upload): the version it reached with that clear, and which image (handle plus
+    // creation serial) it was. A member, so it dies with the texture. Touched under GuestMemory::GpuMutex only.
+    struct ClearMemo {
+        VkImage image = VK_NULL_HANDLE;
+        std::uint64_t imageSerial = 0;
+        std::uint64_t version = 0;
+        VkClearColorValue value{};
+        std::uint32_t mips = 0;
+    };
+    ClearMemo clearMemo;
+    std::uint64_t imageSerial = 0;
     ImageAllocation imageAllocation;
     VkDeviceSize memoryBytes = 0;
     VkImageView view = VK_NULL_HANDLE;

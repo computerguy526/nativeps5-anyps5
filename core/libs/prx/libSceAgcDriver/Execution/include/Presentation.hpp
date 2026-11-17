@@ -2,6 +2,7 @@
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_PRESENTATION_HPP
 
 #define VK_NO_PROTOTYPES
+#include <stop_token>
 #include <vulkan/vulkan.h>
 #include <cstdint>
 #include <exception>
@@ -24,6 +25,11 @@ struct PresentationWindow {
     std::uint32_t width;
     std::uint32_t height;
     std::shared_ptr<FrameTiming> timing;
+    // nps5: optional; shows a status line (the startup shader prebuild progress) in the window. Called from any thread.
+    void (*setStatus)(void* context, const char* text) = nullptr;
+    // nps5: optional; polled every 100 ms during the startup prebuild: returns true when the user asked to quit (SDL_QUIT). `stop` is the presenter's stop token.
+    bool (*pollQuit)(void* context) = nullptr;
+    std::stop_token stop;
 };
 
 }

@@ -20,7 +20,7 @@ void Submit(const Packet* packet, std::uint32_t queue) try {
         driver.Submit(packet, queue);
         return;
     }
-    GuestMemory::CheckRange(packet, sizeof(Packet), alignof(Packet));
+    GuestMemory::CheckHostRange(packet, sizeof(Packet), alignof(Packet));  // a host pointer: the Packet descriptor is an HLE argument; its `addr` is a guest address
     recorder->RewindTailFlips(driver.RewindTailFlips());
     const auto flips = driver.FlipSubmissions();
     recorder->Submit(*packet, queue, [&] { driver.Submit(packet, queue); });

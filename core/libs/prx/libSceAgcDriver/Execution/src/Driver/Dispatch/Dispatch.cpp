@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -75,7 +76,7 @@ bool CapturedCurrent(std::span<const ShaderRecompiler::MemoryRegion> captured, c
         if (Driver::QueryPendingSpan(address, bytes, {}) != ShaderMemory::PendingWrite::None || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), bytes)) return false;
         GuestMemory::GuardRead(address, bytes);
         GuestMemory::FlushGpuWrites(address, bytes);
-        if (std::memcmp(region.bytes.data(), reinterpret_cast<const void*>(address), bytes) != 0) return false;
+        if (std::memcmp(region.bytes.data(), GuestAddr::HostPtr<const void>(address), bytes) != 0) return false;
     }
     return true;
 }

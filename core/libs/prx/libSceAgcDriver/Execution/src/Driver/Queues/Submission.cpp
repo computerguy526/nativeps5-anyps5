@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libc/include/HostThread.hpp"
@@ -228,10 +229,10 @@ bool Driver::copyLink(Submission& submission, const std::uint32_t* guest, std::s
             require(mode == 1u || mode == 2u, "invalid COND_INDIRECT_BUFFER mode");
             require(((guest[cursor + 1] >> 8u) & 7u) == 0u, "a COND_INDIRECT_BUFFER with a comparison is not implemented");
             require(!Pm4::Predicated(header), "a predicated COND_INDIRECT_BUFFER is not implemented");
-            const auto* target = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(guest[cursor + 8] & ~3u) | (static_cast<std::uintptr_t>(guest[cursor + 9] & 0xffffu) << 32u));
+            const auto* target = GuestAddr::HostPtr<const std::uint32_t>(static_cast<std::uintptr_t>(guest[cursor + 8] & ~3u) | (static_cast<std::uintptr_t>(guest[cursor + 9] & 0xffffu) << 32u));
             const std::size_t targetWords = guest[cursor + 10] & 0xfffffu;
             if (targetWords != 0) {
-                GuestMemory::CheckRange(target, targetWords * sizeof(std::uint32_t), alignof(std::uint32_t));
+                GuestMemory::CheckHostRange(target, targetWords * sizeof(std::uint32_t), alignof(std::uint32_t));
                 const auto start = submission.commands.size();
                 if (copySegment(submission, target, targetWords, budget, depth + 1)) {
                     require(guarded.empty(), "a REWIND inside a conditional execution range is not implemented");
@@ -245,11 +246,11 @@ bool Driver::copyLink(Submission& submission, const std::uint32_t* guest, std::s
         }
         if (opcode == 0x3fu) {
             require(count == 4, "invalid INDIRECT_BUFFER size");
-            const auto* target = reinterpret_cast<const std::uint32_t*>(static_cast<std::uintptr_t>(guest[cursor + 1] & ~3u) | (static_cast<std::uintptr_t>(guest[cursor + 2] & 0xffffu) << 32u));
+            const auto* target = GuestAddr::HostPtr<const std::uint32_t>(static_cast<std::uintptr_t>(guest[cursor + 1] & ~3u) | (static_cast<std::uintptr_t>(guest[cursor + 2] & 0xffffu) << 32u));
             const std::size_t targetWords = guest[cursor + 3] & 0xfffffu;
             const bool chain = (guest[cursor + 3] & (1u << 20u)) != 0;
             require(!chain || guarded.empty(), "a chained INDIRECT_BUFFER inside a conditional execution range is not implemented");
-            GuestMemory::CheckRange(target, targetWords * sizeof(std::uint32_t), alignof(std::uint32_t));
+            GuestMemory::CheckHostRange(target, targetWords * sizeof(std::uint32_t), alignof(std::uint32_t));
             if (Pm4::Predicated(header)) {
                 require(!chain, "predicated command buffer chains are not implemented");
                 const auto start = submission.commands.size();
@@ -298,7 +299,7 @@ bool Driver::copyLink(Submission& submission, const std::uint32_t* guest, std::s
 
 bool Driver::refreshIndirectSegment(Submission& submission, std::size_t index) {
     const auto segment = submission.indirectSegments[index];
-    const auto address = reinterpret_cast<std::uint64_t>(segment.target);
+    const auto address = GuestAddr::HostToGuest(segment.target);  // target is a host pointer to the command words
     const auto bytes = segment.words * sizeof(std::uint32_t);
     const bool pipelineWrites = DrawPipeline::Active() && DrawPipeline::Queue0().Overlaps(address, bytes);
     const bool finisherWrites = DrawFinisher::Busy() && DrawFinisher::Get().PendingOverlaps(address, address + bytes);
@@ -479,8 +480,8 @@ bool Driver::awaitsTitle(std::uint64_t awaited) const {
 
 bool Driver::stillAwaited(const AwaitedSlot& slot, std::uint64_t awaited) {
     const auto shape = slot.shape.load(std::memory_order_relaxed);
-    if (shape == 0) return (*reinterpret_cast<const volatile std::uint32_t*>(awaited) & Pm4::RewindValid) == 0;
-    const std::uint64_t value = shape >> 32u == 8 ? *reinterpret_cast<const volatile std::uint64_t*>(awaited) : *reinterpret_cast<const volatile std::uint32_t*>(awaited);
+    if (shape == 0) return (*GuestAddr::HostPtr<const volatile std::uint32_t>(awaited) & Pm4::RewindValid) == 0;
+    const std::uint64_t value = shape >> 32u == 8 ? *GuestAddr::HostPtr<const volatile std::uint64_t>(awaited) : *GuestAddr::HostPtr<const volatile std::uint32_t>(awaited);
     return !Pm4::WaitCompares(static_cast<std::uint32_t>(shape), slot.reference.load(std::memory_order_relaxed), slot.mask.load(std::memory_order_relaxed), value);
 }
 
@@ -689,7 +690,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
     if (ring) PrepareSubmissionRing(stalled.queue);
     std::atomic_ref<std::uint32_t> control(*const_cast<std::uint32_t*>(stalled.rewindTail - 1));
     if ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
-        noteWaitBlocked(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1), true);
+        noteWaitBlocked(stalled.queue, GuestAddr::HostToGuest(stalled.rewindTail - 1), true);
         struct BlockedWait {
             Driver& driver;
             std::uint32_t queue;
@@ -699,8 +700,8 @@ void Driver::executeRewindTail(const Submission& stalled) {
         while ((control.load(std::memory_order_acquire) & Pm4::RewindValid) == 0) {
             CheckFailure();
             checkStopping();
-            noteAwaitingTitle(stalled.queue, reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1));
-            stall.Check("REWIND at", reinterpret_cast<std::uint64_t>(stalled.rewindTail - 1));
+            noteAwaitingTitle(stalled.queue, GuestAddr::HostToGuest(stalled.rewindTail - 1));
+            stall.Check("REWIND at", GuestAddr::HostToGuest(stalled.rewindTail - 1));
             if (stalled.queue == 0 && completionsPending()) reapCompletionLabels();
             PollSleep();
         }
@@ -751,7 +752,7 @@ void Driver::executeRewindTail(const Submission& stalled) {
 void Driver::SubmitFlip(const FlipInfo& info) {
     const auto argument = static_cast<std::uint64_t>(info.argument);
     std::array<std::uint32_t, FlipPacketWords> words{FlipPacketHeader, info.handle, static_cast<std::uint32_t>(info.index), info.mode, static_cast<std::uint32_t>(argument), static_cast<std::uint32_t>(argument >> 32u)};
-    const Packet packet{words.data(), static_cast<std::uint32_t>(words.size()), 0, {}};
+    const Packet packet{reinterpret_cast<std::uint32_t*>(GuestAddr::HostToGuest(words.data())), static_cast<std::uint32_t>(words.size()), 0, {}};  // Packet::addr is a guest address
     Submit(&packet, 0, true);
 }
 
@@ -764,8 +765,9 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
     static const bool flipsInOrder = std::getenv("APS5_CPU_FLIP_IN_ORDER") != nullptr || std::getenv("APS5_SYNC_FLIP") != nullptr;
     const bool unorderedFlip = cpuFlip && !flipsInOrder && !APS5_ENABLE_TIMING_LOG && !submitsQueue0();
     if (queue == 0 && !cpuFlip) submitsQueue0() = true;
-    GuestMemory::CheckRange(packet, sizeof(Packet), alignof(Packet));
+    GuestMemory::CheckHostRange(packet, sizeof(Packet), alignof(Packet));  // `packet` is a host pointer; `packet->addr` a guest address
     const auto descriptor = *packet;
+    const auto* const commandsHost = GuestAddr::HostPtr<const std::uint32_t>(reinterpret_cast<std::uintptr_t>(descriptor.addr));  // the command words, read through the choke point
     require(descriptor.flags == 0, "nonzero submission flags are not implemented");
     Submission submission{};
     submission.queue = queue;
@@ -776,11 +778,11 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
     if (descriptor.dw_num != 0) {
         require(descriptor.dw_num <= std::numeric_limits<std::size_t>::max() / sizeof(std::uint32_t), "command size overflow");
         GuestMemory::CheckRange(descriptor.addr, static_cast<std::size_t>(descriptor.dw_num) * sizeof(std::uint32_t), alignof(std::uint32_t));
-        copyCommands(submission, descriptor.addr, descriptor.dw_num);
+        copyCommands(submission, commandsHost, descriptor.dw_num);
     }
     const auto copied = profile ? std::chrono::steady_clock::now() : start;
     if (APS5_ENABLE_TIMING_LOG) submission.copiedAt = std::chrono::steady_clock::now();
-    validate(submission, descriptor.addr);
+    validate(submission, commandsHost);
     readRegisterLists(submission);
     if (APS5_ENABLE_TIMING_LOG) submission.validatedAt = std::chrono::steady_clock::now();
     waitForFlipRoom(submission);
@@ -835,7 +837,7 @@ void Driver::Submit(const Packet* packet, std::uint32_t queue, bool cpuFlip) {
         const auto now = std::chrono::steady_clock::now();
         submission.enqueuedAt = now;
         if (capture != nullptr) capture->Take(captured, submission.serial, captureTime(), submission.heldAtSubmit);
-        if (ring) RecordSubmission(queue, submission.serial, submission.commands, descriptor.addr, false);
+        if (ring) RecordSubmission(queue, submission.serial, submission.commands, commandsHost, false);
         if (profile) {
             ++costs.submissions;
             costs.validateNs += static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(validated - copied).count());
@@ -1024,8 +1026,8 @@ void Driver::noteHeldAtSubmit(Submission& submission, std::size_t cursor) {
         if (std::find(submission.labelWrites.begin(), submission.labelWrites.end(), dword) != submission.labelWrites.end()) return;
         if (worker != workers.end() && worker->second.unfinishedWrites.contains(dword)) return;
     }
-    std::uint64_t value = *reinterpret_cast<const volatile std::uint32_t*>(address);
-    if (bytes == 8) value |= static_cast<std::uint64_t>(*reinterpret_cast<const volatile std::uint32_t*>(address + 4)) << 32u;
+    std::uint64_t value = *GuestAddr::HostPtr<const volatile std::uint32_t>(address);
+    if (bytes == 8) value |= static_cast<std::uint64_t>(*GuestAddr::HostPtr<const volatile std::uint32_t>(address + 4)) << 32u;
     if (Pm4::WaitComparesValue(packet, value)) submission.heldAtSubmit.insert(cursor);
 }
 

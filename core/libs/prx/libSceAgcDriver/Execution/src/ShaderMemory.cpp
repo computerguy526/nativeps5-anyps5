@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderMemory.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -384,7 +385,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
     const auto index = static_cast<std::size_t>((address % PageBytes) / sizeof(*value));
     if (!page.valid.Test(index) && page.lazy) {
         const auto first = index / BlockWords * BlockWords;
-        GuestMemory::CopyGuestBytes(&page.words[first], reinterpret_cast<const void*>((address & ~static_cast<std::uint64_t>(PageBytes - 1)) + first * sizeof(std::uint32_t)), BlockWords * sizeof(std::uint32_t));
+        GuestMemory::CopyGuestBytes(&page.words[first], GuestAddr::HostPtr<const void>((address & ~static_cast<std::uint64_t>(PageBytes - 1)) + first * sizeof(std::uint32_t)), BlockWords * sizeof(std::uint32_t));
         page.valid.SetBlock(index);
     }
     const auto spanNeedsSync = [](PendingWrite spanPolicy) {
@@ -443,7 +444,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             }
         } else if (policy == PendingWrite::Raw || policy == PendingWrite::VerifyRaw) {
             GuestMemory::GuardRead(address, sizeof(word));
-            std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+            std::memcpy(&word, GuestAddr::HostPtr<const void>(address), sizeof(word));
             ++CaptureTotals().wordsRaw;
             if (policy == PendingWrite::VerifyRaw) {
                 std::uint32_t verifiedWord = 0;
@@ -463,7 +464,7 @@ bool ShaderMemory::read(void* context, std::uint64_t address, std::uint32_t* val
             // On a word-wise page the bytes before the hook's wait are kept for the observer.
             const bool observed = page.wordwise && policy == PendingWrite::Sync && self.observe != nullptr && GuestMemory::Accessible(reinterpret_cast<const void*>(address), sizeof(word));
             std::uint32_t before = 0;
-            if (observed) std::memcpy(&before, reinterpret_cast<const void*>(address), sizeof(before));
+            if (observed) std::memcpy(&before, GuestAddr::HostPtr<const void>(address), sizeof(before));
             const auto waitsBefore = page.wordwise ? hookWaits() : 0;
             const auto started = page.wordwise ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
             if (page.wordwise && policy == PendingWrite::Sync && self.descriptorSpanBytes > sizeof(word)) {
@@ -573,7 +574,7 @@ bool ShaderMemory::readWords(void* context, std::uint64_t address, std::uint32_t
                     }
                     auto last = first + BlockWords;
                     while (last < end && !page->valid.TestBlock(last)) last += BlockWords;
-                    GuestMemory::CopyGuestBytes(&page->words[first], reinterpret_cast<const void*>(base + first * sizeof(std::uint32_t)), (last - first) * sizeof(std::uint32_t));
+                    GuestMemory::CopyGuestBytes(&page->words[first], GuestAddr::HostPtr<const void>(base + first * sizeof(std::uint32_t)), (last - first) * sizeof(std::uint32_t));
                     page->valid.SetRun(first, last - first);
                     first = last;
                 }
@@ -719,8 +720,8 @@ bool ShaderMemory::place(std::uint64_t address, const std::uint32_t* values, std
                 if (!page.valid.Test(index + word)) page.words[index + word] = values[word];
             }
         }
-        if (headOpen && head < index) GuestMemory::CopyGuestBytes(&page.words[head], reinterpret_cast<const void*>(base + head * sizeof(std::uint32_t)), (index - head) * sizeof(std::uint32_t));
-        if (tailOpen && index + words < tail) GuestMemory::CopyGuestBytes(&page.words[index + words], reinterpret_cast<const void*>(base + (index + words) * sizeof(std::uint32_t)), (tail - index - words) * sizeof(std::uint32_t));
+        if (headOpen && head < index) GuestMemory::CopyGuestBytes(&page.words[head], GuestAddr::HostPtr<const void>(base + head * sizeof(std::uint32_t)), (index - head) * sizeof(std::uint32_t));
+        if (tailOpen && index + words < tail) GuestMemory::CopyGuestBytes(&page.words[index + words], GuestAddr::HostPtr<const void>(base + (index + words) * sizeof(std::uint32_t)), (tail - index - words) * sizeof(std::uint32_t));
         page.valid.SetRun(page.lazy ? head : index, page.lazy ? tail - head : words);
         page.read.SetRun(index, words);
         if (recent) page.recent.SetRun(index, words);

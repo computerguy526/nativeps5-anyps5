@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstdio>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -56,6 +57,7 @@ bool VideoOutHostResolutionLimited() {
 
 }
 
+static bool VoTrace() { static const bool on = std::getenv("APS5_TRACE_VIDEOOUT") != nullptr; return on; }
 static constexpr std::uint32_t VIDEO_OUT_OUTPUT_OPTIONS_FIRST_WORD = 0x00FF0000;
 static constexpr std::size_t VIDEO_OUT_OUTPUT_OPTIONS_FREE_WORD = 3;
 static constexpr int VIDEO_OUT_ERROR_0x8029001C = -2144796644;
@@ -129,6 +131,7 @@ static void validateOpenParam(const void* param) {
 extern "C" {
 
 int APS5_VABI sceVideoOutOpen(int userId, int busType, int index, const void* param) try {
+    if (VoTrace()) std::fprintf(stderr, "[vo-trace] Open(bus=%d)\n", busType);
     if (busType == VIDEO_OUT_BUS_TYPE_HMD2_MAIN) return VIDEO_OUT_ERROR_INVALID_VALUE;
     validateOpenParam(param);
     if (userId != 255 && userId != 0) {
@@ -154,6 +157,7 @@ int APS5_VABI sceVideoOutClose(int handle) try {
 }
 
 int APS5_VABI sceVideoOutGetDeviceCapabilityInfo_(int handle, void* info, std::uint64_t size) try {
+    if (VoTrace()) std::fprintf(stderr, "[vo-trace] GetDeviceCapabilityInfo(handle=%d size=%llu)\n", handle, (unsigned long long)size);
     if (!VideoOutDriver::Get().HasConfig(handle)) return VIDEO_OUT_ERROR_INVALID_HANDLE;
     if (info == nullptr || size != sizeof(std::uint64_t)) return VIDEO_OUT_ERROR_INVALID_VALUE;
     const std::uint64_t capabilities = 1;
@@ -241,6 +245,7 @@ int APS5_VABI sceVideoOutGetVblankStatus(int handle, VideoOutVblankStatus* statu
 }
 
 int APS5_VABI sceVideoOutGetOutputStatus(int handle, VideoOutOutputStatus* status) try {
+    if (VoTrace()) std::fprintf(stderr, "[vo-trace] GetOutputStatus(handle=%d)\n", handle);
     if (status == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
@@ -272,6 +277,7 @@ int APS5_VABI sceVideoOutGetOutputStatusWithVrr(int handle, void* status) try {
 }
 
 int APS5_VABI sceVideoOutGetResolutionStatus(int handle, VideoOutResolutionStatus* status) try {
+    if (VoTrace()) std::fprintf(stderr, "[vo-trace] GetResolutionStatus(handle=%d)\n", handle);
     if (status == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_ADDRESS");
     }
@@ -395,6 +401,7 @@ int APS5_VABI sceVideoOutInitializeOutputOptions(VideoOutOutputOptions* options)
 }
 
 int APS5_VABI sceVideoOutIsOutputSupported(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) try {
+    if (VoTrace()) std::fprintf(stderr, "[vo-trace] IsOutputSupported(mode=0x%llx)\n", (unsigned long long)mode);
     const int result = validateOutputConfig(handle, mode, options, reservedPtr, reserved);
     if (result == VIDEO_OUT_ERROR_UNKNOWN_OUTPUT_MODE && VideoOutHostResolutionLimited()) return 0;
     return result;
@@ -403,6 +410,7 @@ int APS5_VABI sceVideoOutIsOutputSupported(int handle, uint64_t mode, const Vide
 }
 
 int APS5_VABI sceVideoOutConfigureOutput(int handle, uint64_t mode, const VideoOutOutputOptions* options, void* reservedPtr, uint64_t reserved) try {
+    if (VoTrace()) std::fprintf(stderr, "[vo-trace] ConfigureOutput(mode=0x%llx)\n", (unsigned long long)mode);
     const int supported = sceVideoOutIsOutputSupported(handle, mode, options, reservedPtr, reserved);
     if (supported < 0) {
         return supported;

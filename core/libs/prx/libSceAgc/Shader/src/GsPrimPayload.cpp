@@ -5,6 +5,7 @@
 #include <prx/libc/include/General.hpp>
 
 #include "SceShaders.hpp"
+#include "prx/libSceAgc/Shader/include/ShaderView.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 
 namespace {
@@ -17,10 +18,12 @@ constexpr std::uint32_t TwoComponentPayloadBytes = 8u;
 
 extern "C" {
 
-int APS5_VABI sceAgcGetGsPrimPayload(std::uint32_t* payload, const Shader* gs) {
-    if (payload == nullptr || gs == nullptr) {
+int APS5_VABI sceAgcGetGsPrimPayload(std::uint32_t* payload, const Shader* gsHost) {
+    if (payload == nullptr || gsHost == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": payload or gs is null");
     }
+    const Agc::Guest::ShaderView gsView(gsHost);
+    const Shader* const gs = gsView.get();
     if (gs->num_cx_registers != 0 && gs->cx_registers == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": gs->cx_registers is null but num_cx_registers != 0");
     }

@@ -13,6 +13,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include "Recompiler.hpp"
 
 namespace AgcDriver::Graphics {
@@ -214,6 +215,9 @@ void ApplyPointSize(const State& state, ShaderRecompiler::ShaderVertexStageInfo&
 State DecodeState(const QueueState& queue, bool vertexWorkgroup = false);
 void ApplyDepthRemap(const Context& context, State& state);
 void ApplyDepthBoundsEmulation(const Context& context, State& state, const ShaderRecompiler::ShaderPixelStageInfo& pixel);
+// Whether a driver reports the depth bounds test but drops it (KosmicKrisp on Apple M1 to M4);
+// APS5_DEPTH_BOUNDS=emulate|native overrides.
+bool DriverIgnoresDepthBounds(std::string_view driverInfo, std::string_view deviceName);
 void ApplyReadOnlyDepthBoundsComparison(State& state, const ShaderRecompiler::ShaderPixelStageInfo& pixel, bool enabled);
 void NormalizeUnusedViewportDepth(State& state, const ShaderRecompiler::ShaderPixelStageInfo& pixel);
 std::uint32_t StageWaveSize(const ShaderStages& stages, ShaderRecompiler::ShaderStage stage);

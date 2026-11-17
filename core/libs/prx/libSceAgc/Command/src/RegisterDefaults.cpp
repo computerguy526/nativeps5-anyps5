@@ -1,5 +1,9 @@
 #include "prx/libSceAgc/Command/include/RegisterDefaults.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
+#include "prx/libSceAgc/include/GuestPtr.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
+#include <memory>
+#include <new>
 
 #include <algorithm>
 #include <array>
@@ -44,10 +48,14 @@ struct CompactRegisterDefaults {
 
 #include "prx/libSceAgc/Command/include/RegisterDefaultsData.hpp"
 
+// The defaults tables are read by the title and their register banks are named by GPU-visible indirect register
+// packets, so the whole structure (header, banks, pointer tables, types) is built in one driver scratch block that has a
+// guest address; every pointer stored in it is a guest value. `defaults` is the host pointer of the header in the block.
 struct Storage {
-    RegisterDefaults defaults{};
-    std::array<std::vector<ShaderRegister*>, 4> pointers;
-    std::vector<TypeIndex> types;
+    // Never freed: the tables live for the process (and a destructor running during static teardown would touch the
+    // scratch allocator after it is gone).
+    AgcDriver::GuestAddr::Scratch* block = nullptr;
+    RegisterDefaults* defaults = nullptr;
     bool initialized = false;
 };
 
@@ -91,42 +99,53 @@ void* GetRegisterDefaults(std::uint32_t version, bool internal, const char* func
     const auto layoutIndex = typeLayout == RegisterDefaultsTypeLayout::KeyBankPairs ? 1 : 0;
     auto& destination = storage[internal ? 1 : 0][layoutIndex][version];
     if (!destination.initialized) {
-        std::array<std::vector<ShaderRegister*>, 4> pointers;
-        RegisterDefaults defaults{};
-        for (std::size_t bank = 0; bank < pointers.size(); ++bank) {
-            const auto& input = source->banks[bank];
+        const auto alignUp = [](std::size_t value) { return (value + 15u) & ~std::size_t{15}; };
+        std::size_t bytes = alignUp(sizeof(RegisterDefaults));
+        for (const auto& input : source->banks) {
             Require(input.pointerCount == 0 || (input.registers != nullptr && input.offsets != nullptr), function, "invalid register defaults bank");
-            auto& table = pointers[bank];
-            table.reserve(input.pointerCount);
-            for (std::uint32_t index = 0; index < input.pointerCount; ++index) {
-                Require(input.offsets[index] < input.registerCount, function, "register defaults pointer exceeds bank");
-                table.push_back(input.registers + input.offsets[index]);
-            }
-            defaults.tables[bank] = table.empty() ? nullptr : table.data();
-            defaults.registerCounts[bank] = input.registerCount;
+            bytes += alignUp(std::size_t{input.registerCount} * sizeof(ShaderRegister)) + alignUp(std::size_t{input.pointerCount} * sizeof(ShaderRegister*));
         }
         Require(source->count == 0 || source->types != nullptr, function, "missing register defaults types");
-        std::vector<TypeIndex> types;
+        bytes += alignUp(std::size_t{source->count} * 3u * sizeof(std::uint32_t));
+        auto* const block = new AgcDriver::GuestAddr::Scratch(bytes, 4096);
+        auto* const base = static_cast<std::uint8_t*>(block->data());
+        std::size_t cursor = 0;
+        const auto take = [&](std::size_t size) {
+            auto* const at = base + cursor;
+            cursor += alignUp(size);
+            return at;
+        };
+        auto* const defaults = new (take(sizeof(RegisterDefaults))) RegisterDefaults{};
+        for (std::size_t bank = 0; bank < 4; ++bank) {
+            const auto& input = source->banks[bank];
+            auto* const registers = reinterpret_cast<ShaderRegister*>(take(std::size_t{input.registerCount} * sizeof(ShaderRegister)));
+            if (input.registerCount != 0) std::memcpy(registers, input.registers, std::size_t{input.registerCount} * sizeof(ShaderRegister));
+            auto* const table = reinterpret_cast<ShaderRegister**>(take(std::size_t{input.pointerCount} * sizeof(ShaderRegister*)));
+            for (std::uint32_t index = 0; index < input.pointerCount; ++index) {
+                Require(input.offsets[index] < input.registerCount, function, "register defaults pointer exceeds bank");
+                table[index] = Agc::Guest::Guest(registers + input.offsets[index]);
+            }
+            defaults->tables[bank] = input.pointerCount == 0 ? nullptr : Agc::Guest::Guest(table);
+            defaults->registerCounts[bank] = input.registerCount;
+        }
+        auto* const types = reinterpret_cast<std::uint32_t*>(take(std::size_t{source->count} * 3u * sizeof(std::uint32_t)));
         if (typeLayout == RegisterDefaultsTypeLayout::KeyBankPairs) {
-            types.reserve(source->count);
+            auto* const pairs = reinterpret_cast<TypeIndex*>(types);
             for (std::uint32_t entry = 0; entry < source->count; ++entry) {
                 const std::uint32_t bankIndex = source->types[entry * 3 + 1] & 0x3ffu;
                 Require((bankIndex >> 2) < source->banks[bankIndex & 3u].pointerCount, function, "register defaults type exceeds its bank");
-                types.push_back({source->types[entry * 3], bankIndex});
+                pairs[entry] = {source->types[entry * 3], bankIndex};
             }
+        } else if (source->count != 0) {
+            std::memcpy(types, source->types, std::size_t{source->count} * 3u * sizeof(std::uint32_t));
         }
-        if (typeLayout == RegisterDefaultsTypeLayout::KeyBankPairs) {
-            defaults.types = types.empty() ? nullptr : types.data();
-        } else {
-            defaults.types = source->types;
-        }
-        defaults.count = source->count;
-        destination.pointers = std::move(pointers);
-        destination.types = std::move(types);
+        defaults->types = source->count == 0 ? nullptr : Agc::Guest::Guest(static_cast<void*>(types));
+        defaults->count = source->count;
+        destination.block = block;
         destination.defaults = defaults;
         destination.initialized = true;
     }
-    return &destination.defaults;
+    return destination.defaults;
 }
 
 int GetDefaultCxStateFlat(void* destination, std::uint32_t size) {

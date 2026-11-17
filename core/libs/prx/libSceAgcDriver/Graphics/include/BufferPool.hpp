@@ -76,6 +76,11 @@ public:
     VkDeviceMemory TakeImageMemory(const VkMemoryAllocateInfo& allocation, const char* operation, std::optional<std::uint32_t> hostType = std::nullopt, std::uint32_t* allocatedType = nullptr, bool newImage = false);
     void PutImageMemory(VkDeviceMemory memory, VkDeviceSize bytes, std::uint32_t memoryType) noexcept;
     std::size_t RetainedImages();
+    // WP0 memprobe: retained bytes of each tier against its budget.
+    struct PoolTotals {
+        std::uint64_t small = 0, smallBudget = 0, large = 0, largeBudget = 0, device = 0, deviceBudget = 0, images = 0, imageBudget = 0;
+    };
+    PoolTotals Totals();
     std::optional<BufferAllocation> Take(std::size_t bytes, VkBufferUsageFlags usage, VkMemoryPropertyFlags properties = VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT, const char* category = nullptr, bool hostPlaced = false);
     void Put(const BufferAllocation& allocation) noexcept;
     VkDeviceSize ReclaimIdleDevice(VkDeviceSize bytes, std::chrono::steady_clock::time_point now);

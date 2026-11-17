@@ -28,6 +28,10 @@ struct SpirvRequirements {
     bool bufferInt64Atomics = false;
     bool bufferInt64AtomicsExact = false;
     bool bufferInt64AtomicsSplit = false;
+    // Every 64-bit buffer atomic of the program is a plain 64-bit load or store in disguise (IsPlainBufferAtomic64).
+    bool bufferInt64AtomicsPlainOnly = false;
+    // Set by the emitter on a device without shaderBufferInt64Atomics: those atomics compile to one aligned 64-bit load or store.
+    bool bufferInt64AtomicsPlain = false;
     bool coherentBufferPairs = false;
     bool bufferU64View = false;
     bool imageInt64Atomics = false;
@@ -44,6 +48,10 @@ struct SpirvRequirements {
 };
 
 [[nodiscard]] bool IsSplittableBufferAtomic64(const IrValue* inst);
+// A 64-bit buffer atomic that only reads the word (or/xor/add of a zero operand on every active lane) or only writes it
+// (an exchange whose result no instruction reads).
+[[nodiscard]] bool IsPlainLoadBufferAtomic64(const IrValue* inst);
+[[nodiscard]] bool IsPlainStoreBufferAtomic64(const IrValue* inst);
 [[nodiscard]] SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program);
 [[nodiscard]] bool IsIntegerFloat64Opcode(IrOpcode opcode);
 inline constexpr std::uint32_t FunctionLdsDwordLimit = 8192u;

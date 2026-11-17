@@ -255,6 +255,8 @@ public:
     bool KnownHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::optional<std::uint32_t>& highest, std::uint32_t* lowest = nullptr);
     void KeepHighestIndex(std::uint64_t address, std::size_t bytes, SnapshotUse use, std::uint64_t generation, std::uint64_t registryGeneration, std::optional<std::uint32_t> highest, std::uint32_t lowest = 0);
     void OnComplete(std::function<void()> action);
+    // Debug aid (APS5_TRACE_VOLUME): an action of the open batch's completion that counts as nothing.
+    void DebugOnComplete(std::function<void()> action);
     void NotePendingWrite(std::uint64_t address, std::size_t bytes);
     void NotePendingFill(std::uint64_t address, std::size_t bytes, std::uint8_t value);
     void NotePendingWordFill(std::uint64_t address, std::size_t bytes, std::uint32_t word);
@@ -628,6 +630,16 @@ public:
     static constexpr std::uint64_t DrawTimingKey(std::uint64_t variantId) { return variantId | DrawTimingFlag; }
     static std::string TimingKeyLabel(std::uint64_t key);
     static bool GpuTimingEnabled();
+    // APS5_PROFILE_PASSES=<n> (implies the timing above): each render pass and compute dispatch is
+    // labelled (render targets with size and format, shader variant ids, draw count, grid) and its
+    // GPU time is reported as a per-pass table: the passes of every n-th frame (default 40) and,
+    // every 10 s, the top passes of the window and of the run by total time.
+    static bool PassProfileEnabled();
+    // Labels the timed range `index` (a dispatch).
+    void DescribeTiming(std::uint32_t index, std::string label);
+    // A draw recorded into the open render pass: the first one labels the pass's range with
+    // `label()`, every one is counted and its shader variant ids listed.
+    void NotePassDraw(const std::function<std::string()>& label, std::uint64_t vertexShader, std::uint64_t fragmentShader);
     static bool BatchStampsEnabled();
     std::uint32_t BeginGpuTiming(std::uint64_t key);
     std::uint32_t BeginInPassGpuTiming(std::uint64_t key);
@@ -772,6 +784,13 @@ private:
         std::uint32_t queuedDumps = 0;
         std::vector<std::uint64_t> timedKeys;
         std::vector<std::uint64_t> timedBytes;
+        // Per timed range, when PassProfileEnabled(): what it was (see DescribeTiming).
+        struct TimedInfo {
+            std::string label;
+            std::uint32_t draws = 0;
+            std::uint64_t frame = 0;
+        };
+        std::vector<TimedInfo> timedInfo;
         // The whole-batch timed range (BatchTimingKey) and its stamps once read (see Completed).
         std::uint32_t batchTiming = NoTiming;
         double gpuStartNs = 0;
@@ -879,6 +898,8 @@ private:
         bool behindCompletion = false;
     };
     void readGpuTiming(Batch& batch);
+    static void notePassRow(const Batch::TimedInfo& info, std::uint64_t key, double ms);
+    static void reportPasses();
     void beginSamples(Batch& batch);
     void readSamples(Batch& batch);
     bool gpuSampleCounter();
@@ -945,6 +966,14 @@ private:
         return resolved != nullptr ? resolved : context.Function<TFunction>(name);
     }
     VkResult fenceStatus(VkFence fence) const { return function(getFenceStatus, "vkGetFenceStatus")(context.device, fence); }
+    // fenceStatus of a submitted batch, answered "not ready" from the timeline counter when the timeline
+    // has not reached the batch's serial (APS5_TIMELINE_POLL=1). On KosmicKrisp vkGetFenceStatus of an
+    // unsignaled fence is a kernel call (-[MTLSharedEvent waitUntilSignaledValue:timeoutMS:0], 18-43 us),
+    // the counter a load from the event's shared page. Submit signals the timeline with the serial in
+    // the same submission as the fence, so a counter below the serial means the batch has not
+    // completed; at or above it the fence is still asked (it may signal a moment after the counter).
+    VkResult batchStatus(const Batch& batch) const;
+    PFN_vkGetSemaphoreCounterValueKHR getCounterValue = nullptr;
     void recordBarrier(VkCommandBuffer commands, VkPipelineStageFlags sourceStage, VkPipelineStageFlags destinationStage, VkAccessFlags sourceAccess, VkAccessFlags destinationAccess) const;
     // Opens a batch when none is open, without closing a store run (Commands() does both).
     void ensureOpen();

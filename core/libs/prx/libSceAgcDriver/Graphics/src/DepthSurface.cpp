@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -810,7 +811,7 @@ public:
             if (stencilPlaneAliased) sampling.aliasStencil = *stencilClearValue;
             else Require(gpuFill || stencilStored || GuestMemory::StoredAllSince_nid_no_patch(plane.address, plane.bytes, stencilClearGeneration), "native multisample stencil plane fill has no complete tracked store");
             if (!queuedStencilFill && !stencilPlaneAliased) {
-                const auto* bytes = reinterpret_cast<const std::uint8_t*>(plane.address);
+                const auto* bytes = GuestAddr::HostPtr<const std::uint8_t>(plane.address);
                 Require(std::all_of(bytes, bytes + plane.bytes, [&](std::uint8_t value) { return value == *stencilClearValue; }), "native multisample stencil plane does not hold its fill value");
             }
             const auto generation = GuestMemory::CollectWritesUncached(plane.address, plane.bytes);
@@ -835,7 +836,7 @@ public:
             auto current = sampling.initial;
             current[1].generation = GuestMemory::CollectWritesUncached(metadata.address, metadata.bytes);
             std::vector<std::uint32_t> words(queuedFill ? 1u : metadata.bytes / sizeof(std::uint32_t), queuedFill ? *clearPattern : 0u);
-            if (!queuedFill) std::memcpy(words.data(), reinterpret_cast<const void*>(metadata.address), metadata.bytes);
+            if (!queuedFill) std::memcpy(words.data(), GuestAddr::HostPtr<const void>(metadata.address), metadata.bytes);
             for (const auto word : words) {
                 Require(htileProvesClear(word, target.htileDepthOnly, clearDepth), "native multisample depth completed HTILE does not prove its clear value");
                 Require((clearAspects & VK_IMAGE_ASPECT_STENCIL_BIT) == 0u || htileProvesStencilClear(word), "native multisample stencil completed HTILE does not prove its clear value");
@@ -1786,7 +1787,7 @@ private:
         for (std::size_t index = 0u; index < pages; ++index) {
             const auto first = index * PublicationPlane::PageBytes;
             const auto length = std::min(PublicationPlane::PageBytes, range.bytes - first);
-            GuestMemory::CopyGuestBytes(page.data(), reinterpret_cast<const void*>(range.address + first), length);
+            GuestMemory::CopyGuestBytes(page.data(), GuestAddr::HostPtr<const void>(range.address + first), length);
             if (length <= 4u || std::equal(page.begin() + 4u, page.begin() + length, page.begin())) {
                 std::memcpy(&plane.words[index], page.data(), std::min<std::size_t>(length, 4u));
             } else {
@@ -2736,7 +2737,7 @@ void DepthSurface::PublishToGuest() {
             observed.push_back({part.address, part.bytes, GuestMemory::CollectWritesUncached(part.address, part.bytes)});
             const auto begin = static_cast<std::size_t>(part.address - plane.range.address);
             const auto end = begin + part.bytes;
-            GuestMemory::CopyGuestBytes(current[index].data() + begin, reinterpret_cast<const void*>(part.address), part.bytes);
+            GuestMemory::CopyGuestBytes(current[index].data() + begin, GuestAddr::HostPtr<const void>(part.address), part.bytes);
             for (auto first = begin; first < end;) {
                 const auto address = plane.range.address + first;
                 const auto bytes = std::min<std::size_t>(4096u - (address & 4095u), end - first);
@@ -2779,7 +2780,7 @@ void DepthSurface::PublishToGuest() {
         if (tookGuest[index] || !whole) continue;
         const auto generation = GuestMemory::CollectWritesUncached(range.address, range.bytes);
         std::vector<std::byte> committed(range.bytes);
-        GuestMemory::CopyGuestBytes(committed.data(), reinterpret_cast<const void*>(range.address), range.bytes);
+        GuestMemory::CopyGuestBytes(committed.data(), GuestAddr::HostPtr<const void>(range.address), range.bytes);
         if (committed == result[index]) sampling.initial[index].generation = generation;
     }
     hostWritten->store(false, std::memory_order_release);
@@ -2875,7 +2876,7 @@ std::optional<std::uint32_t> htileAfterPendingFills(const Recorder& recorder, st
     if (!landed.has_value()) return std::nullopt;
     for (const auto& [from, to] : unwritten) {
         if (from % 4u != 0 || to % 4u != 0) return std::nullopt;
-        const auto* words = reinterpret_cast<const volatile std::uint32_t*>(from);
+        const auto* words = GuestAddr::HostPtr<const volatile std::uint32_t>(from);
         for (std::uint64_t index = 0; index < (to - from) / 4u; ++index) {
             if (words[index] != *landed) return std::nullopt;
         }
@@ -4192,7 +4193,7 @@ void NoteDepthMetadataFill(std::uint64_t address, std::size_t bytes, std::uint32
                 const auto sameStored = [&] {
                     if (surface->clearGeneration == 0u || surface->clearPattern != pattern) return false;
                     std::vector<std::uint32_t> words(metadata.bytes / sizeof(std::uint32_t));
-                    std::memcpy(words.data(), reinterpret_cast<const void*>(metadata.address), metadata.bytes);
+                    std::memcpy(words.data(), GuestAddr::HostPtr<const void>(metadata.address), metadata.bytes);
                     return std::all_of(words.begin(), words.end(), [&](std::uint32_t word) { return word == pattern; }) && GuestMemory::NewestStamp(metadata.address, metadata.bytes) > surface->clearStoreStamp;
                 };
                 if (surface->clearPending || (surface->clearGeneration != 0u && !surface->clearPattern.has_value())) surface->sampling.Refuse("native multisample depth metadata fill over a pending HTILE clear dispatch is not implemented");

@@ -391,6 +391,7 @@ private:
     void checkRoundingUse(const RdnaInstruction& inst) const;
     bool emitVector(const RdnaInstruction& inst);
     std::uint32_t f32DenormalFlushFor(const RdnaInstruction& inst) const;
+    bool convertIgnoresDenormalInput(const RdnaInstruction& inst) const;
     bool flushesInHardware(const RdnaInstruction& inst) const;
     bool emitInterpolation(const RdnaInstruction& inst);
     bool emitMemory(const RdnaInstruction& inst);

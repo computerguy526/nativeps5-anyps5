@@ -8,6 +8,7 @@
 #include <prx/libc/include/General.hpp>
 
 #include "SceShaders.hpp"
+#include "prx/libSceAgc/Shader/include/ShaderView.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 
 namespace {
@@ -61,10 +62,12 @@ GsOccupancyLimits getGsOccupancyLimits(const Shader* gs, std::uint32_t vertexCap
 
 extern "C" {
 
-int APS5_VABI sceAgcGetGsOversubscription(ShaderRegister* regs, const Shader* gs, std::uint32_t budget, float factor) {
+int APS5_VABI sceAgcGetGsOversubscription(ShaderRegister* regs, const Shader* gsHost, std::uint32_t budget, float factor) {
     if (regs == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": regs is null");
     }
+    const Agc::Guest::ShaderView gsView(gsHost);
+    const Shader* const gs = gsView.get();
 
     ShaderRegister pcAlloc{ShaderRegs::GE_PC_ALLOC, 0u};
     ShaderRegister rsrc4{ShaderRegs::SPI_SHADER_PGM_RSRC4_GS, 0u};

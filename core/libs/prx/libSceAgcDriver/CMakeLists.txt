@@ -1,4 +1,8 @@
 if(BUILD_TESTING)
+    add_test_executable(agc_self_guard_tests tests/SelfGuard.cpp Execution/src/SelfGuard.cpp)
+    target_include_directories(agc_self_guard_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    add_test(NAME agc_self_guard COMMAND agc_self_guard_tests)
+    set_tests_properties(agc_self_guard PROPERTIES TIMEOUT 20)
     add_test_executable(agc_preparation_inputs_tests
             tests/PreparationInputs.cpp
             Execution/src/Driver/Shaders/ShaderDiagnostics.cpp
@@ -411,6 +415,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitMemory.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Driver/Synchronization/WaitStatistics.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/WorkerSampler.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/SelfGuard.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/HostAllocator.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTrace.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceTraceThread.cpp
@@ -439,6 +444,7 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PerformanceOverlay.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/KeyboardOverlay.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/PadStatusOverlay.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/ProgressScreen.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Execution/src/Screenshot.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Draw.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DepthSurface.cpp
@@ -449,12 +455,19 @@ set(agcDriverSources
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Pipeline.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineLibrary.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCache.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineJobs.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineCreateStats.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DriverPipelineArchive.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/GpuCacheStore.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PipelineJournal.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/RuntimeSwitches.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/AbSwitch.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Resources.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/DeferredDestruction.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MemoryAccounting.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/MemoryProbe.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderImages.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/PlaceholderTexel.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/Recorder.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ParallelCompare.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/Graphics/src/ShaderInputState.cpp
@@ -561,6 +574,7 @@ target_link_libraries(libSceAgcDriver PRIVATE
         libkernel
         jpeg_turbo
         libzstd_static
+        sqlite3
         ${CMAKE_DL_LIBS}
 )
 if(WIN32)
@@ -1026,6 +1040,12 @@ endif()
 set_target_properties(agc_frame_replay PROPERTIES CXX_EXTENSIONS OFF)
 configure_windows_unwind(agc_frame_replay)
 
+# nps5: offline pipeline prewarm (journal replay without guest code).
+add_executable(nps5_prewarm EXCLUDE_FROM_ALL tools/Prewarm.cpp)
+target_include_directories(nps5_prewarm PRIVATE ${LIBS_INCLUDE_DIR})
+target_link_libraries(nps5_prewarm PRIVATE libSceAgcDriver libkernel libc libzstd_static)
+set_target_properties(nps5_prewarm PROPERTIES CXX_EXTENSIONS OFF)
+
 add_executable(agc_pm4_replay EXCLUDE_FROM_ALL
         tools/Pm4Replay.cpp
         tools/Pm4Analysis.cpp
@@ -1132,3 +1152,45 @@ if(BUILD_TESTING)
 endif()
 
 target_sources(agc_driver_scattered_runs_tests PRIVATE tests/AllocationFailure.cpp)
+
+# nps5: per-pipeline cold/warm create-time benchmark on real recompiled SPIR-V (no guest execution).
+if(APS5_HOST_ARM64)
+    add_executable(nps5_pipe_bench EXCLUDE_FROM_ALL
+            tools/PipelineCacheBench.cpp
+            Graphics/src/PipelineCache.cpp
+            Graphics/src/PipelineJobs.cpp
+            Graphics/src/DriverPipelineArchive.cpp
+            Graphics/src/GpuCacheStore.cpp
+    )
+    target_include_directories(nps5_pipe_bench PRIVATE ${LIBS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/shader/recompiler ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR})
+    target_link_libraries(nps5_pipe_bench PRIVATE shader_recompiler_agc_driver libc)
+    target_link_directories(nps5_pipe_bench PRIVATE /opt/homebrew/lib)
+    target_link_libraries(nps5_pipe_bench PRIVATE vulkan libzstd_static sqlite3)
+endif()
+
+# nps5: indexed per-title GPU cache store (SQLite index + zstd blobs): unit tests and the maintenance CLI.
+if(APPLE)
+    add_library(gpucache_store STATIC Graphics/src/GpuCacheStore.cpp)
+    target_include_directories(gpucache_store PUBLIC ${LIBS_INCLUDE_DIR})
+    target_link_libraries(gpucache_store PUBLIC libzstd_static sqlite3)
+    set_target_properties(gpucache_store PROPERTIES POSITION_INDEPENDENT_CODE ON)
+    add_executable(nps5_gpucache ${CMAKE_SOURCE_DIR}/tools/gpucache/nps5_gpucache.cpp)
+    target_link_libraries(nps5_gpucache PRIVATE gpucache_store)
+    add_executable(gpucache_store_tests tests/GpuCacheStore.cpp)
+    target_link_libraries(gpucache_store_tests PRIVATE gpucache_store)
+    set_target_properties(gpucache_store_tests PROPERTIES CXX_EXTENSIONS OFF)
+    if(BUILD_TESTING)
+        add_test(NAME gpucache_store COMMAND gpucache_store_tests)
+    endif()
+endif()
+
+# nps5: prioritized pipeline job pool and pipeline stamp (no Vulkan dependency): unit tests.
+if(APPLE)
+    add_executable(pipeline_jobs_tests EXCLUDE_FROM_ALL tests/PipelineJobs.cpp Graphics/src/PipelineJobs.cpp)
+    target_include_directories(pipeline_jobs_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    set_target_properties(pipeline_jobs_tests PROPERTIES CXX_EXTENSIONS OFF)
+    if(BUILD_TESTING)
+        add_test(NAME pipeline_jobs COMMAND pipeline_jobs_tests)
+        set_tests_properties(pipeline_jobs PROPERTIES TIMEOUT 60)
+    endif()
+endif()

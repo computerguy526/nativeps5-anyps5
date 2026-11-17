@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Float16ConversionProbe.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 
@@ -5,6 +6,7 @@
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <span>
 #include <vector>
 
@@ -36,8 +38,8 @@ alignas(256) constexpr std::array<std::uint32_t, 10> NarrowTowardZeroCode{
     0x80010501u, 0xbf810000u,
 };
 
-std::array<std::uint32_t, 4> BufferDescriptor(const void* data, std::uint32_t bytes) {
-    const auto address = reinterpret_cast<std::uintptr_t>(data);
+// `address` is the guest address of the buffer (AgcDriver::GuestAddr::Scratch::guest()).
+std::array<std::uint32_t, 4> BufferDescriptor(std::uint64_t address, std::uint32_t bytes) {
     return {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>((address >> 32u) & 0xffffu), bytes, 0x31016facu};
 }
 
@@ -73,10 +75,14 @@ std::vector<std::uint32_t> Float16NarrowProbeInputs() {
 namespace {
 
 std::vector<std::uint32_t> Run(VulkanDevice& device, ShaderRecompiler::SpirvTarget target, bool widen, bool narrow, const std::optional<ShaderRecompiler::ShaderFloatMode>& floatMode, std::span<const std::uint32_t> code, std::span<const std::uint32_t> input) {
-    std::vector<std::uint32_t> output(input.size(), 0xdeadbeefu);
+    GuestAddr::Scratch inputMemory(input.size_bytes());
+    GuestAddr::Scratch outputMemory(input.size() * sizeof(std::uint32_t));
+    std::memcpy(inputMemory.data(), input.data(), input.size_bytes());
+    auto* const outputWords = static_cast<std::uint32_t*>(outputMemory.data());
+    std::fill(outputWords, outputWords + input.size(), 0xdeadbeefu);
     std::vector<std::uint32_t> userData(8, 0u);
-    const auto inputDescriptor = BufferDescriptor(input.data(), static_cast<std::uint32_t>(input.size_bytes()));
-    const auto outputDescriptor = BufferDescriptor(output.data(), static_cast<std::uint32_t>(output.size() * 4u));
+    const auto inputDescriptor = BufferDescriptor(inputMemory.guest(), static_cast<std::uint32_t>(input.size_bytes()));
+    const auto outputDescriptor = BufferDescriptor(outputMemory.guest(), static_cast<std::uint32_t>(input.size() * 4u));
     std::copy(inputDescriptor.begin(), inputDescriptor.end(), userData.begin());
     std::copy(outputDescriptor.begin(), outputDescriptor.end(), userData.begin() + 4);
     const std::array<ShaderRecompiler::MemoryRegion, 1> memory{{{reinterpret_cast<std::uintptr_t>(code.data()), std::as_bytes(code)}}};
@@ -94,7 +100,7 @@ std::vector<std::uint32_t> Run(VulkanDevice& device, ShaderRecompiler::SpirvTarg
     const auto result = ShaderRecompiler::Recompile(request);
     device.Dispatch(result, static_cast<std::uint32_t>(input.size() / Threads), 1, 1, {}, reinterpret_cast<std::uintptr_t>(code.data()));
     device.WaitIdle();
-    return output;
+    return std::vector<std::uint32_t>(outputWords, outputWords + input.size());
 }
 
 void Compare(Float16ConversionProbeDirection& direction, VulkanDevice& device, const ShaderRecompiler::SpirvTarget& target, bool widen, bool narrow, std::span<const std::uint32_t> code, std::span<const std::uint32_t> input) {

@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include "SceShaders.hpp"
+#include "prx/libSceAgc/include/GuestPtr.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 
 template <typename T>
@@ -10,8 +11,11 @@ void ResolveRelativePtr(T*& field) {
     if (field == nullptr) {
         return;
     }
+    // `field` sits in a (host-mapped) Shader header and holds an offset relative to its own location. The resolved
+    // pointer is stored in the header and is GPU-visible, so it is a *guest* value: the guest address of the field
+    // plus the offset (identity with bias 0).
     field = reinterpret_cast<T*>(
-        reinterpret_cast<std::uintptr_t>(field) + reinterpret_cast<std::uintptr_t>(&field)
+        reinterpret_cast<std::uintptr_t>(field) + static_cast<std::uintptr_t>(Agc::Guest::Address(&field))
     );
 }
 

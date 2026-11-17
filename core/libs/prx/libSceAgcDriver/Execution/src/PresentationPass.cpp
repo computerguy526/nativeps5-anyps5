@@ -7,6 +7,7 @@
 #include "prx/libSceAgcDriver/Graphics/include/Resources.hpp"
 #include "prx/libSceAgcDriver/Graphics/shaders/PresentationPassFrag_spv.h"
 #include "prx/libSceAgcDriver/Graphics/shaders/PresentationPassVert_spv.h"
+#include <cstdlib>
 #include <array>
 #include <bit>
 #include <cmath>
@@ -20,6 +21,13 @@ constexpr std::uint32_t ModeRedLow = 2;
 constexpr std::uint32_t ModeKeepTenBit = 4;
 constexpr std::uint32_t ModeSubsample = 8;
 constexpr std::uint32_t ModePq = 16;
+// The pass downscales with an area filter; this bit restores the two bilinear taps (APS5_PRESENT_BILINEAR_MINIFY=1).
+constexpr std::uint32_t ModeBilinearMinify = 32;
+
+std::uint32_t MinifyMode() {
+    static const std::uint32_t mode = std::getenv("APS5_PRESENT_BILINEAR_MINIFY") != nullptr ? ModeBilinearMinify : 0u;
+    return mode;
+}
 
 }
 
@@ -409,7 +417,7 @@ void PresentationPass::recordInto(VkCommandBuffer commands, std::size_t index, V
     const auto framebuffer = destinationFramebuffer(slot, entry, destination, format, extent, VK_IMAGE_LAYOUT_UNDEFINED, finalLayout);
     const bool hdr10 = colorSpace == VK_COLOR_SPACE_HDR10_ST2084_EXT;
     Graphics::Require(colorSpace == VK_COLOR_SPACE_SRGB_NONLINEAR_KHR || (hdr10 && (slot.mode & ModePq) != 0 && TenBitFormat(format)), "presentation pass presents only PQ display buffers to a 10-bit HDR10 destination");
-    const std::uint32_t mode = (hdr10 ? slot.mode & ~ModePq : slot.mode) | (TenBitFormat(format) ? ModeKeepTenBit : 0u);
+    const std::uint32_t mode = (hdr10 ? slot.mode & ~ModePq : slot.mode) | (TenBitFormat(format) ? ModeKeepTenBit : 0u) | MinifyMode();
     const std::int32_t parameters[9] = {rect.x, rect.y, static_cast<std::int32_t>(rect.width), static_cast<std::int32_t>(rect.height), static_cast<std::int32_t>(slot.width), static_cast<std::int32_t>(slot.height), 1, static_cast<std::int32_t>(mode), std::bit_cast<std::int32_t>(slot.whiteNits)};
     draw(commands, slot, entry, framebuffer, extent, {{0, 0}, extent}, parameters);
 }

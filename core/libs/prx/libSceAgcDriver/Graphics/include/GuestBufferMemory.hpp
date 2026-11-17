@@ -51,6 +51,11 @@ struct HostImport {
     std::uint32_t memoryType = std::numeric_limits<std::uint32_t>::max();
     std::uint64_t backingSerial = 0;
     mutable std::uint64_t spaceSerial = 0;
+    // Debug (APS5_CHECK_IMPORT_PROTECTION): pages of the range the host held without write access when the import was made.
+    std::uint32_t readOnlyAtCreate = 0;
+    // Diagnostics (APS5_IMPORT_RESIDENCY): who made the import and at which present.
+    std::uint8_t requester = 0;
+    std::uint64_t madeAtPresent = 0;
 };
 
 inline VkDeviceSize HostImportOffset(const HostImport& import, std::uint64_t address) {
@@ -118,6 +123,8 @@ const char* ImportRequesterName(ImportRequester requester);
 HostImportCounts HostImportCounters();
 std::string FormatHostImportCounts(const HostImportCounts& counts);
 void ReportHostImports();
+// APS5_IMPORT_RESIDENCY=1 (macOS): one [import-res] line per live import with its guest-side resident/dirty/paged-out pages (mach_vm_page_range_query, not the imported view) and age, plus totals.
+void LogHostImportResidency(const char* tag);
 
 // The host import of the registered allocation containing [address, address + bytes), made on demand
 // (alignment and budget permitting), or null. Bytes at `address` are at `HostImportOffset(*import,
@@ -159,6 +166,8 @@ HostImportSettleCounts HostImportSettles();
 // Tests: how many imports settleImport has used on the settle queue.
 std::uint64_t HostImportsSettled();
 bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& ranges, std::uint64_t generation, bool adoptDevice);
+// Debug aid (APS5_TRACE_VOLUME): the host import over an address and whether its pages still are the guest's.
+std::string DebugDescribeImportAt(std::uint64_t address, std::size_t bytes);
 // Whether an existing import covers [address, address + bytes), without reconciling the imports
 // with the registry or making one (HostImportFor may take a registry lease): a hint for choices
 // made outside the device lock (a sampled texture's path, a dispatch's pre-sync); the path taken
@@ -389,6 +398,8 @@ public:
     void UploadPrepare(bool addressable);
     void UploadFinish(bool addressable, std::optional<std::pair<std::uint64_t, std::size_t>> htileClear = std::nullopt);
     VkDescriptorBufferInfo Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const;
+    // Debug aid (APS5_TRACE_VOLUME): the region that serves [address, address + bytes) and how.
+    std::string DebugOwner(std::uint64_t address, std::size_t bytes) const;
     static std::uint64_t ViewBytes(std::uint64_t bytes, std::uint32_t adjustment);
     std::vector<ShaderRecompiler::BdaAbi::Range> AddressRanges() const;
     // The BDA table of the cached address space when it serves this upload alone (an address-based

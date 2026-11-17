@@ -355,15 +355,57 @@ bool IsSplittableBufferAtomic64(const IrValue* inst) {
     }
 }
 
+namespace {
+
+// Zero on every lane the instruction is active on: a literal zero, or SelectU32(active, 0, anything).
+bool ZeroWhenActive(const IrValue* value, const IrValue* active) {
+    if (value == nullptr) return false;
+    value = value->Resolve();
+    if (value == nullptr) return false;
+    if (value->HasImmediate()) return value->Type() == IrType::U64 ? value->ImmediateU64() == 0u : value->ImmediateU32() == 0u;
+    if (value->Opcode() != IrOpcode::SelectU32 || value->ArgumentCount() != 3u || active == nullptr) return false;
+    const IrValue* condition = value->Argument(0) != nullptr ? value->Argument(0)->Resolve() : nullptr;
+    const IrValue* chosen = value->Argument(1) != nullptr ? value->Argument(1)->Resolve() : nullptr;
+    return condition != nullptr && condition == active->Resolve() && chosen != nullptr && chosen->HasImmediate() && chosen->ImmediateU32() == 0u;
+}
+
+}
+
+bool IsPlainLoadBufferAtomic64(const IrValue* inst) {
+    switch (inst->Opcode()) {
+    case IrOpcode::BufferAtomicOr64:
+    case IrOpcode::BufferAtomicXor64:
+    case IrOpcode::BufferAtomicIAdd64:
+        break;
+    default:
+        return false;
+    }
+    if (inst->ArgumentCount() < 2u) return false;
+    const IrValue* active = inst->Argument(inst->ArgumentCount() - 1u);
+    const IrValue* data = inst->Argument(inst->ArgumentCount() - 2u);
+    if (data == nullptr) return false;
+    data = data->Resolve();
+    if (data == nullptr) return false;
+    if (data->HasImmediate()) return ZeroWhenActive(data, active);
+    if (data->Opcode() != IrOpcode::CompositeConstructU64 || data->ArgumentCount() != 2u) return false;
+    return ZeroWhenActive(data->Argument(0), active) && ZeroWhenActive(data->Argument(1), active);
+}
+
+bool IsPlainStoreBufferAtomic64(const IrValue* inst) {
+    return inst->Opcode() == IrOpcode::BufferAtomicSwap64 && !inst->HasUses();
+}
+
 SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
     bool storageWrites = false;
     SpirvRequirements requirements {};
     std::optional<IrOpcode> splitOpcode;
+    bool plainOnly = true;
     for (const IrBlock* block : program.BlockOrder()) {
         for (const IrValue* inst : block->Instructions()) {
             const auto addressAccess = AddressOpcodeInfoOf(inst->Opcode()).access;
             if ((BufferAccessOf(inst->Opcode()) == BufferAccess::Atomic || addressAccess == AddressAccess::Atomic) && inst->Type() == IrType::U64) {
                 requirements.bufferInt64Atomics = true;
+                if (BufferAccessOf(inst->Opcode()) != BufferAccess::Atomic || (!IsPlainLoadBufferAtomic64(inst) && !IsPlainStoreBufferAtomic64(inst))) plainOnly = false;
                 if (!IsSplittableBufferAtomic64(inst)) {
                     requirements.bufferInt64AtomicsExact = true;
                 } else if (!splitOpcode) {
@@ -531,6 +573,7 @@ SpirvRequirements AnalyzeProgramRequirements(const IrProgram& program) {
         std::ranges::none_of(info.buffers, [](const BufferResource& buffer) { return buffer.written || buffer.atomic; }) &&
         std::ranges::none_of(info.images, writtenImage) && std::ranges::none_of(info.runtimeImageModes, [&](const auto& modes) { return std::ranges::any_of(modes, writtenImage); });
     requirements.coherentBufferAlias = requirements.coherentBuffers && !program.Metadata().invalidatesCaches;
+    requirements.bufferInt64AtomicsPlainOnly = requirements.bufferInt64Atomics && plainOnly;
     return requirements;
 }
 

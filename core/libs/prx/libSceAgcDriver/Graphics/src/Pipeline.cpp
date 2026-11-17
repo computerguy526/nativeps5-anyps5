@@ -2,15 +2,18 @@
 #include "prx/libSceAgcDriver/Execution/include/PerformanceOverlay.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreateStats.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJobs.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PatchVertexLayer.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineSpecialization.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/SampleOrder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Recorder.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/VertexInput.hpp"
+#include "prx/libc/include/HostThread.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <algorithm>
@@ -21,7 +24,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <condition_variable>
+#include <deque>
+#include <limits>
 #include <list>
+#include <thread>
+#include <unordered_set>
 #include <mutex>
 #include <spirv/unified1/spirv.hpp>
 #include <stdexcept>
@@ -31,7 +39,20 @@
 #include <unordered_map>
 #include <vector>
 
+#include <set>
+#include <tuple>
+
 namespace AgcDriver::Graphics {
+
+// APS5_LOG_TARGET_EXTENTS=1: logs each distinct render extent the first time a draw renders to it (resolution check).
+static void NoteTargetExtent(std::uint32_t w, std::uint32_t h, std::uint32_t layers, bool depth) {
+    static const bool on = std::getenv("APS5_LOG_TARGET_EXTENTS") != nullptr;
+    if (!on) return;
+    static std::mutex m;
+    static std::set<std::tuple<std::uint32_t, std::uint32_t, std::uint32_t, bool>> seen;
+    std::lock_guard lock(m);
+    if (seen.insert({w, h, layers, depth}).second) std::fprintf(stderr, "[target-extent] %ux%u layers=%u depth=%d (distinct #%zu)\n", w, h, layers, depth ? 1 : 0, seen.size());
+}
 
 namespace {
 
@@ -812,16 +833,19 @@ Pipeline::Pipeline(const Context& context, const State& state, const VertexInput
         if (libraries) pipeline = LinkPipelineFromLibraries(context, pipelineInfo, rendering, layoutInfo, keys, &optimized, false, _modules);
         else {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            PipelineCreateTimer createTimer(PipelineCreateTimer::Kind::Graphics);
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &pipeline), "vkCreateGraphicsPipelines");
         }
         if (alternateAlpha) {
             blend.pAttachments = secondChannels.data();
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            PipelineCreateTimer createTimer(PipelineCreateTimer::Kind::Graphics, "second-channel");
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &secondChannel), "vkCreateGraphicsPipelines");
         }
         if (state.depthBiasPerFace) {
             raster.cullMode = VK_CULL_MODE_FRONT_BIT;
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            PipelineCreateTimer createTimer(PipelineCreateTimer::Kind::Graphics, "back-faces");
             Check(context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, pipelineCache, 1, &pipelineInfo, nullptr, &backFaces), "vkCreateGraphicsPipelines");
         }
         for (const auto module : _modules) context.Function<PFN_vkDestroyShaderModule>("vkDestroyShaderModule")(context.device, module, nullptr);
@@ -943,6 +967,7 @@ std::shared_ptr<Framebuffer> Pipeline::AcquireFramebuffer(std::span<const VkImag
 }
 
 void Pipeline::Begin(CommandState& recording, const Framebuffer& framebuffer, VkExtent2D extent, const State& state, const State* masked) const {
+    NoteTargetExtent(extent.width, extent.height, state.renderLayers, depthFormat != VK_FORMAT_UNDEFINED);
     const auto commands = recording.Commands();
     if (dynamicRendering) {
         const auto views = framebuffer.Views();
@@ -1237,6 +1262,33 @@ std::uint64_t hashKey(std::span<const std::byte> key) {
     return std::hash<std::string_view>{}(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()));
 }
 
+// nps5: the state fields of a pipeline that only choose which fragments a primitive covers, not what render pass, shaders, vertex
+// input or descriptor layouts it needs and not what is written into the targets. A draw whose exact pipeline is still compiling
+// may borrow the pipeline of a draw that differs only in these (see CachedPipeline, APS5_ASYNC_PIPELINES). Everything else stays in
+// the family: shader identities, attachment formats and samples, topology, vertex layout, set layouts, and all depth, stencil and
+// blend state (a different depth write, stencil op or blend equation would write wrong values into targets that later passes or
+// frames read, so those draws wait for their own pipeline instead). Depth bias only joins the normalised set when depth is not written.
+State familyState(const State& state) {
+    State family = state;
+    family.cullMode = 0;
+    family.polygonMode = VK_POLYGON_MODE_FILL;
+    family.lineWidth = 1.0f;
+    family.frontFace = VK_FRONT_FACE_COUNTER_CLOCKWISE;
+    if (!family.depthBiasPerFace && !family.depthWrite) {
+        family.depthBias = false;
+        family.depthBiasClamp = 0.0f;
+    }
+    return family;
+}
+
+std::uint64_t pipelineFamily(const Context& context, const State& state, const VertexInputLayout& input, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
+    struct PipelineFamilyStorage {};
+    auto& storage = HostThreadLocal<std::vector<std::byte>, PipelineFamilyStorage>();
+    const auto length = pipelineKey(storage, context, familyState(state), input, resources, shaders, attachmentLayout);
+    return length == 0 ? 0u : hashKey(std::span<const std::byte>(storage.data(), length)) | 1u;
+}
+
+
 struct PipelineStore {
     struct Entry {
         VkDevice device;
@@ -1247,6 +1299,8 @@ struct PipelineStore {
         std::uint64_t hash;
         std::vector<std::byte> key;
         std::shared_ptr<Pipeline> pipeline;
+        // nps5: hash of the key with the state-only variant fields normalised (pipelineFamily); 0 unless async pipelines are on.
+        std::uint64_t family = 0;
     };
     AgcDriver::Mutex mutex;
     // Least recently used first.
@@ -1344,14 +1398,203 @@ void reportPipelines(PipelineStore& store) {
 
 }
 
+// True when every stage only writes the draw's render targets: no storage buffer or image that is not proved read-only, no
+// raw-address store, no GDS. Only such a draw can be skipped while its pipeline compiles: whatever it would have stored
+// elsewhere is read by later work, which a skipped draw would corrupt. (rps5e's rule is that compute always waits.)
+bool WritesOnlyRenderTargets(std::span<const CompiledShader> shaders) {
+    for (const auto& shader : shaders) {
+        const auto* program = shader.program;
+        if (program == nullptr || program->bdaWrites) return false;
+        for (const auto& binding : program->bindings) {
+            if (binding.role == ShaderRecompiler::DescriptorRole::Gds) return false;
+            const bool storage = binding.kind == ShaderRecompiler::DescriptorKind::StorageBuffer || binding.kind == ShaderRecompiler::DescriptorKind::StorageImage || binding.kind == ShaderRecompiler::DescriptorKind::StorageTexelBuffer;
+            if (storage && !binding.readOnly) return false;
+        }
+    }
+    return true;
+}
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout) {
     return CachedPipeline(context, state, vertexInput, resources.SetLayouts(), shaders, attachmentLayout);
 }
 
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool* created, std::uint64_t* storeHash) {
+namespace {
+
+// APS5_ASYNC_PIPELINES: store misses of draws are built on the shared build pool (PipelineJobs.hpp) as Now jobs, ahead of
+// the journal replay's Ahead and Idle ones. A job owns deep copies of everything the build reads (the canonical state, the
+// vertex layout, the recompiled stages) because the draw that queued it goes on without them.
+struct AsyncJob {
+    Context context;
+    State state;
+    VertexInputLayout vertexInput;
+    VkImageLayout attachmentLayout;
+    std::vector<std::shared_ptr<ShaderRecompiler::RecompileResult>> owned;
+    std::vector<std::shared_ptr<std::vector<ShaderRecompiler::RegisteredImageView>>> views;
+    std::vector<CompiledShader> shaders;
+    std::uint64_t hash;
+};
+
+// nps5-placeholder: wait budget for draws that would be skipped, a token bucket in microseconds refilled per wall-clock second.
+struct SkipWaitBudget {
+    std::mutex mutex;
+    std::int64_t perSecondUs = [] {
+        const char* value = std::getenv("APS5_SKIP_WAIT_MS_PER_SEC");
+        return (value != nullptr && *value != '\0' ? std::strtoll(value, nullptr, 10) : 100ll) * 1000;
+    }();
+    std::int64_t balance = perSecondUs;
+    std::chrono::steady_clock::time_point last = std::chrono::steady_clock::now();
+    std::atomic<std::int64_t> chargedUs{0};
+};
+
+SkipWaitBudget& skipWaitBudget() {
+    static SkipWaitBudget budget;
+    return budget;
+}
+
+bool SkipWaitAllowed() {
+    auto& budget = skipWaitBudget();
+    if (budget.perSecondUs <= 0) return false;
+    std::lock_guard lock(budget.mutex);
+    const auto now = std::chrono::steady_clock::now();
+    budget.balance = std::min<std::int64_t>(budget.balance + std::chrono::duration_cast<std::chrono::microseconds>(now - budget.last).count() * budget.perSecondUs / 1000000, budget.perSecondUs * 3 / 2);
+    budget.last = now;
+    return budget.balance > 0;
+}
+
+// Charges the time a would-be-skipped draw spent waiting for its pipeline.
+struct SkipWaitCharge {
+    std::chrono::steady_clock::time_point start;
+    bool active = false;
+    ~SkipWaitCharge() {
+        if (!active) return;
+        auto& budget = skipWaitBudget();
+        const auto us = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count();
+        std::lock_guard lock(budget.mutex);
+        budget.balance -= us;
+        budget.chargedUs.fetch_add(us, std::memory_order_relaxed);
+    }
+};
+
+struct AsyncPool {
+    std::mutex mutex;
+    std::condition_variable drained;
+    std::unordered_set<std::uint64_t> inflight;
+    // Jobs queued or running per device, and the devices being retired (no new job is accepted for them): teardown waits for zero.
+    std::unordered_map<VkDevice, unsigned> active;
+    std::unordered_set<VkDevice> retiring;
+    std::atomic<std::uint64_t> queued{0}, built{0}, skipped{0}, fallbacks{0}, blocked{0}, promoted{0}, skipWaited{0};
+    std::atomic<double> buildMs{0};
+    void report() const {
+        const auto q = queued.load();
+        if (q != 0 || fallbacks.load() != 0 || blocked.load() != 0 || skipWaited.load() != 0) std::fprintf(stderr, "[async-pipeline] exit: %llu queued, %llu built (%.1f ms on the pool), %llu draws skipped while pending, %llu drew with a compiled variant instead, %llu waited for their pipeline (stores beyond the render targets), %llu journal jobs promoted to now, %llu would-be skips waited for their pipeline instead (%.1f ms charged)\n", static_cast<unsigned long long>(q), static_cast<unsigned long long>(built.load()), buildMs.load(), static_cast<unsigned long long>(skipped.load()), static_cast<unsigned long long>(fallbacks.load()), static_cast<unsigned long long>(blocked.load()), static_cast<unsigned long long>(promoted.load()), static_cast<unsigned long long>(skipWaited.load()), skipWaitBudget().chargedUs.load() / 1000.0);
+    }
+};
+
+AsyncPool& asyncPool() {
+    static auto* pool = [] {
+        auto* created = new AsyncPool;  // leaked: workers outlive static destruction order
+        std::atexit([] { asyncPool().report(); });
+        return created;
+    }();
+    return *pool;
+}
+
+void finishAsyncJob(const AsyncJob& job) {
+    auto& pool = asyncPool();
+    std::lock_guard lock(pool.mutex);
+    pool.inflight.erase(job.hash);
+    if (auto found = pool.active.find(job.context.device); found != pool.active.end() && --found->second == 0) pool.active.erase(found);
+    pool.drained.notify_all();
+}
+
+void runAsyncJob(const std::shared_ptr<AsyncJob>& job) {
+    auto& pool = asyncPool();
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        const auto layouts = DescribeSetLayouts(job->context, job->shaders);
+        static_cast<void>(CachedPipeline(job->context, job->state, job->vertexInput, layouts.View(), job->shaders, job->attachmentLayout));
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[async-pipeline] build failed: %s\n", error.what());
+    } catch (...) {
+        // (a non-std exception must not leave the hash in `inflight`: that pipeline's draws would skip every frame)
+        std::fprintf(stderr, "[async-pipeline] build failed: unknown exception\n");
+    }
+    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
+    auto old = pool.buildMs.load();
+    while (!pool.buildMs.compare_exchange_weak(old, old + ms)) {}
+    pool.built.fetch_add(1, std::memory_order_relaxed);
+    finishAsyncJob(*job);
+}
+
+// Queues the build of a missed pipeline as a Now job (once: a miss already in flight is not queued again).
+void queueAsyncPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, std::uint64_t hash) {
+    auto& pool = asyncPool();
+    {
+        std::lock_guard lock(pool.mutex);
+        if (pool.retiring.contains(context.device)) return;
+        if (!pool.inflight.insert(hash).second) return;
+        ++pool.active[context.device];
+    }
+    auto job = std::make_shared<AsyncJob>(AsyncJob{context, CanonicalPipelineState(state), vertexInput, attachmentLayout, {}, {}, {}, hash});
+    for (const auto& shader : shaders) {
+        job->owned.push_back(std::make_shared<ShaderRecompiler::RecompileResult>(*shader.program));
+        auto copy = shader;
+        copy.program = job->owned.back().get();
+        if (shader.registeredImageViews != nullptr) {
+            job->views.push_back(std::make_shared<std::vector<ShaderRecompiler::RegisteredImageView>>(*shader.registeredImageViews));
+            copy.registeredImageViews = job->views.back().get();
+        }
+        job->shaders.push_back(copy);
+    }
+    pool.queued.fetch_add(1, std::memory_order_relaxed);
+    if (!SharedPipelinePool().Submit(hash ^ 0x5bd1e9955bd1e995ull, JobPriority::Now, [job] { runAsyncJob(job); })) finishAsyncJob(*job);
+}
+
+// The pipeline of a draw that differs from this one only in state fields that change the look, not the render pass, shaders or
+// layouts (familyState): the closest compiled one, by the number of key bytes that differ. nullptr when the family has none yet.
+std::shared_ptr<Pipeline> findFallbackVariant(PipelineStore& store, const Context& context, std::uint64_t family, std::span<const std::byte> key) {
+    std::shared_ptr<Pipeline> best;
+    std::size_t bestDistance = std::numeric_limits<std::size_t>::max();
+    for (auto& entry : store.entries) {
+        if (entry.family != family || !alive(entry, context) || entry.key.size() != key.size()) continue;
+        std::size_t distance = 0;
+        for (std::size_t index = 0; index < key.size(); ++index) distance += entry.key[index] != key[index] ? 1u : 0u;
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = entry.pipeline;
+        }
+    }
+    return best;
+}
+
+}
+
+void WaitForAsyncPipelines(VkDevice device) {
+    auto& pool = asyncPool();
+    std::unique_lock lock(pool.mutex);
+    pool.retiring.insert(device);
+    pool.drained.wait(lock, [&] { return !pool.active.contains(device); });
+    pool.retiring.erase(device);
+}
+
+bool AsyncPipelinesEnabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("APS5_ASYNC_PIPELINES");
+        return value != nullptr && *value != '\0' && *value != '0';
+    }();
+    return enabled;
+}
+
+AsyncPipelineCounters AsyncPipelineTotals() {
+    auto& pool = asyncPool();
+    return {pool.queued.load(), pool.built.load(), pool.skipped.load(), pool.buildMs.load(), pool.fallbacks.load(), pool.blocked.load(), pool.promoted.load()};
+}
+
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout, bool* created, std::uint64_t* storeHash, bool* pending, bool skippable, bool* fallback) {
     static const bool disabled = std::getenv("APS5_NO_PIPELINE_CACHE") != nullptr;
     if (created != nullptr) *created = false;
     if (storeHash != nullptr) *storeHash = 0;
+    if (pending != nullptr) *pending = false;
+    if (fallback != nullptr) *fallback = false;
     if (disabled) return std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
     auto& store = Pipelines();
     struct PipelineKeyStorage {};
@@ -1405,11 +1648,80 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
         ++store.totals.misses;
         noteStoreReturn(store, hash);
     }
+    const bool async = pending != nullptr && AsyncPipelinesEnabled();
+    const bool journalled = !PipelineJournalReplaying() && state.tessellationCapture == nullptr;
+    // nps5: a pipeline the journal replay has not built yet is wanted now. Sync (or a draw that must wait): run its job here, or
+    // wait for the worker that is on it (never compile it twice). Async: move it to the front of the queue and draw with a
+    // fallback or skip meanwhile.
+    const bool replaying = PipelineJournalReplaying();
+    bool journalHolds = false;
+    std::optional<GraphicsPipelineRecipe> recipe;
+    if (journalled && PipelineJournalReplayActive()) recipe = MakeGraphicsPipelineRecipe(state, vertexInput, resources, shaders, attachmentLayout);
+    const auto finishFromJournal = [&]() -> std::shared_ptr<Pipeline> {
+        if (!recipe || !PipelineJournalFinish(*recipe)) return nullptr;
+        // The job built its pipeline through this thread's key storage when it ran here: refill it (same bytes, same size).
+        static_cast<void>(pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout));
+        std::lock_guard lock(store.mutex);
+        bool raced = false;
+        auto built = lookup(raced);
+        if (built != nullptr && storeHash != nullptr) *storeHash = hash;
+        return built;
+    };
+    if (recipe && async) {
+        journalHolds = PipelineJournalPromote(*recipe);
+        if (journalHolds) asyncPool().promoted.fetch_add(1, std::memory_order_relaxed);
+    }
+    SkipWaitCharge skipWait;
+    if (async && journalled) {
+        const auto family = pipelineFamily(context, state, vertexInput, resources, shaders, attachmentLayout);
+        std::shared_ptr<Pipeline> variant;
+        // popskip: only a draw that may be approximated at all borrows a look-alike pipeline (a UAV/depth/compute-like draw waits).
+        if (skippable && family != 0 && !state.stencilReplayReference) {
+            std::lock_guard lock(store.mutex);
+            variant = findFallbackVariant(store, context, family, key);
+        }
+        if (variant != nullptr) {
+            if (!journalHolds) queueAsyncPipeline(context, state, vertexInput, shaders, attachmentLayout, hash);
+            asyncPool().fallbacks.fetch_add(1, std::memory_order_relaxed);
+            if (fallback != nullptr) *fallback = true;
+            return variant;
+        }
+        // nps5-placeholder: a colour-writing draw that would be skipped (nothing drawn: the surface behind or a cleared target shows,
+        // often black) waits for its pipeline instead while the wait budget lasts (APS5_SKIP_WAIT_MS_PER_SEC, default 100, 0 = never
+        // wait). The wait is charged to the budget, so a burst of misses degrades to skipping rather than to a long freeze.
+        if (skippable && SkipWaitAllowed()) {
+            skipWait.start = std::chrono::steady_clock::now();
+            skipWait.active = true;
+            asyncPool().skipWaited.fetch_add(1, std::memory_order_relaxed);
+            if (!journalHolds) {
+                // One build, whoever gets there first: queue it as a Now job, then run it here or wait for the worker on it.
+                queueAsyncPipeline(context, state, vertexInput, shaders, attachmentLayout, hash);
+                SharedPipelinePool().Finish(hash ^ 0x5bd1e9955bd1e995ull);
+                static_cast<void>(pipelineKey(storage, context, state, vertexInput, resources, shaders, attachmentLayout));
+                std::lock_guard lock(store.mutex);
+                bool raced = false;
+                if (auto built = lookup(raced)) {
+                    if (storeHash != nullptr) *storeHash = hash;
+                    return built;
+                }
+            }
+        } else if (skippable) {
+            if (!journalHolds) queueAsyncPipeline(context, state, vertexInput, shaders, attachmentLayout, hash);
+            asyncPool().skipped.fetch_add(1, std::memory_order_relaxed);
+            *pending = true;
+            return nullptr;
+        }
+        // The draw stores beyond its render targets: it cannot be skipped or approximated, so it waits for the exact pipeline.
+        if (!skipWait.active) asyncPool().blocked.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (recipe) {
+        if (auto built = finishFromJournal()) return built;
+    }
     // Built outside the mutex: a draw that finds its pipeline resident is not held behind another
     // thread's build (the journal replay builds here too), and a device's driver compiles in
     // parallel when several threads build at once.
     auto pipeline = std::make_shared<Pipeline>(context, state, vertexInput, resources, shaders, attachmentLayout);
-    const bool replaying = PipelineJournalReplaying();
+    const auto family = AsyncPipelinesEnabled() ? pipelineFamily(context, state, vertexInput, resources, shaders, attachmentLayout) : 0u;
     {
         std::lock_guard lock(store.mutex);
         bool collision = false;
@@ -1434,10 +1746,10 @@ std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& st
             store.capacity = std::min(store.capacity * 2u, PipelineStore::MaximumEntries);
         }
         if (replaying) {
-            store.entries.push_front({context.device, context.bufferPool, context.bufferPool != nullptr, hash, std::vector<std::byte>(key.begin(), key.end()), pipeline});
+            store.entries.push_front({context.device, context.bufferPool, context.bufferPool != nullptr, hash, std::vector<std::byte>(key.begin(), key.end()), pipeline, family});
             store.index[hash] = store.entries.begin();
         } else {
-            store.entries.push_back({context.device, context.bufferPool, context.bufferPool != nullptr, hash, std::vector<std::byte>(key.begin(), key.end()), pipeline});
+            store.entries.push_back({context.device, context.bufferPool, context.bufferPool != nullptr, hash, std::vector<std::byte>(key.begin(), key.end()), pipeline, family});
             store.index[hash] = std::prev(store.entries.end());
         }
         while (store.entries.size() > storeBound(store)) {
@@ -1495,6 +1807,8 @@ bool PipelineStoreCanGrow() {
 }
 
 void ClearCachedPipelines(VkDevice device) {
+    // A worker inside CachedPipeline for this device would use Vulkan objects (and the store entries) this tears down.
+    WaitForAsyncPipelines(device);
     auto& store = Pipelines();
     std::lock_guard lock(store.mutex);
     for (auto it = store.entries.begin(); it != store.entries.end();) {

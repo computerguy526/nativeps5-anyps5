@@ -102,6 +102,25 @@ struct PipelineJournalHooks {
 [[nodiscard]] std::uint64_t PipelineJournalDeviceFingerprint(const VkPhysicalDeviceProperties& properties);
 [[nodiscard]] std::shared_ptr<PipelineJournalReplay> StartPipelineJournalReplay(const Context& context, std::uint64_t deviceFingerprint, PipelineJournalHooks hooks);
 
+// nps5: the replay runs on one shared build pool (PipelineJobs.hpp) whose jobs have priorities: the first journal entries as Ahead, the
+// rest as Idle. A draw that misses a pipeline the replay has not built yet takes it as Now: Finish runs the job on the calling thread,
+// or waits for the worker already building it; Promote only moves it to the front of the queue (the async path draws with a fallback
+// meanwhile). Both return whether the replay held the job. Finish and Promote of a recipe cost an encode and a hash: call them on a miss only.
+class PipelineJobPool;
+[[nodiscard]] PipelineJobPool& SharedPipelinePool();
+[[nodiscard]] bool PipelineJournalReplayActive();
+bool PipelineJournalFinish(const GraphicsPipelineRecipe& recipe);
+bool PipelineJournalPromote(const GraphicsPipelineRecipe& recipe);
+bool PipelineJournalFinishCompute(const ShaderRecompiler::PipelineIdentity& identity, bool pushConstants);
+[[nodiscard]] std::uint64_t PipelineJournalPromotedNow();
+
+// nps5: startup prebuild. While the mode is on, the replay submits every journal entry as Now and the pool takes all cores but two
+// (at most 8). The driver waits for the replay before the guest's first frame, showing PrebuildProgress. Must be set before the first device
+// with a window is created (it starts the replay).
+void SetPipelinePrebuildMode(bool on);
+struct PrebuildProgress { std::uint64_t done; std::uint64_t total; bool loaded; bool finished; };
+[[nodiscard]] PrebuildProgress PipelineJournalProgress();
+
 }
 
 #endif

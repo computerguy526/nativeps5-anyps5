@@ -78,6 +78,17 @@ if(BUILD_TESTING)
     endif()
 endif()
 
+# nps5: the builder under a nonzero guest bias (host = guest + bias): packets, cursors and out-slots are guest-valued.
+if(APPLE)
+    add_test_executable(agc_guest_bias_tests EXCLUDE_FROM_ALL tests/GuestBias.cpp)
+    target_include_directories(agc_guest_bias_tests PRIVATE ${LIBS_INCLUDE_DIR})
+    target_link_libraries(agc_guest_bias_tests PRIVATE libSceAgc libSceAgcDriver libc)
+    if(BUILD_TESTING)
+        set_target_properties(agc_guest_bias_tests PROPERTIES EXCLUDE_FROM_ALL OFF)
+        add_test(NAME agc_guest_bias COMMAND agc_guest_bias_tests)
+    endif()
+endif()
+
 add_test_executable(agc_atomic_gds_size_tests EXCLUDE_FROM_ALL tests/AtomicGdsSize.cpp)
 target_include_directories(agc_atomic_gds_size_tests PRIVATE ${LIBS_INCLUDE_DIR})
 target_link_libraries(agc_atomic_gds_size_tests PRIVATE libSceAgc libc)
@@ -447,7 +458,7 @@ add_test_executable(agc_gs_oversubscription_tests EXCLUDE_FROM_ALL
         Shader/src/GsOversubscription.cpp
 )
 target_include_directories(agc_gs_oversubscription_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_gs_oversubscription_tests PRIVATE libc)
+target_link_libraries(agc_gs_oversubscription_tests PRIVATE libSceAgcDriver libc)
 configure_windows_unwind(agc_gs_oversubscription_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_gs_oversubscription_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)
@@ -463,7 +474,7 @@ add_test_executable(agc_gs_prim_payload_tests EXCLUDE_FROM_ALL
         Shader/src/GsPrimPayload.cpp
 )
 target_include_directories(agc_gs_prim_payload_tests PRIVATE ${LIBS_INCLUDE_DIR})
-target_link_libraries(agc_gs_prim_payload_tests PRIVATE libc)
+target_link_libraries(agc_gs_prim_payload_tests PRIVATE libSceAgcDriver libc)
 configure_windows_unwind(agc_gs_prim_payload_tests)
 if(BUILD_TESTING)
     set_target_properties(agc_gs_prim_payload_tests PROPERTIES EXCLUDE_FROM_ALL FALSE)

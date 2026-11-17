@@ -404,7 +404,17 @@ void Driver::storeBufferFill(std::uint32_t queueId, std::uint64_t base, std::siz
         absorbedBytes += bytes;
     } else if (!cleared) {
         ++flushes;
-
+        // APS5_FILL_GPU_ORDERED=1: the pending storage results under the fill are written back in GPU
+        // order (as the storage refresh and the label readback do) instead of the CPU waiting for
+        // their producer first: the fill below is recorded on the same recorder behind its
+        // ALL_COMMANDS -> TRANSFER barrier, so it lands after the write-back either way. FlushPending
+        // falls back to the waiting path whenever the ordered skip does not hold (no host import,
+        // a publish or a pending lease over the range, inside a completion).
+        static const bool fillOrdered = [] {
+            const char* value = std::getenv("APS5_FILL_GPU_ORDERED");
+            return value != nullptr && std::strcmp(value, "0") != 0;
+        }();
+        const Graphics::StorageTexture::GpuOrderedFlushScope ordered(fillOrdered);
         if (Graphics::StorageTexture::FlushPending(base, bytes, nullptr, "buffer fill", Graphics::PublishScope::PartialUnits)) ++flushed;
     }
     phase(FillFlush);

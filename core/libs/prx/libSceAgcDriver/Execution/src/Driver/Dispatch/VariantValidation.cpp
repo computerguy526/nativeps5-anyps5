@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Synchronization/DeferredLabels.hpp"
@@ -71,7 +72,7 @@ bool Driver::syncPendingRuns(std::uint64_t program, std::uint32_t queue, const S
         std::vector<std::byte> before;
         if (writeEvidenceEnabled() && GuestMemory::Accessible(reinterpret_cast<const void*>(region.guestAddress), region.bytes.size())) {
             before.resize(region.bytes.size());
-            std::memcpy(before.data(), reinterpret_cast<const void*>(region.guestAddress), before.size());
+            std::memcpy(before.data(), GuestAddr::HostPtr<const void>(region.guestAddress), before.size());
         }
         const auto waitsBefore = Graphics::Recorder::ThreadHookWaits();
         const bool timed = profile || traceCapSync();

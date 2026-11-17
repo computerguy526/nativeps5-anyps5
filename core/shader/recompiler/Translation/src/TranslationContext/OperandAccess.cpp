@@ -5,10 +5,23 @@
 #include <array>
 #include <stdexcept>
 #include <string>
+#include <map>
+#include <mutex>
+#include <cstdio>
+#include <cstdlib>
 
 namespace ShaderRecompiler {
 
 namespace {
+
+struct FlushStats {
+    std::mutex lock;
+    std::map<std::string, unsigned> counts;
+    bool enabled = std::getenv("NPS5_FLUSH_STATS") != nullptr;
+    void Add(const char* kind, unsigned opcode) { if (!enabled) return; std::fprintf(stderr, "FLUSHEV %s %u\n", kind, opcode); }
+    ~FlushStats() { if (!enabled) return; for (const auto& [key, count] : counts) std::fprintf(stderr, "FLUSHSTAT %s %u\n", key.c_str(), count); }
+};
+FlushStats& Stats() { static FlushStats stats; return stats; }
 
 DppMoveFlags dppFlags(const RdnaOperand& operand) {
     const auto control = operand.dpp8 ? DppMoveFlags::Lanes8 | operand.dppCtrl : operand.dppCtrl;
@@ -152,12 +165,14 @@ IrU32 TranslationContext::flushF32Denormal(IrU32 bits, std::uint32_t flushBit) {
         const std::uint32_t value = bits.Value().ImmediateU32();
         return (value & 0x7f800000u) == 0u ? IrU32(ir.Constant(value & 0x80000000u)) : bits;
     }
+    Stats().Add("flush", static_cast<unsigned>(currentOpcode));
     const IrU1 denormal(ir.IEqual(ir.BitwiseAnd(bits.Value(), ir.Constant(0x7f800000u)), ir.Constant(0u)));
     return IrU32(ir.Select(denormal.Value(), ir.BitwiseAnd(bits.Value(), ir.Constant(0x80000000u)), bits.Value()));
 }
 
 IrF32 TranslationContext::flushTinyProduct(IrValue* lhs, IrValue* rhs, IrValue* product, IrValue* addend, bool afterRounding) {
     if ((f32DenormalFlush & 2u) == 0u || ((f32DenormalFlush & 1u) != 0u && (keepsProductOutOfTinyRange(*lhs) || keepsProductOutOfTinyRange(*rhs)))) return IrF32(*product);
+    Stats().Add("tiny", static_cast<unsigned>(currentOpcode));
     IrValue& lhsBits = ir.BitCastU32(*lhs);
     IrValue& rhsBits = ir.BitCastU32(*rhs);
     const std::uint32_t roundMode = floatMode.has_value() ? floatMode->floatMode & 3u : 0u;

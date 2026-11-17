@@ -118,7 +118,16 @@ private:
 // APS5_NO_PIPELINE_CACHE=1 builds one per draw as before.
 std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const ShaderResources& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
 // `created` reports whether this call built the pipeline (false: served from the store or private).
-std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, bool* created = nullptr, std::uint64_t* storeHash = nullptr);
+std::shared_ptr<Pipeline> CachedPipeline(const Context& context, const State& state, const VertexInputLayout& vertexInput, const PipelineSetLayouts& resources, std::span<const CompiledShader> shaders, VkImageLayout attachmentLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, bool* created = nullptr, std::uint64_t* storeHash = nullptr, bool* pending = nullptr, bool skippable = true, bool* fallback = nullptr);
+// nps5 APS5_ASYNC_PIPELINES=1: with `pending` given, a store miss is built on a background pool (APS5_ASYNC_PIPELINE_THREADS,
+// default half the cores, utility QoS) and the call returns nullptr with *pending = true; the draw is skipped and the pipeline
+// is there a few frames later (as UE's PSO precaching does). Without the flag, or without `pending`, the build is synchronous.
+[[nodiscard]] bool AsyncPipelinesEnabled();
+// Counters for the exit report: pipelines handed to the pool, finished, draws skipped while one was pending.
+struct AsyncPipelineCounters { std::uint64_t queued, built, skippedDraws; double buildMs; std::uint64_t fallbackDraws, blockedDraws, promoted; };
+// nps5: whether every stage of the draw only writes its render targets (so the draw may be skipped, not waited for, while its pipeline compiles).
+[[nodiscard]] bool WritesOnlyRenderTargets(std::span<const CompiledShader> shaders);
+[[nodiscard]] AsyncPipelineCounters AsyncPipelineTotals();
 std::shared_ptr<Pipeline> TouchCachedPipeline(const Context& context, std::uint64_t hash, const std::weak_ptr<Pipeline>& expected);
 // Cumulative pipeline store outcomes since start-up (the [pipecache] line reports 10 s windows).
 struct PipelineStoreCounters {
@@ -147,6 +156,9 @@ bool SplitsSets(const Context& context, std::span<const CompiledShader> shaders)
 // entries of a gone device are recognised by their buffer pool (made and reset with the device, so
 // it tells device instances apart when the loader reuses a VkDevice handle) and forgotten unused.
 void ClearCachedPipelines(VkDevice device);
+// Blocks until the async pipeline jobs (APS5_ASYNC_PIPELINES) queued for `device` have finished, refusing new ones meanwhile. Called
+// before the device or its pipelines are destroyed (ClearCachedPipelines does it too).
+void WaitForAsyncPipelines(VkDevice device);
 bool HasStencil(VkFormat format);
 // Device limit checks of the viewport, which is dynamic state and so no longer checked by Pipeline.
 void ValidateViewport(const Context& context, const VkViewport& viewport);

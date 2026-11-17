@@ -1,3 +1,4 @@
+#include "prx/libSceVideoOut/include/DisplayWindow.hpp"
 #include <bit>
 #include <charconv>
 #include <chrono>
@@ -6,6 +7,7 @@
 #include <cstdio>
 #include <exception>
 #include <thread>
+#include "prx/libScePad/include/LatTrace.hpp"
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -50,6 +52,46 @@ namespace {
 constexpr std::uint64_t FLIP_ROOM_WAIT_MICROS = 60000000;
 constexpr std::uint64_t PRESENT_POLL_MICROS = 10000;
 constexpr std::int64_t FRAME_LIMIT_SLICE_NANOS = 20000000;
+constexpr std::uint64_t PRESENT_DEPTH_WAIT_MICROS = 250000;
+
+// nps5 (docs/nps5-present.md): APS5_PRESENT_DEPTH=<n> (1..15, 0/unset = off) holds the guest's submission of a
+// frame's flip while n flips are already pending (reserved, not yet on screen), so the title runs at most n frames
+// ahead of the picture instead of VIDEO_OUT_FLIP_QUEUE_CAPACITY. The hold is bounded (PRESENT_DEPTH_WAIT_MICROS):
+// a flip that cannot complete without the title's next submission only costs that wait.
+std::size_t presentDepth() {
+    static const std::size_t depth = [] {
+        const char* value = std::getenv("APS5_PRESENT_DEPTH");
+        if (value == nullptr) return std::size_t{0};
+        const long parsed = std::strtol(value, nullptr, 10);
+        if (parsed >= 0 && parsed < static_cast<long>(VIDEO_OUT_FLIP_QUEUE_CAPACITY)) return static_cast<std::size_t>(parsed);
+        std::fprintf(stderr, "[videoout] APS5_PRESENT_DEPTH=%s refused (0..%zu)\n", value, VIDEO_OUT_FLIP_QUEUE_CAPACITY - 1);
+        return std::size_t{0};
+    }();
+    // Measurement aid: APS5_PRESENT_DEPTH_AB=<seconds> applies the depth only in every second period of that
+    // length, so one run holds both arms under the same machine load ([pflip] lines carry depth=<active>).
+    static const double abSeconds = [] {
+        const char* value = std::getenv("APS5_PRESENT_DEPTH_AB");
+        return value != nullptr ? std::atof(value) : 0.0;
+    }();
+    if (abSeconds > 0.0 && depth != 0) {
+        static const auto start = std::chrono::steady_clock::now();
+        const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
+        if (static_cast<std::uint64_t>(elapsed / abSeconds) % 2 == 0) return 0;
+    }
+    return depth;
+}
+std::atomic<std::uint64_t> presentDepthHolds{0}, presentDepthTimeouts{0};
+
+// APS5_PRESENT_DRAIN=1: a flip taken while another GPU-ready flip already stands behind it waits one vblank, not
+// its whole flip interval, so frames queued up by a hitch at a 30 fps cap leave the queue instead of each staying
+// a frame late for as long as the title holds the cap. Nothing is dropped or shown twice.
+bool presentDrain() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_PRESENT_DRAIN");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return on;
+}
 
 void require(bool condition, const char* reason) {
     if (!condition) throw std::runtime_error(std::string("VideoOut: ") + reason);
@@ -122,6 +164,25 @@ VkSurfaceKHR createWindowSurface(void* context, VkInstance instance) {
         if (!SDL_Vulkan_CreateSurface(static_cast<SDL_Window*>(context), instance, &surface)) throw std::runtime_error(std::string("SDL_Vulkan_CreateSurface failed: ") + SDL_GetError());
         return surface;
     });
+}
+
+void windowSetStatus(void* context, const char* text) {
+    const std::string line = DisplayWindowRunTagPrefix() + text;
+    OnMainThread([&] { SDL_SetWindowTitle(static_cast<SDL_Window*>(context), line.c_str()); });
+}
+
+// nps5: set when SDL_QUIT was consumed while the window attach (the startup shader prebuild) ran; presentLoop then shuts down at once.
+std::atomic<bool> gQuitDuringAttach{false};
+
+// nps5: called every 100 ms by the prebuild: pumps SDL and takes only a pending SDL_QUIT (other events stay queued for the presentation loop).
+bool windowPollQuit(void*) {
+    const bool quit = OnMainThread([&] {
+        SDL_PumpEvents();
+        SDL_Event event;
+        return SDL_PeepEvents(&event, 1, SDL_GETEVENT, SDL_QUIT, SDL_QUIT) > 0;
+    });
+    if (quit) gQuitDuringAttach = true;
+    return quit;
 }
 
 void windowDrawableSize(void* context, std::uint32_t* width, std::uint32_t* height) {
@@ -203,6 +264,15 @@ public:
         if (queue->failure) std::rethrow_exception(queue->failure);
         if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
         require(room, "flip queue stayed full for 60 s: the presenter is not completing flips");
+        const auto depth = presentDepth();
+        if (depth == 0 || queue->reservations.load() < depth) return;
+        ++presentDepthHolds;
+        const bool below = queue->changed.WaitUntil(queueLock, TimedWait::DeadlineNanos(PRESENT_DEPTH_WAIT_MICROS), [&] {
+            return queue->failure || queue->stopping || cfg->shutdownToken.stop_requested() || queue->reservations.load() < depth;
+        });
+        if (!below) ++presentDepthTimeouts;
+        if (queue->failure) std::rethrow_exception(queue->failure);
+        if (queue->stopping || cfg->shutdownToken.stop_requested()) throw ProcessShutdown{};
     }
 
     std::shared_ptr<AgcDriver::IFlipRequest> Reserve(const AgcDriver::FlipInfo& info) override { return Reserve(info, false); }
@@ -232,6 +302,11 @@ public:
             request->reuseTicket = cfg->bufferReuse[info.index].Reserve();
         }
         ++queue->reservations;
+        static const bool traceReserve = std::getenv("APS5_TRACE_PRESENT") != nullptr;  // only the [pflip] trace reads these stamps
+        if (traceReserve) {
+            request->reservedAt = std::chrono::steady_clock::now();
+            request->pendingAtReserve = queue->reservations.load();
+        }
         ++cfg->flipStatus.flipPendingNum;
         if (info.index >= 0) ++cfg->bufferPending[info.index];
         if (info.index >= 0 && cfg->buffers[info.index].Occupied() && cfg->buffers[info.index].groupIndex < VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX && cfg->groups[cfg->buffers[info.index].groupIndex].occupied) {
@@ -348,6 +423,7 @@ VideoOutDriver::VideoOutDriver() {
 #ifdef __linux__
         SDL_SetHint(SDL_HINT_VIDEODRIVER, "wayland,x11");
 #endif
+        PadInput::ConfigureSdl();
         if (SDL_InitSubSystem(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER) < 0) {
             throw std::runtime_error(std::string("SDL_InitSubSystem(VIDEO | GAMECONTROLLER) failed: ") + SDL_GetError());
         }
@@ -371,6 +447,7 @@ VideoOutDriver::VideoOutDriver() {
     } catch (...) {
         if (vblankThread.joinable()) {
             vblankThread.request_stop();
+            linkBeat.Wake();
             flipQueue->changed.NotifyAll();
             vblankThread.join();
         }
@@ -399,6 +476,7 @@ void VideoOutDriver::Shutdown() {
     }
     presentThread.request_stop();
     vblankThread.request_stop();
+    linkBeat.Wake();
     flipQueue->changed.NotifyAll();
     presentThread.join();
     vblankThread.join();
@@ -535,6 +613,7 @@ int VideoOutDriver::SubmitFlip(int handle, int index, int flipMode, int64_t flip
     // A title that does not pace on flipPendingNum can run ahead of the presenter now that the queue
     // worker no longer waits per flip; a full queue is the documented error, not a failure.
     if (flipQueue->reservations.load() >= VIDEO_OUT_FLIP_QUEUE_CAPACITY) return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
+    LatTrace::Submit(static_cast<long long>(flipArg));
     AgcDriverSubmitFlip_nid_postfix(AgcDriver::FlipInfo{static_cast<std::uint32_t>(handle), index, static_cast<std::uint32_t>(flipMode), flipArg});
     return 0;
 }
@@ -551,6 +630,7 @@ int VideoOutDriver::SubmitEopFlip(int handle, int index, int flipMode, int64_t f
         if (index >= 0 && !cfg->buffers[index].Occupied()) return VIDEO_OUT_ERROR_INVALID_INDEX;
     }
     const AgcDriver::FlipInfo info{static_cast<std::uint32_t>(handle), index, static_cast<std::uint32_t>(flipMode), flipArg};
+    LatTrace::Submit(static_cast<long long>(flipArg));
     const auto reserved = AgcDriverReserveEopFlip_nid_postfix(info);
     if (reserved == 0) return VIDEO_OUT_ERROR_FLIP_QUEUE_FULL;
     std::memcpy(token, &reserved, sizeof(reserved));
@@ -595,6 +675,7 @@ void VideoOutDriver::updateDisplayRefreshRate() {
     if (SDL_GetCurrentDisplayMode(display, &mode) != 0) throw std::runtime_error(std::string("SDL_GetCurrentDisplayMode failed: ") + SDL_GetError());
     displayRefreshRate.store(mode.refresh_rate);
     displayResolution.store(resolutionIndex(mode.w, mode.h));
+    followWindowDisplay();
 }
 
 void VideoOutDriver::pollHostHdr() {
@@ -611,14 +692,18 @@ void VideoOutDriver::pollHostHdr() {
     }
 }
 
-void VideoOutDriver::vblankEnd(std::uint64_t tick) {
+void VideoOutDriver::vblankEnd(std::uint64_t tick, std::uint64_t advance) {
     std::lock_guard lock(mutex);
     for (const auto& cfg : contexts) {
         if (!cfg) continue;
         std::lock_guard cfgLock(cfg->mutex);
         if (!cfg->opened || cfg->failure) continue;
-        if (cfg->outputMode != VIDEO_OUT_OUTPUT_MODE_119_88HZ && tick % 2 != 0) continue;
-        require(cfg->vblankStatus.count != std::numeric_limits<uint64_t>::max(), "vblank counter overflow");
+        // A 59.94 Hz mode counts the even ticks of (tick - advance, tick].
+        const std::uint64_t vblanks = cfg->outputMode == VIDEO_OUT_OUTPUT_MODE_119_88HZ ? advance : tick / 2 - (tick - advance) / 2;
+        if (vblanks == 0) continue;
+        require(cfg->vblankStatus.count < std::numeric_limits<uint64_t>::max() - vblanks, "vblank counter overflow");
+        cfg->preVblankStatus.count += vblanks - 1;
+        cfg->vblankStatus.count += vblanks - 1;
         ++cfg->preVblankStatus.count;
         cfg->preVblankStatus.processTime = sceKernelGetProcessTime();
         cfg->preVblankStatus.processTimeCounter = sceKernelGetProcessTimeCounter();
@@ -627,12 +712,26 @@ void VideoOutDriver::vblankEnd(std::uint64_t tick) {
         cfg->vblankStatus.processTime = sceKernelGetProcessTime();
         cfg->vblankStatus.processTimeCounter = sceKernelGetProcessTimeCounter();
         cfg->vblankStatus.reserved = sceKernelReadTsc();
+        static const bool traceClock = std::getenv("APS5_TRACE_FLIP") != nullptr;
+        if (traceClock && cfg->vblankStatus.count % 120 == 0) {
+            std::fprintf(stderr, "[vblank-clock] #%llu processTime=%llu us processTimeCounter=%llu tsc=%llu => counter/us=%.1f tsc/us=%.1f; freq(process counter)=%llu tscfreq=%llu\n",
+                         static_cast<unsigned long long>(cfg->vblankStatus.count), static_cast<unsigned long long>(cfg->vblankStatus.processTime),
+                         static_cast<unsigned long long>(cfg->vblankStatus.processTimeCounter), static_cast<unsigned long long>(cfg->vblankStatus.reserved),
+                         static_cast<double>(cfg->vblankStatus.processTimeCounter) / static_cast<double>(cfg->vblankStatus.processTime + 1),
+                         static_cast<double>(cfg->vblankStatus.reserved) / static_cast<double>(cfg->vblankStatus.processTime + 1),
+                         static_cast<unsigned long long>(sceKernelGetProcessTimeCounterFrequency()), static_cast<unsigned long long>(sceKernelGetTscFrequency()));
+        }
         triggerEvents(*cfg, VIDEO_OUT_EVENT_VBLANK, reinterpret_cast<void*>(cfg->vblankStatus.count));
         cfg->vblankCond.notify_all();
     }
 }
 
 void VideoOutDriver::processFlip(FlipRequest& req) {
+    // APS5_TRACE_FLIP=1: one stderr line per completed flip with the wall time spent in each stage.
+    static const bool traceFlip = std::getenv("APS5_TRACE_FLIP") != nullptr;
+    const auto traceNow = [] { return std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count(); };
+    const double traceT0 = traceFlip ? traceNow() : 0.0;
+    double traceVblank = 0.0, tracePace = 0.0, tracePresent = 0.0;
     AgcDriver::PerformanceContext timingContext(req.timing.get());
     AgcDriver::PerformanceTimer timing("VideoOut.Flip");
     {
@@ -649,12 +748,13 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             std::fprintf(stderr, "[videoout] display no longer supports 119.88 Hz; fell back to 59.94 Hz\n");
         }
         require(req.ready && !req.terminal && req.generation == req.cfg->generation, "stale or incomplete flip request");
-        const auto interval = static_cast<uint64_t>(req.flipRate + 1);
+        const auto interval = presentDrain() && req.readyBehind != 0 ? uint64_t{1} : static_cast<uint64_t>(req.flipRate + 1);
         require(req.cfg->lastFlipVblank <= std::numeric_limits<uint64_t>::max() - interval, "flip interval overflow");
         const auto target = req.cfg->lastFlipVblank + interval;
         timing.Mark("validate");
         req.cfg->vblankCond.wait(lock, req.cfg->shutdownToken, [&] { return req.cfg->vblankStatus.count >= target || req.cfg->failure || req.cfg->closing; });
         timing.Mark("vblank_wait");
+        if (traceFlip) traceVblank = traceNow();
         req.cfg->CheckAlive();
         if (req.cfg->Closed()) {
             req.ReleaseLocked();
@@ -680,7 +780,13 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             }
         }
         timing.Mark("frame_limit");
-        OnMainThread([&] { window.Ensure(req.width, req.height); });
+        if (traceFlip) tracePace = traceNow();
+        // The window exists and has this source extent after the first flip: no hop to the main thread then.
+        if (window.Handle() == nullptr || req.width != ensuredWidth || req.height != ensuredHeight) {
+            OnMainThread([&] { window.Ensure(req.width, req.height); });
+            ensuredWidth = req.width;
+            ensuredHeight = req.height;
+        }
         const auto extensions = windowExtensions(window.Handle());
         const AgcDriver::PresentationWindow target{window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, req.width, req.height, req.timing};
         timing.Mark("window_prepare");
@@ -701,8 +807,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
             AgcDriverPresentClear_nid_postfix(target, req.unregistered || req.index == VIDEO_OUT_BUFFER_INDEX_BLACK, plane ? &*plane : nullptr, gpuReady, &req);
         }
         timing.Mark("present");
-        OnMainThread([&] { window.UpdateTitle(); });
-        timing.Mark("window_title");
+        if (traceFlip) tracePresent = traceNow();
     }
     std::lock_guard lock(req.cfg->mutex);
     timing.Mark("completion_mutex_wait");
@@ -721,8 +826,7 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     req.cfg->flipStatus.flipArg = req.flipArg;
     const auto previous = req.cfg->flipStatus.currentBuffer;
     if (previous >= 0) {
-        auto& label = req.cfg->bufferLabels[previous];
-        AgcDriverStoreGuestLabel_nid_postfix(&label, 0);
+        AgcDriverStoreGuestLabel_nid_postfix(reinterpret_cast<std::uint64_t*>(req.cfg->BufferLabelGuest(previous)), 0);
     }
     req.cfg->flipStatus.currentBuffer = req.index;
     req.cfg->width = req.width;
@@ -737,6 +841,26 @@ void VideoOutDriver::processFlip(FlipRequest& req) {
     req.cfg->vblankCond.notify_all();
     KernelWakeSleepers_nid_no_patch();
     timing.Mark("notify_game");
+    LatTrace::Done(static_cast<long long>(req.cfg->flipStatus.count));
+    // nps5: APS5_TRACE_PRESENT=1: one line per completed flip (host steady clock, ms): when the guest reserved it,
+    // then the delays to GPU-ready (the driver replayed the frame), to the presenter taking it and to completion;
+    // pend = flips pending at the reserve (frames in flight, this one included), behind = ready flips queued behind.
+    static const bool tracePflip = std::getenv("APS5_TRACE_PRESENT") != nullptr;
+    if (tracePflip) {
+        const auto ms = [](std::chrono::steady_clock::time_point t) { return std::chrono::duration<double, std::milli>(t.time_since_epoch()).count(); };
+        const double reserved = ms(req.reservedAt);
+        std::fprintf(stderr, "[pflip] n=%llu arg=%lld t=%.2f ready=+%.2f deq=+%.2f done=+%.2f pend=%zu behind=%zu rate=%d vbl=%llu holds=%llu/%llu depth=%zu\n",
+                     static_cast<unsigned long long>(req.cfg->flipStatus.count), static_cast<long long>(req.flipArg), reserved, ms(req.queuedAt) - reserved, ms(req.dequeuedAt) - reserved,
+                     ms(std::chrono::steady_clock::now()) - reserved, req.pendingAtReserve, req.readyBehind, req.flipRate, static_cast<unsigned long long>(req.cfg->vblankStatus.count),
+                     static_cast<unsigned long long>(presentDepthHolds.load()), static_cast<unsigned long long>(presentDepthTimeouts.load()), presentDepth());
+    }
+    if (traceFlip) {
+        const double now = traceNow();
+        static double last = now;
+        std::fprintf(stderr, "[flip] #%llu t=%.0f dt=%.0f vblank_wait=%.0f frame_limit=%.0f present(gpu_ready)=%.0f\n",
+                     static_cast<unsigned long long>(req.cfg->flipStatus.count), now, now - last, traceVblank - traceT0, tracePace > 0 ? tracePace - traceVblank : 0.0, tracePresent > 0 ? tracePresent - tracePace : 0.0);
+        last = now;
+    }
 }
 
 std::optional<AgcDriver::DisplayBuffer> VideoOutDriver::overlayPlane() {
@@ -761,7 +885,7 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
         });
         hdrProbe.Poll(window.Handle());
         const auto extensions = windowExtensions(window.Handle());
-        AgcDriverAttachWindow_nid_postfix({window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr});
+        AgcDriverAttachWindow_nid_postfix({window.Handle(), extensions, &createWindowSurface, &windowDrawableSize, VIDEO_OUT_DEFAULT_WIDTH, VIDEO_OUT_DEFAULT_HEIGHT, nullptr, &windowSetStatus, &windowPollQuit, token});
         hdrGeneration = AgcDriver::CurrentHostHdr().generation;
     } catch (...) {
         hdrProbe.Release();
@@ -794,6 +918,48 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
             dialogInput.emplace();
             imeTextInput->SetClipboardProvider(&readHostClipboard);
         });
+        int hopWindowWidth = 0;
+        int hopWindowHeight = 0;
+        // nps5: APS5_INPUT_HZ=<n> (0 = off): a thread that pumps SDL events and samples the pads n times a second
+        // (on the main thread, like the hop below, so it never runs concurrently with it). Without it the pads
+        // are sampled once per presentation-loop iteration, and the loop is inside a flip (vblank wait, frame
+        // limit, GPU wait) for much of a frame.
+        std::atomic<bool> inputQuit{gQuitDuringAttach.exchange(false)};
+        std::jthread inputPump;
+        {
+            const char* hzText = std::getenv("APS5_INPUT_HZ");
+            const long hz = hzText != nullptr ? std::strtol(hzText, nullptr, 10) : 0;
+            if (hz > 0 && hz <= 2000) {
+                std::fprintf(stderr, "[input] APS5_INPUT_HZ=%ld: input pump thread\n", hz);
+                inputPump = Libc::StartHostJThread([&, hz](std::stop_token stop) {
+                    const auto period = std::chrono::microseconds(1000000 / hz);
+                    auto next = std::chrono::steady_clock::now();
+                    while (!stop.stop_requested()) {
+                        next += period;
+                        const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(next - std::chrono::steady_clock::now()).count();
+                        if (remaining > 0) PreciseSleepUs(static_cast<unsigned long long>(remaining));
+                        else next = std::chrono::steady_clock::now();
+                        if (stop.stop_requested()) break;
+                        const bool quit = OnMainThread([&] {
+                            SDL_Event event;
+                            while (SDL_PollEvent(&event)) {
+                                if (event.type == SDL_QUIT) return true;
+                                padInput->HandleEvent(event, window);
+                                if (window.Handle() != nullptr) {
+                                    mouseInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
+                                    keyboardInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
+                                    imeTextInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
+                                    dialogInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
+                                }
+                            }
+                            padInput->Update(window);
+                            return false;
+                        });
+                        if (quit) { inputQuit = true; break; }
+                    }
+                });
+            }
+        }
         while (!token.stop_requested()) {
             {
                 std::unique_lock lock(flipQueue->mutex);
@@ -803,33 +969,13 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 if (!flipQueue->requests.empty()) {
                     current = std::move(flipQueue->requests.front());
                     flipQueue->requests.pop_front();
+                    current->readyBehind = flipQueue->requests.size();
+                    current->dequeuedAt = std::chrono::steady_clock::now();
                 }
             }
 
-            const bool quit = OnMainThread([&] {
-                SDL_Event event;
-                while (SDL_PollEvent(&event)) {
-                    if (event.type == SDL_QUIT) return true;
-                    padInput->HandleEvent(event, window);
-                    if (window.Handle() != nullptr) {
-                        mouseInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
-                        keyboardInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
-                        imeTextInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
-                        dialogInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
-                    }
-                }
-                padInput->Update(window);
-                updateDisplayRefreshRate();
-                return false;
-            });
-            if (quit) {
-                LibcRunReportQuitRequested_nid_no_patch();
-                LibcRequestExit_nid_postfix(0);
-                throw ProcessShutdown{};
-            }
             ModalDialogSetPresenter_nid_postfix(window.Handle() != nullptr);
             pollHostHdr();
-            OnMainThread([&] { mouseInput->UpdateCapture(!padInput->MouseModeEnabled()); });
             if (current) {
                 require(current->timing != nullptr, "missing presentation timing");
                 const auto dequeued = AgcDriver::FrameTiming::Clock::now();
@@ -841,9 +987,10 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 const bool dialogShown = !keyboardShown && ModalDialogReadView_nid_postfix(dialogView);
                 AgcDriverSetSystemDialog_nid_postfix(dialogShown ? &dialogView : nullptr);
                 processFlip(*current);
-                int windowWidth = 0;
-                int windowHeight = 0;
-                if (window.Handle() != nullptr) OnMainThread([&] { SDL_GetWindowSize(window.Handle(), &windowWidth, &windowHeight); });
+                // The size read at the top of this iteration; a window created or resized by this very flip is seen
+                // one frame later (it only scales mouse coordinates).
+                const int windowWidth = hopWindowWidth;
+                const int windowHeight = hopWindowHeight;
                 if (windowWidth > 0 && windowHeight > 0) {
                     const auto presented = AgcDriver::ComputeContainSize_nid_postfix(current->width, current->height, static_cast<std::uint32_t>(windowWidth), static_cast<std::uint32_t>(windowHeight), true);
                     mouseInput->SetPresentation(current->width, current->height, presented.width, presented.height);
@@ -860,9 +1007,38 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
                 timingLog->Enqueue(current->timing->Capture(current->outputHandle, current->index, current->flipArg, finished, interval));
 #endif
             }
+            const bool flipped = current != nullptr;
             if (current) {
                 current.reset();
                 flipQueue->changed.NotifyAll();
+            }
+            const bool quit = OnMainThread([&] {
+                SDL_Event event;
+                while (SDL_PollEvent(&event)) {
+                    if (event.type == SDL_QUIT) return true;
+                    padInput->HandleEvent(event, window);
+                    if (window.Handle() != nullptr) {
+                        mouseInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
+                        keyboardInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
+                        imeTextInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
+                        dialogInput->HandleEvent(event, SDL_GetWindowID(window.Handle()));
+                    }
+                }
+                padInput->Update(window);
+                updateDisplayRefreshRate();
+                // One hop to the main thread per loop iteration, after the flip was handed to the GPU and the game
+                // was notified (it was three before the flip and one inside it, each a wake-up of the main thread
+                // the game's flip waited for: about 1.8 ms of a 3.3 ms flip): events, the mouse capture, the window
+                // size (used by the next iteration) and the title.
+                mouseInput->UpdateCapture(!padInput->MouseModeEnabled());
+                if (window.Handle() != nullptr) SDL_GetWindowSize(window.Handle(), &hopWindowWidth, &hopWindowHeight);
+                if (flipped && window.Handle() != nullptr) window.UpdateTitle();
+                return false;
+            });
+            if (quit || inputQuit.load()) {
+                LibcRunReportQuitRequested_nid_no_patch();
+                LibcRequestExit_nid_postfix(0);
+                throw ProcessShutdown{};
             }
         }
     } catch (const ProcessShutdown&) {
@@ -908,7 +1084,130 @@ void VideoOutDriver::presentLoop(std::stop_token token, std::promise<void>& star
     });
 }
 
+namespace {
+
+// nps5: APS5_PRESENT_LINK=1: the vblank beat follows the display the window is on (docs/nps5-present.md).
+bool presentLinkRequested() {
+    static const bool on = [] {
+        const char* value = std::getenv("APS5_PRESENT_LINK");
+        return value != nullptr && value[0] != '\0' && value[0] != '0';
+    }();
+    return on;
+}
+
+}
+
+void VideoOutDriver::followWindowDisplay() {
+    if (!presentLinkRequested() || window.Handle() == nullptr) return;
+    const int index = SDL_GetWindowDisplayIndex(window.Handle());
+    if (index < 0 || index == linkDisplayIndex) return;
+    SDL_Rect bounds{};
+    if (SDL_GetDisplayBounds(index, &bounds) != 0) return;
+    const bool following = linkBeat.Follow(bounds.x + bounds.w / 2, bounds.y + bounds.h / 2);
+    std::fprintf(stderr, "[videoout] APS5_PRESENT_LINK: display %d %s\n", index, following ? "has a display link" : "has no display link; the vblank beat stays on the host clock");
+    linkDisplayIndex = index;
+}
+
+// The beat with APS5_PRESENT_LINK=1. While the window's display nominally refreshes at a multiple the guest's
+// 59.94/119.88 Hz divides (60 or 120 Hz; 30 Hz), the guest's vblank counter advances at the refreshes the link
+// reports, by the host time passed since the last one, so a flip that waits for a vblank is released at the
+// screen's own refresh. A display at another rate (75, 144, 50 Hz), a
+// link that went silent (window hidden, display asleep) and a missing link fall back to a beat on the host clock.
+// Either way a hitch never produces a burst of late vblanks: the counter takes the missed ticks with one event,
+// and the host-clock beat then continues on its grid.
+void VideoOutDriver::vblankLoopLinked(std::stop_token token) {
+    using Clock = std::chrono::steady_clock;
+    constexpr std::chrono::nanoseconds tickPeriod{1001ll * 1000000000ll / 120000ll};
+    enum class Beat { None, Link, HostClock, Silent };
+    Beat reported = Beat::None;
+    std::uint64_t tick = 0;
+    std::uint64_t seen = linkBeat.Ticks();
+    auto anchor = Clock::now();   // host-clock beat: the time of tick `anchorTick`
+    std::uint64_t anchorTick = 0;
+    bool silent = false;
+    bool linked = false;          // the anchor is a display refresh
+    try {
+        while (!token.stop_requested()) {
+            const double period = linkBeat.PeriodSeconds();
+            const int perRefresh = DisplayLinkTicksPerRefresh(period);
+            std::uint64_t advance = 0;
+            Beat beat = Beat::HostClock;
+            if (perRefresh != 0 && !silent) {
+                beat = Beat::Link;
+                const auto timeout = std::max(std::chrono::nanoseconds(static_cast<std::int64_t>(period * 3e9)), std::chrono::nanoseconds(50000000));
+                const auto now = linkBeat.WaitPast(seen, timeout);
+                if (now == seen) {
+                    if (token.stop_requested()) break;
+                    silent = true;
+                } else {
+                    // The refresh gives the instant, the host clock the count: an adaptive-refresh panel skips
+                    // refreshes and a 120.00 Hz one is 0.1 % faster than 119.88 Hz, so ticks are not counted.
+                    seen = now;
+                    if (!linked) {
+                        linked = true;
+                        anchor = Clock::now() - tickPeriod;
+                        anchorTick = tick;
+                    }
+                    const auto elapsed = (Clock::now() - anchor + tickPeriod / 2) / tickPeriod;
+                    const auto target = anchorTick + static_cast<std::uint64_t>(std::max<std::int64_t>(elapsed, 0));
+                    if (target <= tick) continue;  // this refresh came before the next guest tick was due
+                    advance = target - tick;
+                }
+                if (silent) {
+                    // The host-clock beat takes over from here.
+                    linked = false;
+                    anchor = Clock::now();
+                    anchorTick = tick;
+                    continue;
+                }
+            } else {
+                if (silent) beat = Beat::Silent;
+                if (linked) {
+                    linked = false;
+                    anchor = Clock::now();
+                    anchorTick = tick;
+                }
+                const auto next = anchor + tickPeriod * static_cast<std::int64_t>(tick + 1 - anchorTick);
+                const auto remaining = std::chrono::duration_cast<std::chrono::microseconds>(next - Clock::now()).count();
+                if (remaining > 0) PreciseSleepUs(static_cast<unsigned long long>(remaining));
+                const auto elapsed = static_cast<std::uint64_t>(std::max<std::int64_t>((Clock::now() - anchor) / tickPeriod, 0));
+                advance = std::max<std::uint64_t>(elapsed + anchorTick > tick ? elapsed + anchorTick - tick : 0, 1);
+                if (const auto now = linkBeat.Ticks(); now != seen) {
+                    seen = now;
+                    silent = false;
+                }
+            }
+            if (beat != reported) {
+                reported = beat;
+                const double hz = period > 0.0 ? 1.0 / period : 0.0;
+                if (beat == Beat::Link) std::fprintf(stderr, "[videoout] vblank beat: display link, %.2f Hz, %d guest tick(s) of 119.88 Hz per refresh\n", hz, perRefresh);
+                else if (beat == Beat::Silent) std::fprintf(stderr, "[videoout] vblank beat: host clock (the display link went silent)\n");
+                else if (period > 0.0) std::fprintf(stderr, "[videoout] vblank beat: host clock (a %.2f Hz display is no multiple of 59.94 Hz)\n", hz);
+                else std::fprintf(stderr, "[videoout] vblank beat: host clock (no display link yet)\n");
+            }
+            {
+                std::lock_guard lock(flipQueue->mutex);
+                if (token.stop_requested() || flipQueue->failure) return;
+            }
+            tick += advance;
+            vblankEnd(tick, advance);
+        }
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "[videoout] vblank failed: %s\n", error.what());
+        std::fflush(stderr);
+        std::terminate();
+    } catch (...) {
+        std::fprintf(stderr, "[videoout] vblank failed with a non-standard exception\n");
+        std::fflush(stderr);
+        std::terminate();
+    }
+}
+
 void VideoOutDriver::vblankLoop(std::stop_token token) {
+    if (presentLinkRequested()) {
+        vblankLoopLinked(token);
+        return;
+    }
     using Frame = std::chrono::duration<int64_t, std::ratio<1001, 120000>>;
     const auto start = std::chrono::steady_clock::now();
     try {

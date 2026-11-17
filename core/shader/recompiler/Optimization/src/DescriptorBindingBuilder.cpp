@@ -262,7 +262,13 @@ std::array<std::uint32_t, 2> RelativeMinLod(std::span<const std::uint32_t> words
     return {minLod > baseLevel * 256u ? std::min(minLod - baseLevel * 256u, (lastLevel - baseLevel) * 256u) : 0u, lastLevel - baseLevel};
 }
 
-void RequireShaderMinLod(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t image, const ImageResource& mode, std::uint32_t clamp) {
+// Returns the clamp the shader applies. An explicit LOD is clamped in the shader BEFORE the host sampler adds the S#'s LOD
+// bias, where the console clamps after it: max(lod, clamp) + bias instead of max(lod + bias, clamp). When every sample of the
+// image takes an explicit LOD through samplers with one bias, the shader clamps to clamp - bias and the sum is the console's
+// (ASTRO BOT hoover_beach: T# minimum LOD 1.0, S# bias -1.0, explicit LOD).
+std::uint32_t RequireShaderMinLod(const ShaderInfo& info, const ResourceSnapshot& snapshot, std::uint32_t image, const ImageResource& mode, std::uint32_t clamp) {
+    std::optional<std::int32_t> explicitBias;
+    bool otherUse = false;
     const auto prefix = "image " + std::to_string(image) + " applies its T#'s minimum LOD of " + std::to_string(clamp) + "/256 in the shader";
     if ((mode.emulatedCompare & EmulatedCompare::Enabled) != 0u || mode.conversionFormat == IrBufferFormat::Format11_11_10UNorm) fail(prefix + " to an emulated depth-compare or 11:11:10 sample, which is not implemented");
     for (const auto& pair : info.sampledPairs) {
@@ -285,14 +291,31 @@ void RequireShaderMinLod(const ShaderInfo& info, const ResourceSnapshot& snapsho
                 const auto [otherClamp, otherLevels] = RelativeMinLod(snapshot.images.at(other.image).dwords);
                 if (otherClamp != clamp && otherLevels != 0u) fail(prefix + " and " + name + ", which holds the LOD at 0, also samples " + otherName + " with another minimum LOD, which is not implemented");
             }
+            otherUse = true;
             continue;
         }
         if ((sampler.uses & (SamplerUseExplicitLod | SamplerUseImplicitLod | SamplerUseGradient)) == 0u) continue;
         if (maxLod < clamp) fail(prefix + " above the maximum LOD of " + std::to_string(maxLod) + "/256 of " + name + (mipmapped ? "" : unnormalized ? " (unnormalized)" : " (no mip filter)") + ", which is not implemented");
         if ((((words[2] >> 20u) ^ (words[2] >> 22u)) & 1u) != 0u) fail(prefix + " and " + name + " has different magnification and minification filters, between which the clamp moves the choice, which is not implemented");
         const auto bias = static_cast<std::int32_t>(((words[2] & 0x3fffu) ^ 0x2000u) - 0x2000u);
-        if (bias != 0 && (sampler.uses & SamplerUseExplicitLod) != 0u) fail(prefix + " to an explicit LOD that " + name + " biases by " + std::to_string(bias) + "/256, which is not implemented");
+        const bool explicitOnly = (sampler.uses & (SamplerUseExplicitLod | SamplerUseImplicitLod | SamplerUseGradient)) == SamplerUseExplicitLod;
+        if (bias != 0 && (sampler.uses & SamplerUseExplicitLod) != 0u) {
+            if (!explicitOnly) otherUse = true;
+            if (bias > static_cast<std::int32_t>(clamp) || (explicitBias && *explicitBias != bias)) fail(prefix + " to an explicit LOD that " + name + " biases by " + std::to_string(bias) + "/256, which is not implemented");
+            explicitBias = bias;
+        } else {
+            otherUse = true;
+        }
     }
+    if (!explicitBias) return clamp;
+    if (otherUse) {
+        // The image is also sampled with an implicit LOD (or through an unbiased sampler), which wants the plain clamp, and the shader
+        // has one constant per image. The biased clamp is used for all of them: those samples read up to |bias| levels coarser than
+        // the console, never a level above the T#'s minimum (which the title may not have loaded).
+        static std::atomic<bool> told{false};
+        if (!told.exchange(true)) std::fprintf(stderr, "[gpu] %s to an explicit LOD that an S# biases by %d/256 and to other samples of the image: all of them clamp to %d/256 (approximation, said once)\n", prefix.c_str(), *explicitBias, static_cast<std::int32_t>(clamp) - *explicitBias);
+    }
+    return static_cast<std::uint32_t>(static_cast<std::int32_t>(clamp) - *explicitBias);
 }
 
 struct UnnormalizedProof {
@@ -515,8 +538,8 @@ DescriptorBindingPlan DescriptorBindingBuilder::Prepare(const IrBindingLayout& l
         for (std::uint32_t component = 0; component < 4u; ++component) plan.specialization.push_back({first + 1u + component, (snapshot.images.at(index).dwords[3] >> (component * 3u)) & 7u});
         if (shaderImageMinLod) {
             const auto& words = snapshot.images.at(index).dwords;
-            const auto clamp = RelativeMinLod(words)[0];
-            if (clamp != 0u) RequireShaderMinLod(info, snapshot, index, modes.at(imageModes[index]), clamp);
+            auto clamp = RelativeMinLod(words)[0];
+            if (clamp != 0u) clamp = RequireShaderMinLod(info, snapshot, index, modes.at(imageModes[index]), clamp);
             plan.specialization.push_back({PipelineSpecialization::MinLodBase + index, std::bit_cast<std::uint32_t>(static_cast<float>(clamp) / 256.0f)});
         }
         const auto& image = info.images[index];

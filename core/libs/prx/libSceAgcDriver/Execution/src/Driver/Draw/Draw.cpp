@@ -523,6 +523,25 @@ DrawVerdict Driver::draw(QueueState& queue, std::span<const std::uint32_t> packe
         throw;
     }
     const auto& graphics = decode->state;
+    if (graphics.stages.mesh) {
+        // APS5_MESH_CENSUS: one line per distinct geometry-path (mesh) draw shape; with
+        // APS5_MESH_CENSUS=skip the draw is then dropped on a device without mesh shaders, so a
+        // whole frame can be surveyed there.
+        static const char* const census = std::getenv("APS5_MESH_CENSUS");
+        if (census != nullptr) {
+            const auto& mesh = *graphics.stages.mesh;
+            const auto frontType = decode->programs.empty() || decode->programs.front().snapshot == nullptr ? 0u : static_cast<unsigned>(decode->programs.front().snapshot->type);
+            const std::uint64_t shape = (static_cast<std::uint64_t>(graphics.stages.registerValue) << 32u) ^ (static_cast<std::uint64_t>(mesh.inputPrimitive) << 56u) ^ (static_cast<std::uint64_t>(mesh.primitivesPerGroup) << 40u) ^ (static_cast<std::uint64_t>(mesh.maxVertices) << 20u) ^ (static_cast<std::uint64_t>(mesh.maxPrimitives) << 8u) ^ mesh.threadsPerGroup ^ (static_cast<std::uint64_t>(mesh.ldsSizeDwords) << 12u) ^ (drawParameters.indirect ? 2u : 0u) ^ (drawParameters.indexed ? 1u : 0u) ^ (static_cast<std::uint64_t>(frontType) << 28u) ^ (static_cast<std::uint64_t>(decode->programs.size()) << 4u) ^ (decode->programs.empty() ? 0u : decode->programs.front().binary.codeAddress * 0x9e3779b97f4a7c15ull);
+            static std::mutex censusMutex;
+            static std::unordered_map<std::uint64_t, std::uint64_t> seen;
+            static std::uint64_t total = 0;
+            std::lock_guard lock(censusMutex);
+            ++total;
+            if (seen[shape]++ == 0) std::fprintf(stderr, "[mesh-census] #%zu (draw %llu) VGT_SHADER_STAGES_EN=0x%x frontType=%u programs=%zu wave=%u inputPrim=%u primsPerGroup=%u vertsPerGroup=%u maxVertices=%u maxPrimitives=%u threads=%u ldsDwords=%u provoking=%u esgsItem=%u outPrimSize=%u indexed=%d indirect=%d indexCount=%u instances=%u code=0x%llx\n", seen.size(), static_cast<unsigned long long>(total), graphics.stages.registerValue, frontType, decode->programs.size(), graphics.stages.vertexWaveSize, mesh.inputPrimitive, mesh.primitivesPerGroup, mesh.verticesPerGroup, mesh.maxVertices, mesh.maxPrimitives, mesh.threadsPerGroup, mesh.ldsSizeDwords, mesh.provokingVertex, mesh.esgsItemSize, mesh.outputPrimitiveSize, drawParameters.indexed ? 1 : 0, drawParameters.indirect ? 1 : 0, drawParameters.indexCount, drawParameters.instanceCount, static_cast<unsigned long long>(decode->programs.empty() ? 0ull : decode->programs.front().binary.codeAddress));
+            if ((total & (total - 1u)) == 0) std::fprintf(stderr, "[mesh-census] %llu mesh draws, %zu shapes\n", static_cast<unsigned long long>(total), seen.size());
+            if (std::string_view(census) == "skip" && !localDevice->graphicsContext().meshShader) return DrawVerdict::Nothing;
+        }
+    }
     auto& pixel = tail.pixel;
     pixel = decode->pixel;
     const bool writesPrograms = graphics.stages.mesh || drawParameters.indirect || !userPatches.empty();
@@ -915,7 +934,7 @@ DrawVerdict Driver::finishDraw(DrawTail& tail, PerformanceTimer& timing) {
         std::vector<std::uint32_t> words;
         freshRuns(i, runs, words);
         const auto& compiled = *stageCaptures[i].compiled;
-        const char* what = joinedRuns(runs) != joinedRuns(kept.runs) ? "runs" : words != kept.words ? "words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : compiled.pushConstants != kept.compiled->pushConstants ? "push constants" : nullptr;
+        const char* what = joinedRuns(runs) != joinedRuns(kept.runs) ? "runs" : words != kept.words ? "words" : vertexInfos[i].has_value() != (kept.vertexInfo != nullptr) || (vertexInfos[i] && !sameVertexInfo(*vertexInfos[i], *kept.vertexInfo)) ? "vertex stage info" : compiled.variantId != kept.compiled->variantId ? "variant" : compiled.pushConstants != kept.compiled->pushConstants ? "push constants" : compiled.bindings.size() != kept.compiled->bindings.size() || !std::equal(compiled.bindings.begin(), compiled.bindings.end(), kept.compiled->bindings.begin(), [](const auto& a, const auto& b) { return a.role == b.role && a.guestDescriptor == b.guestDescriptor; }) ? "bindings" : compiled.shaderDataUserWords != kept.compiled->shaderDataUserWords ? "forwarded words" : nullptr;
         ++dataVerified;
         if (what == nullptr) return;
         char message[640];

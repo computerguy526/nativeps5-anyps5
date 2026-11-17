@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/AbSwitch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
@@ -453,6 +454,7 @@ void Driver::execute(Submission& submission) {
             Graphics::NoteHostImportFrame();
             if (batchesAtFlip != 0) flipSerial = batchesAtFlip;
             flipBatchesUnsignaled += unsignaledAtFlip;
+            Graphics::AbSwitch::OnFlip();
             if (Graphics::AbConfigured()) {
                 static const auto abClock = std::chrono::steady_clock::now();
                 std::vector<std::string> abLines;

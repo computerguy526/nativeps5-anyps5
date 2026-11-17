@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "ThreadOwned.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -211,7 +212,7 @@ bool Driver::validateCaptured(std::uint64_t program, std::uint32_t queue, std::s
                 std::vector<std::byte> copy;
                 if (GuestMemory::Accessible(reinterpret_cast<const void*>(region.guestAddress), region.bytes.size())) {
                     copy.resize(region.bytes.size());
-                    std::memcpy(copy.data(), reinterpret_cast<const void*>(region.guestAddress), copy.size());
+                    std::memcpy(copy.data(), GuestAddr::HostPtr<const void>(region.guestAddress), copy.size());
                 }
                 before.push_back(std::move(copy));
             }

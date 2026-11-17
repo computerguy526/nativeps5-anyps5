@@ -1,7 +1,12 @@
+#include <chrono>
+#include <cstdio>
+#include <cstdlib>
+#include <pthread.h>
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include <algorithm>
 #include <cstring>
 #include <iterator>
@@ -19,8 +24,9 @@ int AgcDriver::SubmitMany(std::uint32_t* const* addresses, const std::uint32_t* 
         throw std::runtime_error("AGC driver: multi-submit count overflow");
     }
     if (!addresses || !sizes) throw std::runtime_error("AGC driver: null multi-submit arrays");
-    AgcDriver::GuestMemory::CheckRange(addresses, count * sizeof(*addresses), alignof(std::uint32_t*));
-    AgcDriver::GuestMemory::CheckRange(sizes, count * sizeof(*sizes), alignof(std::uint32_t));
+    // The two arrays are HLE arguments (host pointers); each addresses[i] is a guest address of a command buffer.
+    AgcDriver::GuestMemory::CheckHostRange(addresses, count * sizeof(*addresses), alignof(std::uint32_t*));
+    AgcDriver::GuestMemory::CheckHostRange(sizes, count * sizeof(*sizes), alignof(std::uint32_t));
     for (std::uint32_t i = 0; i < count; ++i) {
         if (sizes[i] != 0 && addresses[i] == nullptr) {
             throw std::runtime_error("AGC driver: null multi-submit command buffer");
@@ -54,10 +60,13 @@ constexpr std::uint32_t UserDataPopMarker = 0xC2000000u;
 constexpr std::uint32_t UserDataPushMarker = 0xC1000000u;
 constexpr std::uint32_t UserDataSetMarker = 0xC0000000u;
 
-std::uint32_t WriteUserData(std::uint32_t* commands, std::uint32_t asyncCompute, std::uint32_t value, const std::uint8_t* data, std::uint32_t size) {
+// `guestCommands` is the guest address of the command buffer being written (GPU-visible, so it is not translated
+// by the caller); `data` is an HLE argument (a host pointer).
+std::uint32_t WriteUserData(std::uint32_t* guestCommands, std::uint32_t asyncCompute, std::uint32_t value, const std::uint8_t* data, std::uint32_t size) {
     const bool inlineData = data != nullptr && size != 0;
-    AgcDriver::GuestMemory::CheckRange(commands, std::size_t{inlineData ? WorkloadDataPacketDwords(size) : 3u} * sizeof(std::uint32_t), alignof(std::uint32_t), true);
-    if (inlineData) AgcDriver::GuestMemory::CheckRange(data, size, 1);
+    AgcDriver::GuestMemory::CheckRange(guestCommands, std::size_t{inlineData ? WorkloadDataPacketDwords(size) : 3u} * sizeof(std::uint32_t), alignof(std::uint32_t), true);
+    auto* const commands = AgcDriver::GuestAddr::HostPtr<std::uint32_t>(reinterpret_cast<std::uintptr_t>(guestCommands));
+    if (inlineData) AgcDriver::GuestMemory::CheckHostRange(data, size, 1);
     const std::uint32_t queue = asyncCompute == 0 ? UserDataDrawQueue : 0u;
     commands[0] = UserDataRegisterPacket + (inlineData ? UserDataInlineDword : 0u) + queue;
     commands[1] = UserDataRegister;
@@ -142,16 +151,23 @@ std::uint32_t APS5_VABI sceAgcDriverWaitUntilSafeForRendering(std::uint32_t** co
     std::uint32_t capacity, std::uint32_t mode, std::uint32_t handle, int index) {
     if (!command || capacity < AgcDriver::RenderingWaitPacketWords || mode != 0 || index < 0)
         throw std::invalid_argument("AGC driver: invalid rendering wait arguments");
-    AgcDriver::GuestMemory::CheckRange(command, sizeof(*command), alignof(std::uint32_t*), true);
+    AgcDriver::GuestMemory::CheckHostRange(command, sizeof(*command), alignof(std::uint32_t*), true);  // `command` is an HLE argument; *command is the guest cursor
     AgcDriver::GuestMemory::CheckRange(*command, AgcDriver::RenderingWaitPacketWords * sizeof(std::uint32_t), alignof(std::uint32_t), true);
     const std::uint32_t words[] = {AgcDriver::RenderingWaitPacketHeader, handle, static_cast<std::uint32_t>(index), mode};
-    std::copy(std::begin(words), std::end(words), *command);
+    std::copy(std::begin(words), std::end(words), AgcDriver::GuestAddr::HostPtr<std::uint32_t>(reinterpret_cast<std::uintptr_t>(*command)));
     *command += AgcDriver::RenderingWaitPacketWords;
     return 0;
 }
 
 int APS5_VABI sceAgcDriverSubmitDcb(const Packet* packet) {
+    // APS5_TRACE_FLIP=1 also logs when each guest thread submits a command buffer (steady-clock ms, like the [flip] lines).
+    static const bool traceSubmit = std::getenv("APS5_TRACE_FLIP") != nullptr;
+    const double begin = traceSubmit ? std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count() : 0.0;
     AgcDriver::Submit(packet, 0);
+    if (traceSubmit) {
+        const double end = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now().time_since_epoch()).count();
+        std::fprintf(stderr, "[submit] tid=%llu t=%.0f ms=%.0f\n", reinterpret_cast<unsigned long long>(pthread_self()), end, end - begin);
+    }
     return 0;
 }
 

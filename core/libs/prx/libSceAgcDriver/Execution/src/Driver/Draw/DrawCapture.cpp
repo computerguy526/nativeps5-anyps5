@@ -4,9 +4,11 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Shaders/ShaderRegistry.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "Optimization/ResourceProgram.hpp"
 #include <algorithm>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <span>
@@ -140,6 +142,24 @@ std::shared_ptr<const ShaderRecompiler::RecompileResult> Driver::materializeDraw
 
         const auto slot0 = (static_cast<std::uint64_t>(readRegister(queue.context, 0x390)) << 40u) | (static_cast<std::uint64_t>(readRegister(queue.context, 0x318)) << 8u);
         if ((graphics.hasColorTarget && graphics.color.address == dumpTarget) || slot0 == dumpTarget || program.binary.codeAddress == dumpTarget) static_cast<void>(dumpRequest(program.binary.codeAddress, request));
+        // APS5_DUMP_DRAW_CB=<user word>[,<bytes>[,<every>]] (default off, with APS5_DUMP_DRAW_SHADERS): prints the
+        // colour target format and the bytes of the pixel stage's buffer whose V# starts at that user data word.
+        static const char* const dumpCb = std::getenv("APS5_DUMP_DRAW_CB");
+        if (dumpCb != nullptr && program.binary.stage == Stage::Fragment && ((graphics.hasColorTarget && graphics.color.address == dumpTarget) || program.binary.codeAddress == dumpTarget)) {
+            unsigned word = 0, bytes = 256, every = 60;
+            std::sscanf(dumpCb, "%u,%u,%u", &word, &bytes, &every);
+            static unsigned long long hits = 0;
+            if (hits++ % std::max(1u, every) == 0 && word + 1 < program.userData.size()) {
+                const auto base = (static_cast<std::uint64_t>(program.userData[word + 1] & 0xffu) << 32u) | program.userData[word];
+                std::string text;
+                char item[16];
+                try {
+                    const auto* data = static_cast<const std::uint32_t*>(GuestAddr::GuestToHostChecked(base, bytes));
+                    for (unsigned k = 0; k < bytes / 4; ++k) { std::snprintf(item, sizeof(item), " %08x", data[k]); text += item; }
+                } catch (const std::exception&) { text = " unreadable"; }
+                std::fprintf(stderr, "[draw-cb] hit %llu ps 0x%llx target 0x%llx vkformat %d cb 0x%llx:%s\n", hits, static_cast<unsigned long long>(program.binary.codeAddress), static_cast<unsigned long long>(graphics.hasColorTarget ? graphics.color.address : 0), graphics.hasColorTarget ? static_cast<int>(graphics.color.format) : -1, static_cast<unsigned long long>(base), text.c_str());
+            }
+        }
         }
         if (dumpSlot1 != 0) {
         const auto value = [&](std::uint32_t offset) -> std::uint64_t { const auto it = queue.context.find(offset); return it == queue.context.end() ? 0u : it->second; };

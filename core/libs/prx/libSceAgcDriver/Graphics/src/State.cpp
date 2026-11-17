@@ -12,6 +12,7 @@
 #include "prx/libc/include/General.hpp"
 #include "RdnaDecoder/RdnaInstructionDecoder.hpp"
 #include <algorithm>
+#include <atomic>
 #include <bit>
 #include <bitset>
 #include <cmath>
@@ -1286,7 +1287,7 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         const auto vertices = (group >> 9u) & 0x1ffu;
         const auto primitives = group & 0x1ffu;
         validate(!fastLaunch || (!vertexWorkgroup && vertices == 1 && primitives == 1), "fast launch other than one vertex and one primitive per subgroup is unsupported");
-        const auto maxVertices = read(queue.context, 0x1ff);
+        auto maxVertices = read(queue.context, 0x1ff);
         const auto verticesPerPrimitive = vertexWorkgroup ? 3u : read(queue.context, 0x2ce);
         const auto outputType = read(queue.context, 0x29b);
         validate(outputType == 2 || ((outputType == 0 || outputType == 1) && !vertexWorkgroup), "VGT_GS_OUT_PRIM_TYPE other than a triangle strip, or a point list or line strip from a geometry program, is unsupported");
@@ -1296,15 +1297,34 @@ ShaderStages DecodeShaderStages(const QueueState& queue, bool vertexWorkgroup) {
         validate(vertices >= inputSize && maxVertices != 0 && (!vertexWorkgroup || maxVertices >= inputSize) && maxVertices <= 256 && verticesPerPrimitive <= 256, "invalid geometry subgroup output");
         const auto inputStep = inputPrimitive == 5 || inputPrimitive == 6 ? 1u : inputSize;
         const auto outputLimit = vertexWorkgroup ? (maxVertices - inputSize) / inputStep + 1u : maxVertices / verticesPerPrimitive;
-        const auto groupPrimitives = std::min({primitives, (vertices - inputSize) / inputStep + 1u, outputLimit});
+        auto groupPrimitives = std::min({primitives, (vertices - inputSize) / inputStep + 1u, outputLimit});
         validate(groupPrimitives != 0, "geometry subgroup contains no primitives");
+        // nps5: APS5_GS_GROUP_MAX_PRIMITIVES=<n> runs a geometry program with fewer input primitives per subgroup, so
+        // one mesh workgroup emits at most about n primitives. Metal limits a mesh to 32 KiB of outputs, and a pixel
+        // shader that reads barycentrics costs 3 corner copies of every parameter per primitive (ASTRO BOT: 19 points
+        // per subgroup, 190 vertices / 152 primitives, 28 locations per primitive = 74176 bytes). A subgroup with
+        // fewer primitives is what the program already sees in the last subgroup of every draw.
+        static const std::uint32_t outputPrimitiveCap = [] {
+            const char* text = std::getenv("APS5_GS_GROUP_MAX_PRIMITIVES");
+            return text == nullptr ? 0u : static_cast<std::uint32_t>(std::strtoul(text, nullptr, 10));
+        }();
+        std::uint32_t cappedPrimitives = primitives;
+        if (outputPrimitiveCap != 0 && !vertexWorkgroup && !fastLaunch) {
+            const auto perInput = std::max(verticesPerPrimitive - outputSize + 1u, 1u);
+            const auto limit = std::max(outputPrimitiveCap / perInput, 1u);
+            if (groupPrimitives > limit) {
+                groupPrimitives = limit;
+                cappedPrimitives = limit;
+                maxVertices = std::min(maxVertices, limit * verticesPerPrimitive);
+            }
+        }
         const auto resources = read(queue.shader, 0x8b, RegisterBank::Shader);
         const auto esgsItemSize = read(queue.context, 0x2ab);
         validate(esgsItemSize != 0 && esgsItemSize * vertices <= 0xffffu, "invalid VGT_ESGS_RING_ITEMSIZE");
         const auto amplification = fastLaunch ? read(queue.context, 0x2d3) & 0x1ffu : verticesPerPrimitive - outputSize + 1u;
         validate(amplification != 0, "fast launch subgroup amplifies to no primitives");
-        const auto maxPrimitives = outputSize <= 2u && !fastLaunch ? std::max(primitives * amplification, maxVertices) : primitives * amplification;
-        const auto threads = std::max({(groupPrimitives - 1u) * inputStep + inputSize, primitives, maxVertices, maxPrimitives});
+        const auto maxPrimitives = outputSize <= 2u && !fastLaunch ? std::max(cappedPrimitives * amplification, maxVertices) : cappedPrimitives * amplification;
+        const auto threads = std::max({(groupPrimitives - 1u) * inputStep + inputSize, cappedPrimitives, maxVertices, maxPrimitives});
         const auto raster = find(queue.context, 0x205);
         const auto provokingVertex = raster != queue.context.end() && (raster->second & (1u << 19u)) != 0 ? outputSize - 1u : 0u;
         return ShaderRecompiler::MeshConfiguration{inputPrimitive, groupPrimitives, (groupPrimitives - 1u) * inputStep + inputSize, maxVertices, maxPrimitives, ((threads + result.vertexWaveSize - 1u) / result.vertexWaveSize) * result.vertexWaveSize, ((resources >> 19u) & 0xffu) * 128u, provokingVertex, esgsItemSize, outputSize};
@@ -1517,17 +1537,61 @@ void ApplyReadOnlyDepthBoundsComparison(State& state, const ShaderRecompiler::Sh
     state.viewport.maxDepth = 1.0f;
 }
 
-void ApplyDepthBoundsEmulation(const Context& context, State& state, const ShaderRecompiler::ShaderPixelStageInfo& pixel) {
-    if (!state.depthBoundsTest || !state.depth || context.depthBounds) return;
-    ValidateDepthBounds(context, state);
-    Require(!context.depthRangeUnrestricted, "the depth bounds test without the depthBounds feature is emulated only where stored depth stays in [0, 1]");
-    Require(state.depth->format == VK_FORMAT_D32_SFLOAT || state.depth->format == VK_FORMAT_D32_SFLOAT_S8_UINT, "the depth bounds test on a normalized depth target needs the depthBounds feature");
-    Require(!state.depthTest && !state.depthWrite, "the depth bounds test with depth testing needs the depthBounds feature");
-    Require(!pixel.posZ && !pixel.depthExportEnable, "the depth bounds test from a pixel program that reads or exports depth needs the depthBounds feature");
+namespace {
+
+// Why the depth bounds test of a draw cannot become a depth test against a constant fragment depth,
+// or nullptr when it can. `twoSided` admits bounds that are both inside (0, 1) (see
+// ApplyDepthBoundsEmulation).
+const char* depthBoundsEmulationRefusal(const Context& context, const State& state, const ShaderRecompiler::ShaderPixelStageInfo& pixel, bool twoSided) {
+    if (context.depthRangeUnrestricted) return "the depth bounds test without the depthBounds feature is emulated only where stored depth stays in [0, 1]";
+    if (!(state.minDepthBounds >= 0.0f && state.minDepthBounds <= 1.0f && state.maxDepthBounds >= 0.0f && state.maxDepthBounds <= 1.0f)) return "depth bounds outside [0, 1] require VK_EXT_depth_range_unrestricted";
+    if (state.depth->format != VK_FORMAT_D32_SFLOAT && state.depth->format != VK_FORMAT_D32_SFLOAT_S8_UINT) return "the depth bounds test on a normalized depth target needs the depthBounds feature";
+    if (state.depthTest || state.depthWrite) return "the depth bounds test with depth testing needs the depthBounds feature";
+    if (pixel.posZ || pixel.depthExportEnable) return "the depth bounds test from a pixel program that reads or exports depth needs the depthBounds feature";
     const auto keepsOnFail = [](const VkStencilOpState& face) { return (face.writeMask & 0xffu) == 0 || (face.failOp == VK_STENCIL_OP_KEEP && face.depthFailOp == VK_STENCIL_OP_KEEP); };
-    Require(!state.stencilTest || (keepsOnFail(state.stencilFront) && keepsOnFail(state.stencilBack)), "the depth bounds test with a stencil test that writes on a failed test needs the depthBounds feature");
-    const bool upper = state.minDepthBounds <= 0.0f;
-    Require(upper || state.maxDepthBounds >= 1.0f, "the depth bounds test with both bounds inside (0, 1) needs the depthBounds feature");
+    if (state.stencilTest && !(keepsOnFail(state.stencilFront) && keepsOnFail(state.stencilBack))) return "the depth bounds test with a stencil test that writes on a failed test needs the depthBounds feature";
+    if (!twoSided && state.minDepthBounds > 0.0f && state.maxDepthBounds < 1.0f) return "the depth bounds test with both bounds inside (0, 1) needs the depthBounds feature";
+    return nullptr;
+}
+
+}
+
+bool DriverIgnoresDepthBounds(std::string_view driverInfo, std::string_view deviceName) {
+    if (const char* forced = std::getenv("APS5_DEPTH_BOUNDS"); forced != nullptr) {
+        if (std::string_view(forced) == "emulate") return true;
+        if (std::string_view(forced) == "native") return false;
+    }
+    // KosmicKrisp maps the test to Metal's depth test bounds, which only Apple GPU family 10 (M5)
+    // has; on earlier GPUs kk_fake_depth_bounds (on by default) reports the feature and drops the
+    // test. Apple M1 to M4 are families 7 to 9.
+    if (driverInfo.find("KosmicKrisp") == std::string_view::npos) return false;
+    constexpr std::string_view prefix = "Apple M";
+    return deviceName.starts_with(prefix) && deviceName.size() > prefix.size() && deviceName[prefix.size()] >= '1' && deviceName[prefix.size()] <= '4' && (deviceName.size() == prefix.size() + 1 || deviceName[prefix.size() + 1] == ' ');
+}
+
+// A device without the depth bounds test, or one whose driver accepts it and ignores it
+// (context.depthBoundsIgnored), tests one bound instead: a read-only depth test of the stored depth
+// against a fragment depth pinned to the bound through the viewport. Bounds that are both inside
+// (0, 1) need two tests; a device that ignores the test keeps the bound on the far side, the side of
+// the target's clear depth. That side holds what such a pass must never touch (the sky and the
+// distance past a shadow cascade); the near side is what a later, nearer pass draws over (Unreal's
+// cascaded shadow projection draws its cascades far to near with these bounds and fades each one out
+// in its shader). Before, KosmicKrisp dropped the test there and every cascade projected over the
+// whole screen, sampling the shadow atlas outside its own tile past the cascade's range. A draw this
+// cannot emulate keeps the ignored test on such a device, and is refused on a device without it.
+void ApplyDepthBoundsEmulation(const Context& context, State& state, const ShaderRecompiler::ShaderPixelStageInfo& pixel) {
+    if (!state.depthBoundsTest || !state.depth) return;
+    const bool ignored = context.depthBounds && context.depthBoundsIgnored;
+    if (context.depthBounds && !ignored) return;
+    if (!ignored) ValidateDepthBounds(context, state);
+    if (const char* refusal = depthBoundsEmulationRefusal(context, state, pixel, ignored); refusal != nullptr) {
+        Require(ignored, refusal);
+        static std::atomic<bool> reported{false};
+        if (!reported.exchange(true)) std::fprintf(stderr, "[gpu] depth bounds test left to the driver, which ignores it: %s\n", refusal);
+        return;
+    }
+    const bool twoSided = state.minDepthBounds > 0.0f && state.maxDepthBounds < 1.0f;
+    const bool upper = twoSided ? state.depth->clearDepth >= 0.5f : state.minDepthBounds <= 0.0f;
     const float bound = upper ? state.maxDepthBounds : state.minDepthBounds;
     state.depthBoundsTest = false;
     state.depthTest = true;
@@ -2060,6 +2124,17 @@ State DecodeState(const QueueState& queue, bool vertexWorkgroup) {
         Require(mrt0 == result.colors.end() || (mrt0->componentMapping == 0xe4u && mrt0->packing == ShaderRecompiler::ColorExportPacking::None), "alpha-to-coverage into a component-swapped or packed MRT0 target is unsupported");
     }
     APS5_LOG_OUT_DEBUG("DecodeState done colorTarget=%u render=%ux%u topology=%u", result.hasColorTarget ? 1u : 0u, result.renderExtent.width, result.renderExtent.height, static_cast<unsigned>(result.topology));
+    static const bool traceDepthState = std::getenv("APS5_TRACE_DEPTH_STATE") != nullptr;
+    if (traceDepthState && result.depth) {
+        const auto& d = *result.depth;
+        std::fprintf(stderr, "[depth-state] ext=%ux%u colors=%zu dz=0x%llx fmt=%d %ux%u clear=%g test=%d write=%d cmp=%d bounds=%d[%g,%g] bias=%d c=%g s=%g cl=%g pf=%d bc=%g bs=%g clamp=%d [%g,%g] vp=%g,%g %gx%g z[%g,%g] n11=%d cull=%u remap=%u ds=%g do=%g clip204=0x%x su=0x%x fmtcntl=0x%x\n",
+            result.renderExtent.width, result.renderExtent.height, result.colors.size(), static_cast<unsigned long long>(d.address), static_cast<int>(d.format), d.extent.width, d.extent.height, d.clearDepth,
+            result.depthTest, result.depthWrite, static_cast<int>(result.depthCompare), result.depthBoundsTest, result.minDepthBounds, result.maxDepthBounds,
+            result.depthBias, result.depthBiasConstant, result.depthBiasSlope, result.depthBiasClamp, result.depthBiasPerFace, result.backDepthBiasConstant, result.backDepthBiasSlope,
+            result.depthClamp, result.depthClampMin, result.depthClampMax, result.viewport.x, result.viewport.y, result.viewport.width, result.viewport.height, result.viewport.minDepth, result.viewport.maxDepth,
+            result.negativeOneToOne, static_cast<unsigned>(result.cullMode), result.depthRemap.mode, result.depthScale, result.depthOffset,
+            read(cx, 0x204), read(cx, 0x205), find(cx, 0x2de) == cx.end() ? 0xffffffffu : read(cx, 0x2de));
+    }
     return result;
 }
 

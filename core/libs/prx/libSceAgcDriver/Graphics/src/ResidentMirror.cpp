@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ResidentMirror.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
@@ -191,8 +192,8 @@ struct Candidate {
 };
 
 bool allZero(std::uint64_t begin, std::uint64_t end) {
-    const auto* at = reinterpret_cast<const unsigned char*>(begin);
-    const auto* stop = reinterpret_cast<const unsigned char*>(end);
+    const auto* at = GuestAddr::HostPtr<const unsigned char>(begin);
+    const auto* stop = GuestAddr::HostPtr<const unsigned char>(end);
     while (at < stop && reinterpret_cast<std::uintptr_t>(at) % sizeof(std::uint64_t) != 0) {
         if (*at++ != 0) return false;
     }
@@ -289,7 +290,7 @@ std::vector<Candidate> possiblyNonzero(std::uint64_t begin, std::uint64_t end) {
     std::vector<Candidate> maybe;
 #ifdef _WIN32
     std::vector<std::pair<std::uintptr_t, std::uintptr_t>> zero;
-    GuestArena::GuestArenaKnownZero_nid_no_patch(static_cast<std::uintptr_t>(begin), static_cast<std::size_t>(end - begin), [](void* context, std::uintptr_t first, std::uintptr_t last) { static_cast<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>*>(context)->emplace_back(first, last); }, &zero);
+    GuestArena::GuestArenaKnownZero_nid_no_patch(GuestAddr::HostAddress(begin), static_cast<std::size_t>(end - begin), [](void* context, std::uintptr_t first, std::uintptr_t last) { static_cast<std::vector<std::pair<std::uintptr_t, std::uintptr_t>>*>(context)->emplace_back(first, last); }, &zero);
     auto cursor = begin;
     for (const auto& [first, last] : zero) {
         if (first > cursor) maybe.push_back({cursor, first, true});
@@ -300,7 +301,7 @@ std::vector<Candidate> possiblyNonzero(std::uint64_t begin, std::uint64_t end) {
     for (const auto& mapping : mappings(begin, end)) {
         int file = -1;
         std::uint64_t offset = 0;
-        if (GuestArena::GuestArenaSharedBacking_nid_postfix(static_cast<std::uintptr_t>(mapping.begin), static_cast<std::size_t>(mapping.end - mapping.begin), &file, &offset)) {
+        if (GuestArena::GuestArenaSharedBacking_nid_postfix(GuestAddr::HostAddress(mapping.begin), static_cast<std::size_t>(mapping.end - mapping.begin), &file, &offset)) {
             try {
                 fileData(maybe, mapping, file, offset);
             } catch (...) {

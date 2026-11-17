@@ -21,6 +21,20 @@
 
 namespace AgcDriver {
 
+#ifdef __APPLE__
+// One run of pages with a single protection and share mode, as the live-capture walk reports it. All addresses are guest
+// addresses (the capture format is guest-addressed so it replays on any bias); the kernel query underneath is host-keyed.
+struct GuestRegion {
+    std::uint64_t address = 0;
+    std::uint64_t bytes = 0;
+    std::uint32_t protection = 0;  // Windows PAGE_* style, as recorded in the capture
+    bool readable = false;
+    bool privateMemory = false;    // anonymous, unshared memory (the write-watched kind)
+};
+// Regions of [first, end) (guest addresses) that are accessible, in address order, clipped to the range.
+std::vector<GuestRegion> AppleWalkGuestRegions(std::uint64_t first, std::uint64_t end);
+#endif
+
 class FrameRecorder {
 public:
     static constexpr std::uint64_t DefaultFrames = 10;

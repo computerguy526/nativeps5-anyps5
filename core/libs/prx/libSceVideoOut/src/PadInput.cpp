@@ -5,7 +5,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <string_view>
+#include <thread>
 #include <filesystem>
+#include <fstream>
+#include <sstream>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -13,6 +16,7 @@
 
 #include "SDL.h"
 #include "prx/libSceVideoOut/include/PadInput.hpp"
+#include "prx/libScePad/include/LatTrace.hpp"
 #include "prx/libSceVideoOut/include/DualSenseStatus.hpp"
 #include "prx/libScePad/include/PadTriggerEffect.hpp"
 #include "prx/libSceVideoOut/include/PadStatusSdl.hpp"
@@ -37,6 +41,19 @@
 #include "prx/libkernel/AppMetadata/include/AppMetadata.hpp"
 
 namespace {
+
+// SDL reports every virtual joystick as SDL_CONTROLLER_TYPE_VIRTUAL. A scripted or test pad that declares a Sony, Nintendo or
+// Microsoft vendor/product id is treated as that pad, so the per-family handling can be exercised without hardware.
+SDL_GameControllerType ControllerType(SDL_GameController* controller) {
+    const auto type = SDL_GameControllerGetType(controller);
+    if (type != SDL_CONTROLLER_TYPE_VIRTUAL) return type;
+    const Uint16 vendor = SDL_GameControllerGetVendor(controller);
+    const Uint16 product = SDL_GameControllerGetProduct(controller);
+    if (vendor == 0x054c) return product == 0x0ce6 || product == 0x0df2 ? SDL_CONTROLLER_TYPE_PS5 : SDL_CONTROLLER_TYPE_PS4;
+    if (vendor == 0x057e) return product == 0x2006 ? SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT : product == 0x2007 ? SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT : SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO;
+    if (vendor == 0x045e) return SDL_CONTROLLER_TYPE_XBOXONE;
+    return type;
+}
 
 void stopRumble(SDL_GameController* controller) {
     SDL_GameControllerRumble(controller, 0, 0, 0);
@@ -70,6 +87,10 @@ PadInput::PadInput() : PadInput(Pad::LoadInputMapping(appTitleId())) {
 static_assert(PAD_MAX_CONTROLLERS == AgcDriver::PadStatusSlots, "the pad status panel lists one line per controller slot");
 
 PadInput::PadInput(Pad::InputConfiguration configuration) : mappings(std::move(configuration)), appliedMapping(mappings.Snapshot()), keyboardMouse(*appliedMapping), statusProvider{[this] { return statusSnapshot(); }}, port0Mode(Port0Presence::ConfiguredMode()), port0(port0Mode, false) {
+    {
+        const char* log = std::getenv("NPS5_PAD_LOG");
+        padLog = log != nullptr && *log != '\0' && std::string_view(log) != "0";
+    }
     static_cast<void>(Pad::RumblePercent());
     static_cast<void>(Pad::RumblePausesOnFocusLoss());
     identifyMode = Pad::IdentifyModeFromEnvironment();
@@ -79,26 +100,183 @@ PadInput::PadInput(Pad::InputConfiguration configuration) : mappings(std::move(c
 }
 
 PadInput::~PadInput() {
+    scriptStop = true;
+    if (scriptThread.joinable()) scriptThread.join();
     mappingWatchStop = true;
     if (mappingWatchThread.joinable()) mappingWatchThread.join();
     for (int i = 0; i < PAD_MAX_CONTROLLERS; ++i) {
         closeController(i);
     }
+    if (scriptedJoystick != nullptr) SDL_JoystickClose(scriptedJoystick);
+    if (scriptedDevice >= 0) SDL_JoystickDetachVirtual(scriptedDevice);
+}
+
+void PadInput::ConfigureSdl() {
+    // Priority DEFAULT: an SDL_* variable in the environment still wins, so every driver can be switched off by hand.
+    const auto hint = [](const char* name, const char* value) { SDL_SetHintWithPriority(name, value, SDL_HINT_DEFAULT); };
+    hint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    hint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+    hint(SDL_HINT_JOYSTICK_HIDAPI_PS5, "1");           // DualSense: touchpad, gyro/accel, light bar, adaptive triggers
+    hint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");    // DualSense rumble through the output report
+    hint(SDL_HINT_JOYSTICK_HIDAPI_PS5_PLAYER_LED, "1");
+    hint(SDL_HINT_JOYSTICK_HIDAPI_PS4, "1");
+    hint(SDL_HINT_JOYSTICK_HIDAPI_SWITCH, "1");        // Switch Pro: HD rumble, gyro/accel, full button set
+    hint(SDL_HINT_JOYSTICK_HIDAPI_XBOX, "1");
+    // Positional face buttons: SDL_CONTROLLER_BUTTON_A is always the south button (Cross), also on Nintendo pads.
+    hint(SDL_HINT_GAMECONTROLLER_USE_BUTTON_LABELS, "0");
 }
 
 void PadInput::openAvailableControllers() {
-    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
-    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_PS5_RUMBLE, "1");
+    ConfigureSdl();
     if ((SDL_WasInit(SDL_INIT_GAMECONTROLLER) & SDL_INIT_GAMECONTROLLER) == 0) {
         if (SDL_InitSubSystem(SDL_INIT_GAMECONTROLLER) != 0) {
             APS5_LOG_ERR("Pad: SDL game controller init failed: %s", SDL_GetError());
             return;
         }
     }
+    attachScriptedPad();
+    // The scripted pad takes the first free slot (slot 0 at start), ahead of any connected hardware, so an
+    // unattended run drives the primary user whatever is plugged in.
+    if (scriptedDevice >= 0) openController(scriptedDevice);
     for (int deviceIndex = 0; deviceIndex < SDL_NumJoysticks(); ++deviceIndex) {
         if (!SDL_IsGameController(deviceIndex)) continue;
         openController(deviceIndex);
     }
+}
+
+// NPS5_VPAD_SCRIPT: attach one SDL virtual game controller that follows the script (VirtualPadScript.hpp).
+void PadInput::attachScriptedPad() {
+    const char* text = std::getenv("NPS5_VPAD_SCRIPT");
+    if (text == nullptr || *text == '\0' || scriptedDevice >= 0) return;
+    std::string source = text;
+    if (source.front() == '@') {
+        std::ifstream file(source.substr(1));
+        if (!file) {
+            APS5_LOG_ERR("Pad: NPS5_VPAD_SCRIPT cannot read '%s'", source.c_str() + 1);
+            return;
+        }
+        std::ostringstream content;
+        content << file.rdbuf();
+        source = content.str();
+    }
+    std::string error;
+    if (!Pad::ParseVirtualPadScript(source, script, error)) {
+        APS5_LOG_ERR("Pad: NPS5_VPAD_SCRIPT rejected: %s", error.c_str());
+        script.clear();
+        return;
+    }
+    SDL_VirtualJoystickDesc desc{};
+    desc.version = SDL_VIRTUAL_JOYSTICK_DESC_VERSION;
+    desc.type = SDL_JOYSTICK_TYPE_GAMECONTROLLER;
+    desc.naxes = 6;
+    desc.nbuttons = 16;
+    desc.name = "NPS5 Scripted Pad";
+    if (const char* type = std::getenv("NPS5_VPAD_TYPE")) {
+        const std::string kind = type;
+        if (kind == "ps5") { desc.vendor_id = 0x054c; desc.product_id = 0x0ce6; desc.name = "NPS5 Scripted DualSense"; }
+        else if (kind == "switch") { desc.vendor_id = 0x057e; desc.product_id = 0x2009; desc.name = "NPS5 Scripted Switch Pro"; }
+        else if (kind == "xbox") { desc.vendor_id = 0x045e; desc.product_id = 0x0b12; desc.name = "NPS5 Scripted Xbox"; }
+    }
+    scriptedDevice = SDL_JoystickAttachVirtualEx(&desc);
+    if (scriptedDevice < 0) {
+        APS5_LOG_ERR("Pad: NPS5_VPAD_SCRIPT could not attach a virtual joystick: %s", SDL_GetError());
+        return;
+    }
+    scriptedJoystick = SDL_JoystickOpen(scriptedDevice);
+    if (scriptedJoystick != nullptr) {
+        SDL_JoystickSetVirtualAxis(scriptedJoystick, SDL_CONTROLLER_AXIS_TRIGGERLEFT, SDL_JOYSTICK_AXIS_MIN);
+        SDL_JoystickSetVirtualAxis(scriptedJoystick, SDL_CONTROLLER_AXIS_TRIGGERRIGHT, SDL_JOYSTICK_AXIS_MIN);
+    }
+    APS5_LOG_OUT("Pad: scripted virtual pad attached (%zu events, NPS5_VPAD_SCRIPT)", script.size());
+}
+
+void PadInput::notePress(int index, std::uint64_t elapsedMs) {
+    if (index < 0 || static_cast<std::size_t>(index) >= tapStamps.size()) return;
+    tapStamps[index] = {elapsedMs, LatTrace::gGuestReads.load()};
+}
+
+// nps5: a tap is held until the title has had time to sample it: 100 ms and 2 guest pad reads after ITS press, but never longer than 2 s
+// (a guest that does not poll, e.g. a blocked loading screen, must not freeze the rest of the script).
+bool PadInput::tapHeldLongEnough(int index, std::uint64_t elapsedMs) {
+    if (index < 0 || static_cast<std::size_t>(index) >= tapStamps.size()) return true;
+    const auto& stamp = tapStamps[index];
+    if (elapsedMs < stamp.ms + 100) return false;
+    if (LatTrace::gGuestReads.load() >= stamp.reads + 2) return true;
+    if (elapsedMs < stamp.ms + 2000) return false;
+    if (!tapCapLogged) {
+        tapCapLogged = true;
+        std::fprintf(stderr, "[pad] script: tap on button %d released after the 2 s cap (the guest did not read the pad twice)\n", index);
+    }
+    return true;
+}
+
+void PadInput::advanceScriptedPad(const DisplayWindow& window) {
+    if (scriptedJoystick == nullptr || scriptNext >= script.size()) return;
+    if (!scriptStarted) {
+        scriptStarted = true;
+        scriptStart = std::chrono::steady_clock::now();
+        scriptStartFrame = window.FrameNumber();
+    }
+    // nps5: NPS5_VPAD_ASYNC=1 applies the millisecond events from their own thread at their own time, like a real
+    // controller's report arriving between two samples (otherwise the very Update that applies an event also
+    // samples it, which hides the sampling delay from APS5_TRACE_LAT).
+    if (!scriptThread.joinable() && std::getenv("NPS5_VPAD_ASYNC") != nullptr &&
+        std::none_of(script.begin(), script.end(), [](const auto& e) { return e.byFrame; })) {
+        scriptThread = std::thread([this] {
+            for (const auto& event : script) {
+                const auto at = scriptStart + std::chrono::milliseconds(event.when);
+                while (!scriptStop && std::chrono::steady_clock::now() < at) std::this_thread::sleep_for(std::chrono::microseconds(200));
+                if (scriptStop) return;
+                const auto asyncMs = [&] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scriptStart).count()); };
+                if (event.tapRelease && !event.isAxis) {
+                    while (!scriptStop && !tapHeldLongEnough(event.index, asyncMs())) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    if (scriptStop) return;
+                } else if (!event.isAxis && event.value != 0) {
+                    notePress(event.index, asyncMs());
+                }
+                if (event.value != 0 && (!event.isAxis || LatTrace::AxisInject())) LatTrace::Inject();
+                if (event.isAxis) SDL_JoystickSetVirtualAxis(scriptedJoystick, event.index, event.value);
+                else SDL_JoystickSetVirtualButton(scriptedJoystick, event.index, static_cast<Uint8>(event.value));
+            }
+        });
+        scriptNext = script.size();
+        return;
+    }
+    const auto elapsedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scriptStart).count());
+    const std::uint64_t elapsedFrames = window.FrameNumber() - scriptStartFrame;
+    while (scriptNext < script.size()) {
+        const auto& event = script[scriptNext];
+        if ((event.byFrame ? elapsedFrames : elapsedMs) < event.when) break;
+        // nps5: a tap is held until the title has had time to sample it: 100 ms and 2 guest pad reads after the press
+        // (a frame-counted tap is 4 presented flips, which at a fast loading screen is a few ms and can be read
+        // by nobody).
+        if (event.tapRelease && !event.isAxis) {
+            if (!tapHeldLongEnough(event.index, elapsedMs)) break;
+        } else if (!event.isAxis && event.value != 0) {
+            notePress(event.index, elapsedMs);
+        }
+        if (event.value != 0 && (!event.isAxis || LatTrace::AxisInject())) LatTrace::Inject();
+        if (event.isAxis) SDL_JoystickSetVirtualAxis(scriptedJoystick, event.index, event.value);
+        else SDL_JoystickSetVirtualButton(scriptedJoystick, event.index, static_cast<Uint8>(event.value));
+        if (padLog) std::fprintf(stderr, "[pad] script: %s %d = %d (t=%llums frame+%llu)\n", event.isAxis ? "axis" : "button", event.index, event.value,
+            static_cast<unsigned long long>(elapsedMs), static_cast<unsigned long long>(elapsedFrames));
+        ++scriptNext;
+    }
+}
+
+void PadInput::logPadState(int slot) {
+    const auto& now = slots[slot].state;
+    auto& before = slots[slot].logged;
+    const auto near = [](std::uint8_t a, std::uint8_t b) { return a / 8 == b / 8; };
+    const bool same = slots[slot].loggedValid && now.buttons == before.buttons && near(now.sticks[0], before.sticks[0]) && near(now.sticks[1], before.sticks[1]) &&
+        near(now.sticks[2], before.sticks[2]) && near(now.sticks[3], before.sticks[3]) && near(now.analogButtonsL2, before.analogButtonsL2) &&
+        near(now.analogButtonsR2, before.analogButtonsR2) && now.touch[0].active == before.touch[0].active && now.touch[1].active == before.touch[1].active;
+    if (same) return;
+    before = now;
+    slots[slot].loggedValid = true;
+    std::fprintf(stderr, "[pad] slot %d (%s): buttons=0x%06x L=(%u,%u) R=(%u,%u) L2=%u R2=%u touch=%d%d%s gyro=(%.2f,%.2f,%.2f)\n", slot, slots[slot].name.c_str(), now.buttons,
+        now.sticks[0], now.sticks[1], now.sticks[2], now.sticks[3], now.analogButtonsL2, now.analogButtonsR2, now.touch[0].active, now.touch[1].active,
+        now.hasMotion ? " motion" : "", now.gyro[0], now.gyro[1], now.gyro[2]);
 }
 
 void PadInput::openController(int deviceIndex) {
@@ -133,10 +311,10 @@ void PadInput::openController(int deviceIndex) {
     openStatus(slot);
     slots[slot].identify = Pad::IdentifyScheduler{};
     const char* name = SDL_GameControllerName(gc);
-    slots[slot].kind = PadKindFromSdl(SDL_GameControllerGetType(gc));
+    slots[slot].kind = PadKindFromSdl(ControllerType(gc));
     slots[slot].name = name != nullptr ? name : "";
     APS5_LOG_OUT("Pad: connected game controller (slot %d): %s (type %d, sensors accel=%d gyro=%d, touchpads=%d, led=%d, trigger rumble=%d)",
-        slot, name != nullptr ? name : "unknown", static_cast<int>(SDL_GameControllerGetType(gc)),
+        slot, name != nullptr ? name : "unknown", static_cast<int>(ControllerType(gc)),
         SDL_GameControllerHasSensor(gc, SDL_SENSOR_ACCEL) == SDL_TRUE, SDL_GameControllerHasSensor(gc, SDL_SENSOR_GYRO) == SDL_TRUE,
         SDL_GameControllerGetNumTouchpads(gc), SDL_GameControllerHasLED(gc) == SDL_TRUE, SDL_GameControllerHasRumbleTriggers(gc) == SDL_TRUE);
     if (identifyMode != Pad::IdentifyMode::Off) {
@@ -167,7 +345,7 @@ void PadInput::openStatus(int slot) {
     if (slot < 0 || slot >= PAD_MAX_CONTROLLERS) return;
     PadClearTriggerStatus_nid_postfix(slot);
     SDL_GameController* controller = slots[slot].controller;
-    if (controller == nullptr || SDL_GameControllerGetType(controller) != SDL_CONTROLLER_TYPE_PS5) return;
+    if (controller == nullptr || ControllerType(controller) != SDL_CONTROLLER_TYPE_PS5) return;
     const char* path = SDL_GameControllerPath(controller);
     if (path == nullptr) return;
     slots[slot].statusHid = SDL_hid_open_path(path, 0);
@@ -202,7 +380,7 @@ void PadInput::closeStatus(int slot) {
 }
 
 void PadInput::openHaptics(SDL_GameController* controller) {
-    if (controller == nullptr || SDL_GameControllerGetType(controller) != SDL_CONTROLLER_TYPE_PS5) return;
+    if (controller == nullptr || ControllerType(controller) != SDL_CONTROLLER_TYPE_PS5) return;
     const char* path = SDL_GameControllerPath(controller);
     if (path == nullptr) return;
     bool bluetooth = false;
@@ -317,7 +495,7 @@ void PadInput::applyOutput() {
         SDL_GameController* controller = slots[slot].controller;
         if (controller == nullptr) continue;
         const auto now = std::chrono::steady_clock::now();
-        const bool isPs5 = SDL_GameControllerGetType(controller) == SDL_CONTROLLER_TYPE_PS5;
+        const bool isPs5 = ControllerType(controller) == SDL_CONTROLLER_TYPE_PS5;
         const auto large = std::max(slots[slot].outputState.vibrationLarge, slots[slot].outputState.audioVibrationLarge);
         const auto small = std::max(slots[slot].outputState.vibrationSmall, slots[slot].outputState.audioVibrationSmall);
         const unsigned rumblePercent = Pad::RumblePercent();
@@ -435,8 +613,12 @@ PadInputState PadInput::sampleController(int slot) const {
     addButton(SDL_CONTROLLER_BUTTON_Y, Pad::PadButton::Triangle);
     addButton(SDL_CONTROLLER_BUTTON_LEFTSHOULDER, Pad::PadButton::L1);
     addButton(SDL_CONTROLLER_BUTTON_RIGHTSHOULDER, Pad::PadButton::R1);
-    const auto type = SDL_GameControllerGetType(controller);
-    const bool viewPressed = type != SDL_CONTROLLER_TYPE_PS4 && type != SDL_CONTROLLER_TYPE_PS5 && readButton(SDL_CONTROLLER_BUTTON_BACK);
+    const auto type = ControllerType(controller);
+    // Non-Sony pads have no touchpad: View/Back (Xbox), Minus and Capture (Switch) click it at its centre.
+    const bool nintendo = type == SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO || type == SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_LEFT ||
+        type == SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_RIGHT || type == SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_JOYCON_PAIR;
+    const bool viewPressed = type != SDL_CONTROLLER_TYPE_PS4 && type != SDL_CONTROLLER_TYPE_PS5 &&
+        (readButton(SDL_CONTROLLER_BUTTON_BACK) || (nintendo && readButton(SDL_CONTROLLER_BUTTON_MISC1)));
     if (viewPressed) result.buttons |= static_cast<std::uint32_t>(Pad::PadButton::TouchPad);
     addButton(SDL_CONTROLLER_BUTTON_START, Pad::PadButton::Options);
     addButton(SDL_CONTROLLER_BUTTON_LEFTSTICK, Pad::PadButton::L3);
@@ -462,7 +644,7 @@ PadInputState PadInput::sampleController(int slot) const {
     const auto left = stick(SDL_CONTROLLER_AXIS_LEFTX, SDL_CONTROLLER_AXIS_LEFTY, keyboardMouse.Configuration().settings.leftStickDeadzonePercent);
     const auto right = stick(SDL_CONTROLLER_AXIS_RIGHTX, SDL_CONTROLLER_AXIS_RIGHTY, keyboardMouse.Configuration().settings.rightStickDeadzonePercent);
     result.sticks = {left[0], left[1], right[0], right[1]};
-    switch (SDL_GameControllerGetType(controller)) {
+    switch (ControllerType(controller)) {
         case SDL_CONTROLLER_TYPE_PS5: result.deviceKind = 1; break;
         case SDL_CONTROLLER_TYPE_PS4: result.deviceKind = 2; break;
         default: result.deviceKind = 3; break;
@@ -494,6 +676,7 @@ PadInputState PadInput::sampleController(int slot) const {
 }
 
 void PadInput::HandleEvent(const SDL_Event& event, DisplayWindow& window) {
+    if (event.type == SDL_CONTROLLERBUTTONDOWN) LatTrace::Event();
     applyMappingSnapshot();
     if (event.type == SDL_CONTROLLERDEVICEADDED) {
         openController(event.cdevice.which);
@@ -592,6 +775,7 @@ void PadInput::Update(const DisplayWindow& window) {
             break;
         }
     }
+    advanceScriptedPad(window);
     if (anyController) SDL_GameControllerUpdate();
     for (int slot = 0; slot < PAD_MAX_CONTROLLERS; ++slot) {
         if (slots[slot].controller != nullptr) pollStatus(slot);
@@ -602,6 +786,7 @@ void PadInput::Update(const DisplayWindow& window) {
     for (int slot = 0; slot < PAD_MAX_CONTROLLERS; ++slot) {
         if (slots[slot].controller != nullptr) {
             slots[slot].state = sampleController(slot);
+            if (padLog) logPadState(slot);
         }
     }
     if (keyboardMouse.MouseMode() && SDL_GetKeyboardFocus() == nullptr) {

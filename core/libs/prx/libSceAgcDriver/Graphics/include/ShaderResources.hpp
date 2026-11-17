@@ -297,6 +297,8 @@ public:
     bool ReleaseCompletedSpace(std::uint64_t recorder, std::uint64_t completedThrough) { return guestMemory.ReleaseCompletedSpace(recorder, completedThrough); }
     bool UsesAddressTable() const { return usesBda; }
     std::span<const std::byte> AddressTableBytes() const;
+    // Debug aid (APS5_TRACE_VOLUME): every buffer allocation of the build, its guest range and the buffer it is bound from.
+    std::string DebugAllocations() const;
     bool AddressTableGuardCurrent();
     std::size_t CopiedBytes() const { return guestMemory.CopiedBytes(); }
     bool WritesOverlap(std::uint64_t address, std::size_t bytes) const { return guestMemory.WritesOverlap(address, bytes); }

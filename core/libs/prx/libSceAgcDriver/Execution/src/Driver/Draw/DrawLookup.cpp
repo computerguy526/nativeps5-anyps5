@@ -258,18 +258,32 @@ void Driver::lookupDraw(const Submission& submission, const std::shared_ptr<Vulk
                 const auto& now = programs[i].userData;
                 const auto& was = dataEntry->decode->programs[i].userData;
                 auto& candidates = dataCandidates[i];
+                const bool probe = traceDrawCache();
+                bool probed = false;
+                if (probe) {
+                    auto& s = drawEntryCounters.shapeStage;
+                    ++s[0];
+                    if (dataEntry->stages[i].empty()) ++s[2];
+                }
                 for (const auto& variant : dataEntry->stages[i]) {
                     if (variant->registeredViews != nullptr && !CaptureRegisteredViewsCurrent(*variant->registeredViews)) continue;
                     bool usedEqual = true;
                     for (std::size_t w = 0; w < now.size() && usedEqual; ++w) {
                         if (now[w] != was[w] && (w >= 64u || ((variant->userDataMask >> w) & 1u) != 0)) usedEqual = false;
                     }
-                    if (!usedEqual) continue;
+                    if (!usedEqual) {
+                        if (probe && !probed) {
+                            probed = true;
+                            probeShapeStage(*variant, now, was, programs[i]);
+                        }
+                        continue;
+                    }
                     if ((i == 0 && variant->pushOffset != 0) || std::any_of(candidates.begin(), candidates.end(), [&](const auto& candidate) { return candidate.first->pushOffset == variant->pushOffset; })) continue;
                     std::vector<ShaderRecompiler::MemoryRegion> regions;
                     appendEntryRegions(*variant, regions);
                     auto result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
                     if (gateRetry() && (result == EntryOutcome::PublishMoved || result == EntryOutcome::PendingMoved)) result = validateVariant(programs[i].binary.codeAddress, submission.queue, *variant, regions, imagesFlushed, runsSynced, sampling);
+                    if (probe) ++drawEntryCounters.shapeStage[result == EntryOutcome::Equal ? 1 : result == EntryOutcome::Differing ? 8 : 9];
                     if (result == EntryOutcome::Equal) candidates.emplace_back(variant, std::move(regions));
                 }
             }

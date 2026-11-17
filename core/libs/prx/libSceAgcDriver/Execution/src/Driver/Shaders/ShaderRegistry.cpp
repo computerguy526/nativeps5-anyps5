@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libc/include/general/LogMacros.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "ControlFlow/GraphBuilder.hpp"
@@ -642,7 +643,7 @@ bool FusedHullHeader(const ShaderSnapshot& snapshot, Shader used, const Shader& 
 static Shader GuestShaderFields(const Shader* shader) {
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader fields;
-    std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
+    std::memcpy(&fields, GuestAddr::HostPtr<const void>(reinterpret_cast<std::uintptr_t>(shader)), sizeof(Shader));  // `shader` is a guest-valued pointer
     return fields;
 }
 
@@ -654,7 +655,7 @@ static bool RelocatedRegisters(const ShaderSnapshot& snapshot, Shader used, cons
     const std::size_t bytes = registered.num_sh_registers * sizeof(ShaderRegister);
     if (bytes == 0 || bound == nullptr || address < snapshot.headerAddress || address - snapshot.headerAddress > snapshot.header.size() || snapshot.header.size() - (address - snapshot.headerAddress) < bytes) return false;
     GuestMemory::CheckRange(bound, bytes, alignof(ShaderRegister));
-    return std::memcmp(static_cast<const void*>(bound), snapshot.header.data() + (address - snapshot.headerAddress), bytes) == 0;
+    return std::memcmp(GuestAddr::HostPtr<const void>(reinterpret_cast<std::uintptr_t>(bound)), snapshot.header.data() + (address - snapshot.headerAddress), bytes) == 0;
 }
 
 // A title can relocate a registered header, and the arrays it points at, into memory of its own and resolve the ABI
@@ -668,7 +669,7 @@ static bool ReferredBytesMatch(const ShaderSnapshot& snapshot, const void* point
     const auto offset = address - snapshot.headerAddress;
     if (offset > snapshot.header.size() || snapshot.header.size() - offset < bytes) return false;
     if (!GuestMemory::Accessible(pointer, bytes)) return false;
-    return std::memcmp(static_cast<const void*>(pointer), snapshot.header.data() + offset, bytes) == 0;
+    return std::memcmp(GuestAddr::HostPtr<const void>(reinterpret_cast<std::uintptr_t>(pointer)), snapshot.header.data() + offset, bytes) == 0;
 }
 
 static bool RelocatedCopy(const ShaderSnapshot& snapshot, Shader used, const Shader& registered) {
@@ -693,7 +694,7 @@ bool SameHeader(const ShaderSnapshot& snapshot, const Shader* shader) {
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader used;
     Shader registered;
-    std::memcpy(&used, static_cast<const void*>(shader), sizeof(Shader));
+    std::memcpy(&used, GuestAddr::HostPtr<const void>(reinterpret_cast<std::uintptr_t>(shader)), sizeof(Shader));
     std::memcpy(&registered, snapshot.header.data(), sizeof(Shader));
     used.user_data = registered.user_data;
     return std::memcmp(&used, &registered, offsetof(Shader, num_sh_registers) + sizeof(Shader::num_sh_registers)) == 0 || RelocatedRegisters(snapshot, used, registered) || RelocatedCopy(snapshot, used, registered) || FusedHullHeader(snapshot, used, registered);
@@ -2200,7 +2201,8 @@ void Driver::ResolveGraphicsStagesAbi(std::span<const Shader* const> stages, std
         if (fields.type != snapshot.type) {
             const std::size_t count = fields.num_sh_registers;
             GuestMemory::CheckRange(fields.sh_registers, count * sizeof(ShaderRegister), alignof(ShaderRegister));
-            for (std::size_t index = 0; index < count; ++index) state.shader.insert_or_assign(fields.sh_registers[index].offset, fields.sh_registers[index].value);
+            const auto* shRegisters = GuestAddr::HostPtr<const ShaderRegister>(reinterpret_cast<std::uintptr_t>(fields.sh_registers));
+            for (std::size_t index = 0; index < count; ++index) state.shader.insert_or_assign(shRegisters[index].offset, shRegisters[index].value);
         }
     }
     for (const auto reg : context) state.context.insert_or_assign(reg.offset, reg.value);
@@ -2650,7 +2652,7 @@ void Driver::RegisterShader(const Shader* shader) {
     CheckFailure();
     GuestMemory::CheckRange(shader, sizeof(Shader), 1);
     Shader fields;
-    std::memcpy(&fields, static_cast<const void*>(shader), sizeof(Shader));
+    std::memcpy(&fields, GuestAddr::HostPtr<const void>(reinterpret_cast<std::uintptr_t>(shader)), sizeof(Shader));  // `shader` is a guest-valued pointer
     require(fields.file_header == 0x34333231u && fields.version == 0x18u, "invalid shader header");
     require(fields.header_size >= sizeof(Shader), "shader header is smaller than its fixed fields");
     require(fields.shader_size != 0 && (fields.shader_size & 3u) == 0, "invalid shader size");
@@ -2660,9 +2662,9 @@ void Driver::RegisterShader(const Shader* shader) {
     require(!RawGraphicsDrawnIn(reinterpret_cast<std::uintptr_t>(code), reinterpret_cast<std::uintptr_t>(code) + fields.shader_size), "a shader was registered over a graphics program that was drawn without registration");
     ShaderSnapshot snapshot{reinterpret_cast<std::uintptr_t>(code), reinterpret_cast<std::uintptr_t>(shader), fields.type, {}, {}};
     snapshot.code.resize(fields.shader_size / sizeof(std::uint32_t));
-    std::memcpy(snapshot.code.Mutable().data(), code, fields.shader_size);
+    std::memcpy(snapshot.code.Mutable().data(), GuestAddr::HostPtr<const void>(reinterpret_cast<std::uintptr_t>(code)), fields.shader_size);
     snapshot.header.resize(fields.header_size);
-    std::memcpy(snapshot.header.data(), static_cast<const void*>(shader), fields.header_size);
+    std::memcpy(snapshot.header.data(), GuestAddr::HostPtr<const void>(reinterpret_cast<std::uintptr_t>(shader)), fields.header_size);
 
     transaction.Hold();
     {
@@ -2730,7 +2732,7 @@ void Driver::RegisterShader(const Shader* shader) {
         const auto print = [](const ShaderRegister* registers, std::uint32_t count) {
             for (std::uint32_t i = 0; i < count && registers != nullptr; ++i) {
                 ShaderRegister value;
-                std::memcpy(&value, static_cast<const void*>(registers + i), sizeof(value));
+                std::memcpy(&value, GuestAddr::HostPtr<const void>(reinterpret_cast<std::uintptr_t>(registers + i)), sizeof(value));
                 std::fprintf(stderr, " %x=%08x", value.offset, value.value);
             }
         };

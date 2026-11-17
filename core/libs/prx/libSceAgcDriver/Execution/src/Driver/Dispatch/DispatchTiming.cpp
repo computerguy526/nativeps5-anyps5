@@ -12,7 +12,7 @@ void Driver::addDriverPhases(DispatchClass which, const std::array<double, Drive
     if (hit) ++totals.hits;
     if (validated) ++totals.validations;
     const auto now = std::chrono::steady_clock::now();
-    if (now - driverPhasesReport < std::chrono::seconds(10)) return;
+    if (now - driverPhasesReport < ProfileInterval()) return;
     driverPhasesReport = now;
     for (std::size_t cls = 0; cls < DispatchClassCount; ++cls) {
         auto& line = driverPhaseTotals[cls];

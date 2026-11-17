@@ -380,3 +380,61 @@ void Driver::reportDrawRelocation() {
 }
 
 }
+
+namespace AgcDriver::DriverDetail {
+
+// APS5_TRACE_DRAW_CACHE: why a shape-matched draw cannot reuse a stage variant. Classifies the used user words that moved
+// (pointers the SRT walk follows and that are relocatable, walked but not relocatable, or read directly) and, when every moved
+// word is relocatable, whether the memory behind the pointer at its new address still equals the variant's captured words.
+void Driver::probeShapeStage(const DispatchVariant& variant, const std::vector<std::uint32_t>& now, const std::vector<std::uint32_t>& was, const DrawProgram& program) {
+    auto& s = drawEntryCounters.shapeStage;
+    std::vector<std::uint32_t> moved;
+    bool allRelocatable = true, anyWalked = false, anyDirect = false;
+    for (std::size_t w = 0; w < now.size(); ++w) {
+        if (now[w] == was[w] || !(w >= 64u || ((variant.userDataMask >> w) & 1u) != 0)) continue;
+        moved.push_back(static_cast<std::uint32_t>(w));
+        if (w >= 64u || ((variant.relocatableWords >> w) & 1u) == 0) allRelocatable = false;
+        if (w < 64u && ((variant.userWordsWalked >> w) & 1u) != 0 && ((variant.relocatableWords >> w) & 1u) == 0) anyWalked = true;
+        if (w >= 64u || ((variant.userWordsWalked >> w) & 1u) == 0) anyDirect = true;
+    }
+    if (moved.empty()) return;
+    {
+        const auto& forwarded = variant.compiled->shaderDataUserWords;
+        bool all = true;
+        for (const auto w : moved) {
+            if (std::find(forwarded.begin(), forwarded.end(), w) == forwarded.end()) all = false;
+        }
+        ++s[all ? 13 : 14];
+    }
+    if (std::getenv("APS5_SRT_DEBUG")) {
+        for (const auto w : moved) std::fprintf(stderr, "[srt-moved] stage=%u word=%u walked=%d reloc=%d fwd=%d was=%08x now=%08x hidden=%u\n", static_cast<unsigned>(program.binary.stage), w, w < 64 ? int((variant.userWordsWalked >> w) & 1) : -1, w < 64 ? int((variant.relocatableWords >> w) & 1) : -1, int(std::find(variant.compiled->shaderDataUserWords.begin(), variant.compiled->shaderDataUserWords.end(), w) != variant.compiled->shaderDataUserWords.end()), was[w], now[w], program.hiddenUserWords);
+    }
+    if (variant.vertexInfo != nullptr) {
+        std::uint64_t fetch = 0;
+        for (const auto reg : {variant.vertexInfo->fetchAttribReg, variant.vertexInfo->fetchBufferReg}) fetch |= reg + 1u < 64u ? std::uint64_t{3} << reg : ~std::uint64_t{0};
+        const bool only = std::all_of(moved.begin(), moved.end(), [&](std::uint32_t w) { return w < 64u && ((fetch >> w) & 1u) != 0; });
+        if (only) ++s[15];
+    }
+    if (anyDirect) ++s[7];
+    else if (anyWalked) ++s[6];
+    else ++s[5];
+    (void)program;
+    if (!allRelocatable || variant.runBases.size() != variant.runs.size()) return;
+    std::size_t offset = 0;
+    bool unreadable = false, differs = false;
+    for (std::size_t run = 0; run < variant.runs.size(); ++run) {
+        const auto count = static_cast<std::size_t>((variant.runs[run].second - variant.runs[run].first) / sizeof(std::uint32_t));
+        const auto base = variant.runBases[run];
+        if (base >= 0 && std::find(moved.begin(), moved.end(), static_cast<std::uint32_t>(base)) != moved.end()) {
+            const auto delta = AlignedWord(now[static_cast<std::size_t>(base)]) - AlignedWord(was[static_cast<std::size_t>(base)]);
+            std::vector<std::uint32_t> live(count);
+            if (GuestMemory::CopyMapped(variant.runs[run].first + delta, std::as_writable_bytes(std::span(live))) != GuestMemory::Compare::Equal) unreadable = true;
+            else if (!std::equal(live.begin(), live.end(), variant.words.begin() + static_cast<std::ptrdiff_t>(offset))) differs = true;
+        }
+        offset += count;
+    }
+    ++s[unreadable ? 12 : differs ? 11 : 10];
+}
+
+}
+

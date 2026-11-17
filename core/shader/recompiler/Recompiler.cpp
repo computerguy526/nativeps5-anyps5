@@ -703,7 +703,7 @@ CompiledVariant emitVariant(const RecompileRequest& request, IrProgram& program)
         use.clipVaryings = emulated.barycentrics;
         const auto budget = MeshBarycentricOutputBudget(config, limits, use);
         if (budget.components > limits.maxOutputComponents) throw std::runtime_error("barycentric emulation on the mesh path needs " + std::to_string(budget.components) + " mesh output components (" + std::to_string(budget.vertexLocations) + " per-vertex and " + std::to_string(budget.primitiveLocations) + " per-primitive locations), the device allows " + std::to_string(limits.maxOutputComponents));
-        if (budget.bytes > limits.maxOutputMemoryBytes) throw std::runtime_error("barycentric emulation on the mesh path needs " + std::to_string(budget.bytes) + " bytes of mesh output memory, the device allows " + std::to_string(limits.maxOutputMemoryBytes));
+        if (budget.bytes > limits.maxOutputMemoryBytes) throw std::runtime_error("barycentric emulation on the mesh path needs " + std::to_string(budget.bytes) + " bytes of mesh output memory (" + std::to_string(config.maxVertices) + " vertices x " + std::to_string(budget.vertexLocations) + " locations, " + std::to_string(config.maxPrimitives) + " primitives x " + std::to_string(budget.primitiveLocations) + " locations; " + std::to_string(use.flatParameters) + " passed, " + std::to_string(use.perVertexParameters) + " per-vertex parameters, " + std::to_string(config.threadsPerGroup) + " threads), the device allows " + std::to_string(limits.maxOutputMemoryBytes));
     }
     targetOptions.waveLdsMemoryBarriers = request.target.waveLdsMemoryBarriers;
     targetOptions.deviceScopeLdsMemoryBarriers = request.target.deviceScopeLdsMemoryBarriers;
@@ -1820,7 +1820,8 @@ void reportResultMemo() {
         counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed);
         return;
     }
-    if (now - last < 10'000'000'000ll || !counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
+    static const long long interval = [] { const char* text = std::getenv("APS5_PROFILE_INTERVAL_MS"); const long long ms = text ? std::strtoll(text, nullptr, 10) : 0; return (ms > 0 ? ms : 10000) * 1000000ll; }();
+    if (now - last < interval || !counters.lastReport.compare_exchange_strong(last, now, std::memory_order_relaxed)) return;
     const auto hits = counters.hits.exchange(0, std::memory_order_relaxed);
     const auto patched = counters.patched.exchange(0, std::memory_order_relaxed);
     const auto misses = counters.misses.exchange(0, std::memory_order_relaxed);

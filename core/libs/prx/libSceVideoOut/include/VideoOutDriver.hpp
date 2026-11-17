@@ -16,6 +16,7 @@
 #include <future>
 #include <memory>
 #include <stdexcept>
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/DisplayBuffer.hpp"
 #ifndef __EMSCRIPTEN__
@@ -23,6 +24,7 @@
 #include "prx/libSceVideoOut/include/HostHdrProbe.hpp"
 #endif
 #include "prx/libSceVideoOut/include/BufferReuseTracker.hpp"
+#include "prx/libSceVideoOut/include/DisplayLinkBeat.hpp"
 #include "prx/libc/include/Shutdown.hpp"
 #include "prx/libkernel/Time/include/TimedWait.hpp"
 
@@ -160,7 +162,10 @@ struct VideoOutConfig {
     VideoOutVblankStatus preVblankStatus{};
 
     std::array<VideoOutBuffer, VIDEO_OUT_BUFFER_NUM_MAX> buffers{};
-    alignas(std::atomic_ref<std::uint64_t>::required_alignment) std::array<std::uint64_t, VIDEO_OUT_BUFFER_NUM_MAX> bufferLabels{};
+    // The labels are read and written by the guest and the GPU, so they need a guest address: driver scratch memory
+    // (host = guest + bias under nativeps5; ordinary heap with bias 0).
+    AgcDriver::GuestAddr::Scratch bufferLabelStorage{VIDEO_OUT_BUFFER_NUM_MAX * sizeof(std::uint64_t), std::atomic_ref<std::uint64_t>::required_alignment};
+    std::uint64_t BufferLabelGuest(int index) const { return bufferLabelStorage.guest() + static_cast<std::uint64_t>(index) * sizeof(std::uint64_t); }
     std::array<uint32_t, VIDEO_OUT_BUFFER_NUM_MAX> bufferPending{};
     std::array<BufferReuseTracker, VIDEO_OUT_BUFFER_NUM_MAX> bufferReuse;
     std::array<BufferAttributeGroup, VIDEO_OUT_BUFFER_ATTRIBUTE_NUM_MAX> groups{};
@@ -203,6 +208,12 @@ struct FlipRequest final : AgcDriver::IFlipRequest, std::enable_shared_from_this
 
     std::shared_ptr<AgcDriver::FrameTiming> timing;
     std::chrono::steady_clock::time_point queuedAt;
+    // nps5 (APS5_TRACE_PRESENT): when the guest reserved the flip, how many flips were pending then (this one
+    // included) and how many GPU-ready flips stood behind this one when the presenter took it.
+    std::chrono::steady_clock::time_point reservedAt;
+    std::chrono::steady_clock::time_point dequeuedAt;
+    std::size_t pendingAtReserve = 0;
+    std::size_t readyBehind = 0;
 
     ~FlipRequest() override;
     void GpuReady(const std::shared_ptr<AgcDriver::FrameTiming>& frameTiming) override;
@@ -249,9 +260,15 @@ private:
     bool close(int handle);
     void presentLoop(std::stop_token token, std::promise<void>& started);
     void vblankLoop(std::stop_token token);
-    void vblankEnd(std::uint64_t tick);
+    void vblankLoopLinked(std::stop_token token);
+    // `tick` is the newest 119.88 Hz tick, `advance` how many ticks passed since the last call (more than one only
+    // after a hitch, with APS5_PRESENT_LINK): the counters take them all, the guest gets one event.
+    void vblankEnd(std::uint64_t tick, std::uint64_t advance = 1);
+    void followWindowDisplay();
     void updateDisplayRefreshRate();
     void processFlip(FlipRequest& req);
+    std::uint32_t ensuredWidth = 0;  // presenter thread: the source extent the window was last ensured for
+    std::uint32_t ensuredHeight = 0;
     std::optional<AgcDriver::DisplayBuffer> overlayPlane();
     void triggerEvents(VideoOutConfig& cfg, int eventKind, void* triggerData);
     void pollHostHdr();
@@ -270,6 +287,9 @@ private:
     std::uint64_t hdrGeneration = 0;
     std::atomic<int> displayRefreshRate{0};
     std::atomic<std::uint32_t> displayResolution{VIDEO_OUT_RESOLUTION_1080P};
+
+    DisplayLinkBeat linkBeat;
+    int linkDisplayIndex = -1;  // main thread: the SDL display the link follows
 
     std::jthread presentThread;
     std::jthread vblankThread;

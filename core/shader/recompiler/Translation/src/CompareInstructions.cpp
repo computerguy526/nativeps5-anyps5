@@ -1,3 +1,4 @@
+#include "Float32FlushExt.hpp"
 #include "Translation/TranslationContext.hpp"
 #include <array>
 #include <cstdint>
@@ -125,6 +126,13 @@ void TranslationContext::emitFloatCompare(const RdnaInstruction& inst, IrOpcode 
         }
         if (!lhsConstant.has_value() && rhsConstant.has_value() && unorderedInfinityCompareIsTrue(opcode, false, *rhsConstant)) {
             emitCompareConstant(inst, true, false, cmpx);
+            return;
+        }
+        // Hardware flush (NPS5_HW_F32_FLUSH_EXT cmp): the device compare already treats a denormal as zero.
+        if (float32FlushToZero && (Float32FlushExtMask() & Float32FlushExtCompare) != 0u && (f32DenormalFlush & 1u) != 0u) {
+            lhs = &ir.BitCastF32(*lhsBits);
+            rhs = &ir.BitCastF32(*rhsBits);
+            emitCompareResult(inst, IrU1(ir.Emit(opcode, IrType::U1, {lhs, rhs})), false, cmpx);
             return;
         }
         if ((f32DenormalFlush & 1u) != 0u && lhsConstant.has_value() != rhsConstant.has_value()) {

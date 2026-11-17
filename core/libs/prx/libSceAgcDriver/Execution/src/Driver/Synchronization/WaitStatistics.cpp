@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -52,7 +53,7 @@ void Driver::bumpWaitEpoch(std::uint64_t address, std::size_t bytes) {
         return;
     }
     const auto generation = memo ? GuestMemory::CollectWritesUncached(address, bytes) : 0;
-    const std::uint64_t value = bytes == 8 ? *reinterpret_cast<const volatile std::uint64_t*>(address) : *reinterpret_cast<const volatile std::uint32_t*>(address);
+    const std::uint64_t value = bytes == 8 ? *GuestAddr::HostPtr<const volatile std::uint64_t>(address) : *GuestAddr::HostPtr<const volatile std::uint32_t>(address);
     if (generation != 0) {
         const auto found = ordered.find(address);
         if (found != ordered.end() && found->second.value == value && GuestMemory::UnchangedSince(address, bytes, found->second.generation)) {

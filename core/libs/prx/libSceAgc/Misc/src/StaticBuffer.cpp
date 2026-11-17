@@ -4,6 +4,7 @@
 #include <cstring>
 #include "SceTypes.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgc/include/GuestPtr.hpp"
 
 namespace {
 
@@ -14,7 +15,8 @@ constexpr std::size_t StaticQwordOffset = 16;
 constexpr std::uint32_t StaticQwordCount = static_cast<std::uint32_t>((StaticBufferCount * StaticBufferBytes - StaticQwordOffset) / sizeof(std::uint64_t));
 
 std::uint8_t* StaticTable() {
-    return static_cast<std::uint8_t*>(AgcDriverStaticTable_nid_postfix());
+    // The driver's static table is guest memory (its address is a guest value).
+    return static_cast<std::uint8_t*>(Agc::Guest::Host(AgcDriverStaticTable_nid_postfix()));
 }
 
 }

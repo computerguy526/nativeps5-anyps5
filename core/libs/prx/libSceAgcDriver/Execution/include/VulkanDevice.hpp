@@ -24,6 +24,8 @@
 
 namespace AgcDriver {
 
+struct ProgressScreenInfo;
+
 namespace Graphics {
 class StorageTexture;
 struct HtileMaskClear;
@@ -236,6 +238,9 @@ public:
     void ResolveMemory(std::uint64_t address, std::size_t bytes, bool writable);
     void* Window() const;
     void Resize(std::uint32_t width, std::uint32_t height);
+    // nps5: the startup shader-prebuild screen (ProgressScreen.hpp); drawn by PresentClear until cleared. Under the GPU mutex.
+    void SetProgressScreen(const ProgressScreenInfo& info);
+    void ClearProgressScreen();
     void SelectDynamicRange(const DisplayBuffer* buffer);
     bool Presentable() const;
     bool DualSrcBlend() const;

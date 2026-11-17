@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/WriteEvidence.hpp"
@@ -140,7 +141,7 @@ void Driver::observeDword(std::uint64_t address, bool unchanged) {
 
 void Driver::observeRange(std::uint64_t address, std::span<const std::byte> before) {
     if (before.empty() || !GuestMemory::Accessible(reinterpret_cast<const void*>(address), before.size())) return;
-    const auto* now = reinterpret_cast<const std::byte*>(address);
+    const auto* now = GuestAddr::HostPtr<const std::byte>(address);
     for (std::size_t offset = 0; offset + 4 <= before.size(); offset += 4) {
         observeDword(address + offset, std::memcmp(before.data() + offset, now + offset, 4) == 0);
     }

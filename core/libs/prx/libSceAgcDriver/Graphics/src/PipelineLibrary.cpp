@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineLibrary.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreateStats.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
@@ -233,6 +234,7 @@ VkPipeline LinkPipelineFromLibraries(const Context& context, const VkGraphicsPip
         VkResult created;
         {
             auto pipelineCacheLock = context.LockPipelineCacheForUse();
+            PipelineCreateTimer createTimer(PipelineCreateTimer::Kind::Graphics, "library");
             created = context.Function<PFN_vkCreateGraphicsPipelines>("vkCreateGraphicsPipelines")(context.device, context.pipelineCache, 1, &create, nullptr, &handle);
         }
         lock.lock();

@@ -17,7 +17,7 @@ void Driver::addDrawPhases(const std::array<double, DrawDriverPhaseCount>& ms, b
     if (drawn) ++totals.drawn;
     totals.captures += captures;
     const auto now = std::chrono::steady_clock::now();
-    if (now - totals.lastReport < std::chrono::seconds(10)) return;
+    if (now - totals.lastReport < ProfileInterval()) return;
     totals.lastReport = now;
     std::string report;
     double total = 0;

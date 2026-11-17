@@ -5,6 +5,8 @@
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "ShaderDiskCache.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJobs.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreateStats.hpp"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -25,6 +27,7 @@
 #include <thread>
 #include <type_traits>
 #include <zstd.h>
+#include "prx/libSceAgcDriver/Graphics/include/MetalCompileTasks.hpp"
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -385,7 +388,12 @@ std::uint64_t configured(const char* name, std::uint64_t fallback) {
     if (text == nullptr || *text == '\0') return fallback;
     char* end = nullptr;
     const auto value = std::strtoull(text, &end, 10);
-    if (end == text || *end != '\0') throw std::runtime_error(std::string("AGC graphics: ") + name + " must be a decimal integer");
+    if (end == text || *end != '\0') {
+        // (not an exception: this runs on the loader thread, the pool's first Submit on a draw thread and at device setup, where
+        // nothing catches it and a typo in an environment variable would terminate the process)
+        std::fprintf(stderr, "[pipeline] %s=\"%s\" is not a decimal integer; using %llu\n", name, text, static_cast<unsigned long long>(fallback));
+        return fallback;
+    }
     return value;
 }
 
@@ -565,6 +573,7 @@ bool expandModule(std::span<const std::byte> payload, std::vector<std::byte>& mo
 
 struct LoadedEntry {
     std::uint32_t kind;
+    std::uint64_t hash = 0;  // the record's payload hash: the replay job's key
     GraphicsPipelineRecipe graphics;
     ShaderRecompiler::PipelineIdentity compute;
     bool pushConstants = false;
@@ -968,6 +977,7 @@ private:
                     if (decode && !loaded.indexRecords.contains(record.payloadHash)) {
                         LoadedEntry entry{};
                         entry.kind = record.kind;
+                        entry.hash = record.payloadHash;
                         bool decoded = false;
                         if (record.kind == GraphicsRecord) {
                             Reader reader(payload);
@@ -1360,77 +1370,140 @@ ReplayCounters& replayCounters() {
     return counters;
 }
 
-// Builds the journal's pipelines for one device on a pool: the first thread loads the file, every
-// thread then takes the next entry. A pipeline the store already holds counts as present; an entry
-// whose modules are missing or whose set layouts differ from what its modules describe is rejected.
-class Replay : public PipelineJournalReplay {
+// Builds the journal's pipelines for one device on the shared build pool (PipelineJobs.hpp). One loader thread reads the
+// file and submits an entry per pipeline: the first `APS5_PIPELINE_JOURNAL_AHEAD` entries (the journal is in first-use
+// order, so these are what a run needs first) as Ahead, the rest as Idle; a draw that misses a pipeline still waiting here
+// promotes it to Now (async) or runs it itself (sync): PipelineJournalFinish. A pipeline the store already holds counts
+// as present; an entry whose modules are missing or whose set layouts differ from what its modules describe is rejected.
+class Replay;
+std::mutex activeMutex;
+std::weak_ptr<Replay> activeReplay;
+std::atomic<bool> replayActive{false};
+std::atomic<bool> prebuildMode{false};
+std::atomic<std::uint64_t> progressTotal{0}, progressDone{0};
+std::atomic<bool> progressLoaded{false}, progressFinished{false};
+
+PipelineJobPool& sharedPool();
+
+class Replay : public PipelineJournalReplay, public std::enable_shared_from_this<Replay> {
 public:
     // The context keeps the device's buffer pool: a store entry is alive for a draw only while its
     // pool is the draw's (the pool tells device instances apart), so the entries built here must
     // name it. The pool is released with the replay, before the device's teardown resets it.
-    Replay(Context context, PipelineJournalHooks hooks, unsigned threads) : context(std::move(context)), hooks(std::move(hooks)), active(threads) {
+    Replay(Context context, PipelineJournalHooks hooks, unsigned threads, bool stale) : context(std::move(context)), hooks(std::move(hooks)), stale(stale) {
         started = std::chrono::steady_clock::now();
         replayCounters().threads.store(threads, std::memory_order_relaxed);
         replayCounters().heldPeak.store(0, std::memory_order_relaxed);
-        workers.reserve(threads);
-        for (unsigned index = 0; index < threads; ++index) workers.push_back(Libc::StartHostThread([this] { run(); }));
+        progressFinished.store(false, std::memory_order_relaxed);
+        progressLoaded.store(false, std::memory_order_relaxed);
     }
+
+    // Starts the loader once the replay is owned by a shared_ptr (the registry holds a weak one).
+    void Start() { loader = Libc::StartHostThread([this] { loadAndSubmit(); }); }
 
     ~Replay() override {
         Cancel();
         Wait();
+        std::lock_guard lock(activeMutex);
+        if (activeReplay.expired()) replayActive.store(false, std::memory_order_release);
     }
 
     void Cancel() override { cancelled.store(true, std::memory_order_relaxed); }
 
     void Wait() override {
-        for (auto& worker : workers) {
-            if (worker.joinable()) worker.join();
-        }
-        workers.clear();
+        if (loader.joinable()) loader.join();
+        std::unique_lock lock(outstandingMutex);
+        outstandingDone.wait(lock, [&] { return outstanding == 0; });
+        lock.unlock();
+        finish();
     }
 
     [[nodiscard]] bool Done() const override { return finished.load(std::memory_order_acquire); }
 
+    // A draw needs the pipeline recorded as `hash`. Returns whether the replay still held its job (queued or running).
+    bool Finish(std::uint64_t hash) {
+        if (finished.load(std::memory_order_acquire)) return false;
+        return sharedPool().Finish(hash) != FinishResult::Unknown;
+    }
+
+    bool Promote(std::uint64_t hash) {
+        if (finished.load(std::memory_order_acquire)) return false;
+        const bool queued = sharedPool().Promote(hash);
+        if (queued) promotedNow.fetch_add(1, std::memory_order_relaxed);
+        return sharedPool().Pending(hash);
+    }
+
+    [[nodiscard]] std::uint64_t PromotedNow() const { return promotedNow.load(std::memory_order_relaxed); }
+
 private:
-    void run() {
-#ifdef _WIN32
-        if (!SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL)) std::fprintf(stderr, "[pipeline-journal] replay thread priority not lowered (error %lu)\n", GetLastError());
-#elif defined(__APPLE__)
-        if (const int error = pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0); error != 0) std::fprintf(stderr, "[pipeline-journal] replay thread priority not lowered (error %d)\n", error);
+    void loadAndSubmit() {
+#ifdef __APPLE__
+        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
 #endif
-        std::call_once(loadOnce, [&] {
-            try {
-                auto journal = Journal::Instance().Load();
-                const auto graphicsLimit = configured("APS5_PIPELINE_JOURNAL_ENTRIES", 4096u);
-                const auto computeLimit = configured("APS5_PIPELINE_JOURNAL_COMPUTE_ENTRIES", 1024u);
-                const auto compute = static_cast<std::uint64_t>(std::ranges::count_if(journal.entries, [](const LoadedEntry& entry) { return entry.kind == ComputeRecord; }));
-                const auto graphics = journal.entries.size() - compute;
-                auto graphicsLeft = graphics > graphicsLimit ? graphics - graphicsLimit : 0u;
-                auto computeLeft = compute > computeLimit ? compute - computeLimit : 0u;
-                if (graphicsLeft + computeLeft != 0) {
-                    std::fprintf(stderr, "[pipeline-journal] replaying the newest %llu of %llu graphics and %llu of %llu compute pipelines (APS5_PIPELINE_JOURNAL_ENTRIES, APS5_PIPELINE_JOURNAL_COMPUTE_ENTRIES)\n", static_cast<unsigned long long>(graphics - graphicsLeft), static_cast<unsigned long long>(graphics), static_cast<unsigned long long>(compute - computeLeft), static_cast<unsigned long long>(compute));
-                    std::vector<LoadedEntry> kept;
-                    kept.reserve(static_cast<std::size_t>(journal.entries.size() - graphicsLeft - computeLeft));
-                    for (auto& entry : journal.entries) {
-                        auto& left = entry.kind == ComputeRecord ? computeLeft : graphicsLeft;
-                        if (left != 0) {
-                            --left;
-                            continue;
-                        }
-                        kept.push_back(std::move(entry));
+        try {
+            auto journal = Journal::Instance().Load();
+            const auto graphicsLimit = configured("APS5_PIPELINE_JOURNAL_ENTRIES", 4096u);
+            const auto computeLimit = configured("APS5_PIPELINE_JOURNAL_COMPUTE_ENTRIES", 1024u);
+            const auto compute = static_cast<std::uint64_t>(std::ranges::count_if(journal.entries, [](const LoadedEntry& entry) { return entry.kind == ComputeRecord; }));
+            const auto graphics = journal.entries.size() - compute;
+            auto graphicsLeft = graphics > graphicsLimit ? graphics - graphicsLimit : 0u;
+            auto computeLeft = compute > computeLimit ? compute - computeLimit : 0u;
+            if (graphicsLeft + computeLeft != 0) {
+                std::fprintf(stderr, "[pipeline-journal] replaying the newest %llu of %llu graphics and %llu of %llu compute pipelines (APS5_PIPELINE_JOURNAL_ENTRIES, APS5_PIPELINE_JOURNAL_COMPUTE_ENTRIES)\n", static_cast<unsigned long long>(graphics - graphicsLeft), static_cast<unsigned long long>(graphics), static_cast<unsigned long long>(compute - computeLeft), static_cast<unsigned long long>(compute));
+                std::vector<LoadedEntry> kept;
+                kept.reserve(static_cast<std::size_t>(journal.entries.size() - graphicsLeft - computeLeft));
+                for (auto& entry : journal.entries) {
+                    auto& left = entry.kind == ComputeRecord ? computeLeft : graphicsLeft;
+                    if (left != 0) {
+                        --left;
+                        continue;
                     }
-                    journal.entries = std::move(kept);
+                    kept.push_back(std::move(entry));
                 }
-                loaded = std::move(journal);
-            } catch (const std::exception& error) {
-                std::fprintf(stderr, "[pipeline-journal] cannot load %s: %s\n", Journal::Instance().Path().string().c_str(), error.what());
+                journal.entries = std::move(kept);
             }
-        });
-        for (;;) {
-            if (cancelled.load(std::memory_order_relaxed)) break;
-            const auto index = cursor.fetch_add(1, std::memory_order_relaxed);
-            if (index >= loaded.entries.size()) break;
+            // APS5_PIPELINE_JOURNAL_RANGE=<first>:<count>: replay only that slice of the entries (the offline prewarm runs the
+            // journal in bounded batches, one process each, so a compiler's memory is returned between batches).
+            if (const char* range = std::getenv("APS5_PIPELINE_JOURNAL_RANGE"); range != nullptr && *range != '\0') {
+                char* end = nullptr;
+                const auto first = std::strtoull(range, &end, 10);
+                const auto count = end != nullptr && *end == ':' ? std::strtoull(end + 1, nullptr, 10) : 0ull;
+                std::vector<LoadedEntry> slice;
+                for (std::size_t at = first; at < journal.entries.size() && slice.size() < count; ++at) slice.push_back(std::move(journal.entries[at]));
+                journal.entries = std::move(slice);
+            }
+            loaded = std::move(journal);
+        } catch (const std::exception& error) {
+            loadFailed.store(true, std::memory_order_relaxed);
+            std::fprintf(stderr, "[pipeline-journal] cannot load %s: %s\n", Journal::Instance().Path().string().c_str(), error.what());
+        }
+        progressTotal.store(loaded.entries.size(), std::memory_order_relaxed);
+        progressDone.store(0, std::memory_order_relaxed);
+        progressLoaded.store(true, std::memory_order_release);
+        const auto ahead = configured("APS5_PIPELINE_JOURNAL_AHEAD", 256u);
+        auto& pool = sharedPool();
+        for (std::size_t index = 0; index < loaded.entries.size() && !cancelled.load(std::memory_order_relaxed); ++index) {
+            const auto& entry = loaded.entries[index];
+            {
+                std::lock_guard lock(outstandingMutex);
+                ++outstanding;
+            }
+            const auto priority = prebuildMode.load(std::memory_order_relaxed) ? JobPriority::Now : index < ahead ? JobPriority::Ahead : JobPriority::Idle;
+            const bool submitted = pool.Submit(entry.hash, priority, [this, index] { runEntry(index); });
+            if (!submitted) {
+                replayCounters().present.fetch_add(1, std::memory_order_relaxed);
+                entryDone();
+            }
+        }
+        std::unique_lock lock(outstandingMutex);
+        submitting = false;
+        const bool nothingLeft = outstanding == 0;
+        lock.unlock();
+        if (nothingLeft) finish();
+    }
+
+    void runEntry(std::size_t index) {
+        if (!cancelled.load(std::memory_order_relaxed)) {
             try {
                 replay(loaded.entries[index]);
             } catch (const std::exception& error) {
@@ -1439,13 +1512,40 @@ private:
                 if (reported.fetch_add(1) < 8) std::fprintf(stderr, "[pipeline-journal] replay failed: %s\n", error.what());
             }
         }
-        if (active.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+        entryDone();
+    }
+
+    void entryDone() {
+        progressDone.fetch_add(1, std::memory_order_relaxed);
+        bool last = false;
+        {
+            std::lock_guard lock(outstandingMutex);
+            --outstanding;
+            last = outstanding == 0 && !submitting;
+        }
+        outstandingDone.notify_all();
+        if (last) finish();
+    }
+
+    // The replay ran every entry (or was cancelled): report, and mark the stamp of this run as built.
+    void finish() {
+        std::call_once(finishOnce, [&] {
             loaded = LoadedJournal{};
             const auto ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count();
             replayCounters().ms.store(ms, std::memory_order_relaxed);
+            // Fresh only when the journal loaded and every entry was built (or was already present): a rejected or skipped entry, or a
+        // failed load, leaves the stale state to be retried by the next run.
+        const auto& counters = replayCounters();
+        const bool complete = !cancelled.load(std::memory_order_relaxed) && !loadFailed.load(std::memory_order_relaxed) && counters.failed.load(std::memory_order_relaxed) == 0 && counters.rejected.load(std::memory_order_relaxed) == 0 && counters.skipped.load(std::memory_order_relaxed) == 0 && std::getenv("APS5_PIPELINE_JOURNAL_RANGE") == nullptr;
+            if (complete) {
+                PipelineStamp stamp;
+                StampCheck check;
+                if (CurrentPipelineStamp(stamp, check) && check.state != StampState::Fresh && CommitCurrentPipelineStamp()) std::fprintf(stderr, "[pipeline-stamp] rebuild from the journal finished in %.1f s (%llu graphics + %llu compute built, %llu present): stamp written\n", ms / 1000.0, static_cast<unsigned long long>(replayCounters().graphics.load()), static_cast<unsigned long long>(replayCounters().compute.load()), static_cast<unsigned long long>(replayCounters().present.load()));
+            }
+            progressFinished.store(true, std::memory_order_release);
             finished.store(true, std::memory_order_release);
             ReportPipelineJournal();
-        }
+        });
     }
 
     std::shared_ptr<const ShaderRecompiler::RecompileResult> readModule(const ShaderRecompiler::PipelineIdentity& identity, const LoadedModule& module) const {
@@ -1536,13 +1636,18 @@ private:
 
     Context context;
     PipelineJournalHooks hooks;
-    std::vector<std::thread> workers;
-    std::once_flag loadOnce;
+    bool stale = false;
+    std::atomic<bool> loadFailed{false};
+    std::thread loader;
     LoadedJournal loaded;
-    std::atomic<std::size_t> cursor{0};
-    std::atomic<unsigned> active{0};
+    std::mutex outstandingMutex;
+    std::condition_variable outstandingDone;
+    std::size_t outstanding = 0;
+    bool submitting = true;
+    std::once_flag finishOnce;
     std::atomic<bool> finished{false};
     std::atomic<bool> cancelled{false};
+    std::atomic<std::uint64_t> promotedNow{0};
     std::chrono::steady_clock::time_point started;
 };
 
@@ -1704,18 +1809,108 @@ void ReportPipelineJournal() {
                                          static_cast<unsigned long long>(totals.recordedGraphics), static_cast<unsigned long long>(totals.recordedCompute), static_cast<unsigned long long>(totals.recordedModules), static_cast<double>(totals.writtenBytes) / (1024.0 * 1024.0), static_cast<unsigned long long>(totals.writeFailures), static_cast<unsigned long long>(totals.evictedRecords), static_cast<double>(totals.evictedBytes) / (1024.0 * 1024.0));
 }
 
+// The key list belongs to the GPU, not to the driver build: the vendor and device ids only. The driver version and
+// pipelineCacheUUID (KosmicKrisp hashes its whole build into the UUID) are deliberately left out so a KosmicKrisp change
+// does not throw the journal away; what depends on them (the Metal archive, metallibs, the VkPipelineCache blob) lives in the
+// gpucache store and the pipeline cache file, which both key on them. Everything a journal entry's stages are built from
+// (SPIR-V modules) is stamped by the recompiler version in the file header.
 std::uint64_t PipelineJournalDeviceFingerprint(const VkPhysicalDeviceProperties& properties) {
-    std::array<std::uint32_t, 7> words{properties.vendorID, properties.deviceID, properties.driverVersion, 0u, 0u, 0u, 0u};
-    static_assert(VK_UUID_SIZE == 16);
-    std::memcpy(words.data() + 3, properties.pipelineCacheUUID, VK_UUID_SIZE);
-    return ShaderRecompiler::HashSpirvWords(words, 0x6a6f75726e616c01ull);
+    std::array<std::uint32_t, 2> words{properties.vendorID, properties.deviceID};
+    return ShaderRecompiler::HashSpirvWords(words, 0x6a6f75726e616c02ull);
+}
+
+namespace {
+
+PipelineJobPool& sharedPool() {
+    static auto* pool = [] {
+        const auto cores = std::max(1u, std::thread::hardware_concurrency());
+        // Half the cores: the title's own threads and WindowServer keep the rest. The journal replay's and the async builds'
+        // thread switches both still apply (the larger wins); they share one pool so a draw's "Now" job outranks the replay.
+        const auto journal = configured("APS5_PIPELINE_JOURNAL_THREADS", 0u);
+        const auto async = configured("APS5_ASYNC_PIPELINE_THREADS", 0u);
+        // Startup prebuild (no game running yet): Metal's concurrent compile task count for this GPU (nxnative 72d00571; the old "cores - 2,
+        // at most 8" left most of Metal's compile width unused), bounded by the core count and by RAM (a KosmicKrisp compile holds about 2 GB).
+        const auto prebuild = prebuildMode.load(std::memory_order_relaxed) ? PrebuildWorkerCount(cores, PhysicalMemoryBytes()) : 0u;
+        const auto threads = static_cast<unsigned>(std::max<std::uint64_t>({1u, journal, async, prebuild, journal == 0 && async == 0 ? std::max(1u, cores / 2u) : 0u}));
+        const char* name = std::getenv("APS5_PIPELINE_JOURNAL_QOS");
+        const auto qos = name != nullptr && std::strcmp(name, "background") == 0 ? JobQos::Background : name != nullptr && std::strcmp(name, "user-initiated") == 0 ? JobQos::UserInitiated : JobQos::Utility;
+        return new PipelineJobPool(threads, qos, [] { SetBackgroundPipelineBuildThread(); });  // leaked: the workers outlive static destruction
+    }();
+    return *pool;
+}
+
+}
+
+PipelineJobPool& SharedPipelinePool() {
+    return sharedPool();
 }
 
 std::shared_ptr<PipelineJournalReplay> StartPipelineJournalReplay(const Context& context, std::uint64_t deviceFingerprint, PipelineJournalHooks hooks) {
     if (!Journal::Instance().Enabled() || !Journal::Instance().Bind(deviceFingerprint)) return nullptr;
     const auto threads = static_cast<unsigned>(configured("APS5_PIPELINE_JOURNAL_THREADS", std::max(1u, std::thread::hardware_concurrency() / 2u)));
     if (threads == 0) return nullptr;
-    return std::make_shared<Replay>(context, std::move(hooks), threads);
+    PipelineStamp stamp;
+    StampCheck check;
+    const bool stale = CurrentPipelineStamp(stamp, check) && check.state == StampState::Stale;
+    auto replay = std::make_shared<Replay>(context, std::move(hooks), threads, stale);
+    {
+        std::lock_guard lock(activeMutex);
+        activeReplay = replay;
+        replayActive.store(true, std::memory_order_release);
+    }
+    replay->Start();
+    return replay;
+}
+
+bool PipelineJournalReplayActive() {
+    return replayActive.load(std::memory_order_acquire);
+}
+
+namespace {
+
+std::shared_ptr<Replay> activeReplayLocked() {
+    std::lock_guard lock(activeMutex);
+    return activeReplay.lock();
+}
+
+}
+
+bool PipelineJournalFinish(const GraphicsPipelineRecipe& recipe) {
+    const auto replay = activeReplayLocked();
+    return replay != nullptr && replay->Finish(ShaderRecompiler::HashBytes(EncodeGraphicsPipelineRecipe(recipe)));
+}
+
+bool PipelineJournalPromote(const GraphicsPipelineRecipe& recipe) {
+    const auto replay = activeReplayLocked();
+    return replay != nullptr && replay->Promote(ShaderRecompiler::HashBytes(EncodeGraphicsPipelineRecipe(recipe)));
+}
+
+bool PipelineJournalFinishCompute(const ShaderRecompiler::PipelineIdentity& identity, bool pushConstants) {
+    const auto replay = activeReplayLocked();
+    if (replay == nullptr) return false;
+    std::vector<std::byte> payload;
+    Writer writer(payload);
+    writer.U64(identity.low);
+    writer.U64(identity.high);
+    writer.Bool(pushConstants);
+    return replay->Finish(ShaderRecompiler::HashBytes(payload));
+}
+
+std::uint64_t PipelineJournalPromotedNow() {
+    const auto replay = activeReplayLocked();
+    return replay != nullptr ? replay->PromotedNow() : 0u;
+}
+
+}
+
+namespace AgcDriver::Graphics {
+
+void SetPipelinePrebuildMode(bool on) {
+    prebuildMode.store(on, std::memory_order_relaxed);
+}
+
+PrebuildProgress PipelineJournalProgress() {
+    return {progressDone.load(std::memory_order_relaxed), progressTotal.load(std::memory_order_relaxed), progressLoaded.load(std::memory_order_acquire), progressFinished.load(std::memory_order_acquire)};
 }
 
 }

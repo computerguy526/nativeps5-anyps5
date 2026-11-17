@@ -261,6 +261,8 @@ struct Context {
     bool drawIndirectCount = false;
     bool occlusionQueryPrecise = false;
     bool depthBounds = false;
+    // The driver reports depthBounds but ignores the test (see DriverIgnoresDepthBounds).
+    bool depthBoundsIgnored = false;
     bool depthBiasClamp = false;
     bool dualSrcBlend = false;
     bool logicOp = false;

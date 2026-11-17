@@ -17,7 +17,7 @@ PacketTimer::~PacketTimer() {
     auto& entry = profile.byOpcode[key];
     ++entry.first;
     entry.second += std::chrono::duration<double, std::milli>(now - start).count();
-    if (now - profile.lastReport < std::chrono::seconds(10)) return;
+    if (now - profile.lastReport < ProfileInterval()) return;
     profile.lastReport = now;
     std::vector<std::pair<std::uint32_t, std::pair<std::uint64_t, double>>> hot(profile.byOpcode.begin(), profile.byOpcode.end());
     std::sort(hot.begin(), hot.end(), [](const auto& a, const auto& b) { return a.second.second > b.second.second; });

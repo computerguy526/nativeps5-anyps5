@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include "prx/libSceAgcDriver/Execution/include/CaptureTrace.hpp"
@@ -9,7 +10,9 @@
 #include "prx/libSceAgcDriver/Graphics/include/ColorTargetLayout.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DepthSurface.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PlaceholderImages.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PlaceholderTexel.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/ShaderResources.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/MemoryProbe.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/BufferPool.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Pipeline.hpp"
@@ -198,6 +201,8 @@ struct CachedTexture {
     std::array<std::uint64_t, 4> untracked{};
     std::uint64_t surfaceBytes = 0;
     std::optional<CommittedSlabs> slabs;
+    // APS5_DELAY_TEXTURES test hook: the texture shows a placeholder until this present count, then is rebuilt from guest memory.
+    std::uint64_t placeholderUntil = 0;
 };
 
 // Entries in use order (front = most recent) with a hash index by key: a lookup is O(1) and the
@@ -616,6 +621,37 @@ private:
     bool outermost;
 };
 
+// Debug aid (APS5_TRACE_VOLUME=1): one stderr line per sampled lookup of a 3D texture whose outcome differs from the
+// previous lookup of that address (and every 600th), so a stale tonemap LUT can be followed: path, storage source,
+// generations and a fingerprint of the snapshot bytes.
+bool TraceVolume() {
+    static const bool on = std::getenv("APS5_TRACE_VOLUME") != nullptr;
+    return on;
+}
+
+void traceVolumeLookup(const GuestTextureResource& resource, const char* path, const void* source, std::uint64_t sourceVersion, std::uint64_t generation, std::uint64_t snapshotGeneration, std::span<const std::byte> bytes, std::uint64_t sampledView = 0, std::uint64_t storageImage = 0) {
+    // Any lookup of the LUT's address is followed, whatever shape the consumer gives it (a 3D view, an array, an unwrapped 2D).
+    if (!TraceVolume() || ((resource.dimension != TextureDimension::k3D || resource.width != 32u) && resource.baseAddress != StorageTexture::TraceLutAddress().load(std::memory_order_relaxed))) return;
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    unsigned maxByte = 0;
+    for (std::size_t i = 0; i < bytes.size(); i += 7) {
+        hash = (hash ^ static_cast<std::uint64_t>(bytes[i])) * 0x100000001b3ull;
+        maxByte = std::max(maxByte, static_cast<unsigned>(bytes[i]));
+    }
+    struct Last { std::uint64_t address; int dimension; std::uint32_t width; const char* path; const void* source; std::uint64_t version; std::uint64_t hash; std::uint64_t count; std::uint64_t view = 0; std::uint64_t image = 0; };
+    static std::mutex mutex;
+    static std::vector<Last> lasts;
+    std::lock_guard lock(mutex);
+    auto it = std::find_if(lasts.begin(), lasts.end(), [&](const Last& last) { return last.address == resource.baseAddress && last.dimension == static_cast<int>(resource.dimension) && last.width == resource.width; });
+    if (it == lasts.end()) { lasts.push_back({resource.baseAddress, static_cast<int>(resource.dimension), resource.width, nullptr, nullptr, 0, 0, 0}); it = lasts.end() - 1; }
+    const bool changed = it->path != path || it->source != source || it->version != sourceVersion || it->hash != hash || it->view != sampledView || it->image != storageImage;
+    ++it->count;
+    const bool periodic = it->count % 120 == 0;
+    if (!changed && !periodic) return;
+    *it = {resource.baseAddress, static_cast<int>(resource.dimension), resource.width, path, source, sourceVersion, hash, it->count, sampledView, storageImage};
+    std::fprintf(stderr, "[volume-lookup] present=%llu 0x%llx %ux%ux%u fmt=%u dim=%d tile=%d path=%s source=%p version=%llu generation=%llu snapshotGeneration=%llu bytes=%zu hash=%016llx max=%u n=%llu sampledView=0x%llx storageImage=0x%llx\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.depthOrLastArray + 1u, resource.format, static_cast<int>(resource.dimension), static_cast<int>(resource.tileMode), path, source, static_cast<unsigned long long>(sourceVersion), static_cast<unsigned long long>(generation), static_cast<unsigned long long>(snapshotGeneration), bytes.size(), static_cast<unsigned long long>(hash), maxByte, static_cast<unsigned long long>(it->count), static_cast<unsigned long long>(sampledView), static_cast<unsigned long long>(storageImage));
+}
+
 void refreshForView(StorageTexture& source, const GuestTextureResource& resource) {
     if (resource.dimension == TextureDimension::k2D && source.ImageLayers() > 1) source.RefreshLayers(resource.baseArray, 1);
     else source.Refresh();
@@ -995,6 +1031,11 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
         Require(native != nullptr, "compressed FMASK sampling without a matching resident native target is not implemented");
         return native;
     }
+    if (std::getenv("APS5_TRACE_SAMPLED") != nullptr) std::fprintf(stderr, "[sampled] 0x%llx %ux%u depthOrLast=%u dim=%d fmt=%u tile=%d mips=%u dst=%u%u%u%u\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.depthOrLastArray, static_cast<int>(resource.dimension), resource.format, static_cast<int>(resource.tileMode), resource.mipCount, resource.dstSelX, resource.dstSelY, resource.dstSelZ, resource.dstSelW);
+    if (const char* want = std::getenv("APS5_STAT_SAMPLED"); want != nullptr && resource.baseAddress == std::strtoull(want, nullptr, 16)) {
+        static unsigned count = 0;
+        if (count++ % 8 == 0) { char tag[48]; std::snprintf(tag, sizeof(tag), "sample#%u", count); StorageTexture::PrintStatsAt(resource.baseAddress, tag); }
+    }
     CaptureTrace::Log("sampled-lookup address=%llx width=%u height=%u dcc=%llx", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, static_cast<unsigned long long>(resource.dccAddress));
     RequireNoMultisampleTarget(resource.baseAddress, guestBytes != 0 ? static_cast<std::size_t>(guestBytes) : 1u, "a texture read");
     if (auto* recorder = Recorder::Active(); recorder != nullptr) recorder->BoundKeptBytes();
@@ -1218,11 +1259,12 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 it->keys = *keys;
                 touchTexture(cache, it);
                 logLookup({it->texture.get(), resource, guestBytes, *keys, 0, it->source.get()});
+                traceVolumeLookup(resource, "view-hit", it->source.get(), it->source->Version(), generation, snapshotGeneration, {}, reinterpret_cast<std::uint64_t>(it->texture->View()), reinterpret_cast<std::uint64_t>(it->source->Image()));
                 reportTextureCounters();
                 if (profile) LookupOutcomes::Add(*keys != DccKeys::Uncompressed ? LookupOutcomes::SampledHitClearedView : LookupOutcomes::SampledHitView, start);
                 return it->texture;
             }
-        } else if (source == nullptr && it->surfaceBytes == guestBytes && it->keys == *keys && it->slabs == slabs && stillCommitted(slabs, it->slabs)) {
+        } else if (source == nullptr && it->surfaceBytes == guestBytes && it->keys == *keys && it->slabs == slabs && stillCommitted(slabs, it->slabs) && !(it->placeholderUntil != 0 && Recorder::Presents() >= it->placeholderUntil)) {
             // Unwritten pages need no comparison; partially resident textures compare only committed
             // pages. The compare goes through the flush hook: it waits for recorded work over the
             // surface (counted, and named for the [hooksync] line).
@@ -1242,7 +1284,9 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
                 (same ? counters.untrackedKept : counters.untrackedCompared).fetch_add(1, std::memory_order_relaxed);
                 return same;
             };
-            if ((*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) || unchanged() || kept() || equalsCommitted()) {
+            const char* hitBy = (*keys != DccKeys::Uncompressed && *keys != DccKeys::ClearSingle) ? "snapshot-hit-keys" : unchanged() ? "snapshot-hit-unchanged" : kept() ? "snapshot-hit-untracked" : equalsCommitted() ? "snapshot-hit-equal" : nullptr;
+            if (hitBy != nullptr) {
+                traceVolumeLookup(resource, hitBy, nullptr, 0, generation, snapshotGeneration, it->bytes);
                 it->generation = snapshotGeneration;
                 it->committed = std::move(committed);
                 it->untracked = untracked;
@@ -1322,12 +1366,61 @@ std::shared_ptr<Texture> cachedTexture(const Context& context, std::span<const s
             for (std::size_t i = 0; i < read.size(); i += 64) nonzero += read[i] != std::byte{0};
             std::fprintf(stderr, "[texture] 0x%llx %ux%u format %u tile %d: %zu of %zu sampled bytes nonzero\n", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format, static_cast<int>(resource.tileMode), nonzero, read.size() / 64);
         }
+        // nps5-placeholder: a texture with no data yet shows a neutral grey instead of black (see PlaceholderTexel.hpp). The upload
+        // copy is replaced, never the cache's snapshot, so the first guest write replaces the placeholder the usual way.
+        std::vector<std::byte> placeholderBytes;
+        std::span<const std::byte> uploadBytes = entry.bytes;
+        if (!depthCompare && !entry.slabs.has_value()) {
+            auto& stats = PlaceholderStats();
+            const bool statsOn = PlaceholderStatsEnabled();
+            const auto delayUntil = DelayTexturesPresents();
+            const bool delayed = delayUntil != 0 && Recorder::Presents() < delayUntil;
+            const bool substitute = PlaceholderTexturesEnabled();
+            bool zeroUnwritten = false;
+            if (statsOn || substitute) {
+                if (generation == 0 && !entry.committed.has_value()) {
+                    zeroUnwritten = AllZero(read);
+                    if (zeroUnwritten) stats.zeroUnwritten.fetch_add(1, std::memory_order_relaxed);
+                } else if (statsOn && AllZero(read)) {
+                    stats.zeroWritten.fetch_add(1, std::memory_order_relaxed);
+                    char detail[160];
+                    std::snprintf(detail, sizeof(detail), "zero-written 0x%llx %ux%u format %u", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.format);
+                    PlaceholderNote("texture", stats.zeroWritten.load(), detail);
+                }
+            }
+            stats.created.fetch_add(1, std::memory_order_relaxed);
+            if (zeroUnwritten && statsOn) {
+                char detail[160];
+                std::snprintf(detail, sizeof(detail), "zero-unwritten 0x%llx %ux%u mips %u format %u", static_cast<unsigned long long>(resource.baseAddress), resource.width, resource.height, resource.mipCount, resource.format);
+                PlaceholderNote("texture", stats.zeroUnwritten.load(), detail);
+            }
+            if (delayed || (zeroUnwritten && substitute)) {
+                const auto pattern = PlaceholderPatternFor(resource.format);
+                if (delayed) stats.delayed.fetch_add(1, std::memory_order_relaxed);
+                if (pattern.size == 0 && zeroUnwritten) stats.noPattern.fetch_add(1, std::memory_order_relaxed);
+                if (pattern.size != 0 || delayed) {
+                    // Delayed with the placeholder off: zeros, what a texture that is not uploaded yet samples as.
+                    const bool grey = pattern.size != 0 && substitute;
+                    if (grey && zeroUnwritten) stats.substituted.fetch_add(1, std::memory_order_relaxed);
+                    if (staging != nullptr) {
+                        if (grey) FillPattern(staging->Bytes(), pattern);
+                        else if (delayed) std::memset(staging->Bytes().data(), 0, staging->Bytes().size());
+                    } else {
+                        placeholderBytes.assign(entry.bytes.size(), std::byte{0});
+                        if (grey) FillPattern(placeholderBytes, pattern);
+                        uploadBytes = placeholderBytes;
+                    }
+                    if (delayed) entry.placeholderUntil = delayUntil;
+                }
+            }
+        }
         if (staging != nullptr) entry.texture = createTexture(*context.detiler, resource, components, std::move(staging), depthCompare, layerRows, packedSlabs(entry.slabs));
-        else entry.texture = createTexture(*context.detiler, resource, components, entry.bytes, depthCompare, layerRows, nullptr, packedSlabs(entry.slabs));
+        else entry.texture = createTexture(*context.detiler, resource, components, uploadBytes, depthCompare, layerRows, nullptr, packedSlabs(entry.slabs));
         entry.accounted = entry.texture->AllocationBytes();
         if (entry.bytes.size() > SnapshotCompareBytes && (entry.generation != 0 || entry.untracked[0] != 0)) parkSnapshot(cache, entry.bytes);
         counters.snapshots.fetch_add(1, std::memory_order_relaxed);
     }
+    traceVolumeLookup(resource, source != nullptr ? "view-made" : clear.has_value() ? "clear-made" : "snapshot-made", source.get(), source != nullptr ? source->Version() : 0, generation, snapshotGeneration, entry.bytes, entry.texture != nullptr ? reinterpret_cast<std::uint64_t>(entry.texture->View()) : 0, source != nullptr ? reinterpret_cast<std::uint64_t>(source->Image()) : 0);
     const auto budget = sampledBudget(context, cache);
     auto texture = entry.texture;
     const auto madeRecord = [&] {
@@ -1552,6 +1645,11 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             it = cache.entries.end();
         }
         if (it != cache.entries.end()) {
+            struct UseScope {
+                const char* previous;
+                ~UseScope() { StorageTexture::UseTag() = previous; }
+            } useScope{StorageTexture::UseTag()};
+            if (std::strcmp(StorageTexture::UseTag(), "resource") == 0) StorageTexture::UseTag() = written ? "storage-written" : "storage-read";
             if (layers) it->texture->RefreshLayers(layers->first, layers->second);
             else it->texture->Refresh();
             cache.entries.splice(cache.entries.begin(), cache.entries, it);
@@ -1560,12 +1658,25 @@ std::shared_ptr<StorageTexture> cachedStorageTexture(const Context& context, std
             if (profile) LookupOutcomes::Add(LookupOutcomes::StorageHit, start);
         } else {
             if (guestBytes == 0) guestBytes = DescribeSurface(resource).guestBytes;
+            // WP0 memprobe: why the cache held no usable image (APS5_MEM_PROBE only: scans the cache).
+            auto probeCause = MemoryProbe::Kind::StorageDirect;
+            if (MemoryProbe::Enabled()) {
+                const GuestTextureResource* same = nullptr;
+                for (const auto& cached : cache.entries) {
+                    if (cached.key.device == context.device && cached.texture->Descriptor().baseAddress == resource.baseAddress) {
+                        same = &cached.texture->Descriptor();
+                        break;
+                    }
+                }
+                probeCause = MemoryProbe::ClassifyCreation(same, resource, detached != nullptr);
+            }
             bool flushed = false;
             auto handOver = StorageTexture::PrepareCreation(context, resource, guestBytes, std::move(detached), flushed);
             if (flushed && profile) start = LookupOutcomes::Add(LookupOutcomes::PendingFlush, start);
             std::shared_ptr<StorageTexture> created;
             {
                 const CacheHold reclaimable(storageCacheReclaimable);
+                const MemoryProbe::CauseScope causeScope(probeCause);
                 created = StorageTexture::Create(context, *context.detiler, resource, mip);
             }
             created->AdoptHandOver(std::move(handOver));
@@ -2862,6 +2973,11 @@ void ShaderResources::buildComplete() {
             std::vector<std::pair<std::size_t, std::size_t>> keptWrites;
             const auto absentImage = [this](std::uint32_t binding) {
                 constexpr auto bindingCount = static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count);
+                if (PlaceholderStatsEnabled()) {
+                    const bool storage = binding % static_cast<std::uint32_t>(ShaderRecompiler::RuntimeAbi::Binding::Count) >= ShaderRecompiler::RuntimeAbi::FirstStorageImageBinding;
+                    auto& absent = storage ? PlaceholderStats().absentStorage : PlaceholderStats().absentSampled;
+                    PlaceholderNote("absent image", absent.fetch_add(1, std::memory_order_relaxed) + 1, storage ? "storage" : "sampled");
+                }
                 const auto view = context.nullDescriptors ? VK_NULL_HANDLE : context.placeholderImages->View(binding % bindingCount);
                 return VkDescriptorImageInfo{VK_NULL_HANDLE, view, VK_IMAGE_LAYOUT_GENERAL};
             };
@@ -4172,7 +4288,7 @@ void ShaderResources::subscribeIndex(std::span<const CompiledShader> shaders) {
                 for (auto block = GuestMemory::WriteBlockOf(base); block <= GuestMemory::WriteBlockOf(base + size - 1); ++block) subscribedBlocks.emplace_back(block, TableSpanElement);
             } else if (GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(size))) {
                 std::vector<std::byte> copy(static_cast<std::size_t>(size));
-                std::memcpy(copy.data(), reinterpret_cast<const void*>(base), copy.size());
+                std::memcpy(copy.data(), GuestAddr::HostPtr<const void>(base), copy.size());
                 comparedTableSpans.emplace_back(base, std::move(copy));
             }
         }
@@ -4735,7 +4851,7 @@ bool ShaderResources::revalidateFull(std::span<const CompiledShader> shaders, Pr
     if (indexBaseline != 0) {
         noteIndexProof(indexBaseline, serialBefore);
         for (auto& [address, copy] : comparedTableSpans) {
-            if (GuestMemory::Accessible(reinterpret_cast<const void*>(address), copy.size())) std::memcpy(copy.data(), reinterpret_cast<const void*>(address), copy.size());
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(address), copy.size())) std::memcpy(copy.data(), GuestAddr::HostPtr<const void>(address), copy.size());
             else copy.clear();
         }
         comparedTableSpans.erase(std::remove_if(comparedTableSpans.begin(), comparedTableSpans.end(), [](const auto& span) { return span.second.empty(); }), comparedTableSpans.end());
@@ -5499,7 +5615,7 @@ std::string ShaderResources::Describe() const {
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes))) return -1.0;
         std::size_t nonzero = 0;
         std::size_t samples = 0;
-        const auto* data = reinterpret_cast<const std::uint32_t*>(address);
+        const auto* data = GuestAddr::HostPtr<const std::uint32_t>(address);
         const auto words = bytes / 4;
         const auto step = std::max<std::uint64_t>(1, words / 4096);
         for (std::uint64_t i = 0; i < words; i += step, ++samples) nonzero += data[i] != 0;
@@ -5516,7 +5632,7 @@ std::string ShaderResources::Describe() const {
             text += line;
             if (keys == DccKeys::Mixed) {
                 // Where the keys change: first key, how many leading keys match it, and the next key.
-                const auto* bytes = reinterpret_cast<const std::uint8_t*>(range.dccAddress);
+                const auto* bytes = GuestAddr::HostPtr<const std::uint8_t>(range.dccAddress);
                 const auto count = static_cast<std::size_t>(range.bytes / 256u);
                 std::size_t run = 1;
                 while (run < count && bytes[run] == bytes[0]) ++run;
@@ -5541,7 +5657,7 @@ std::string ShaderResources::Describe() const {
         if (allocation.guest) {
             std::snprintf(line, sizeof(line), " buffer%s 0x%llx+0x%zx nz=%.2f", allocation.written ? "" : "(ro)", static_cast<unsigned long long>(allocation.address), allocation.size, sample(allocation.address, allocation.size));
             text += line;
-            if (GuestMemory::Accessible(reinterpret_cast<const void*>(allocation.address), allocation.size)) appendWords(reinterpret_cast<const std::uint32_t*>(allocation.address), allocation.size);
+            if (GuestMemory::Accessible(reinterpret_cast<const void*>(allocation.address), allocation.size)) appendWords(GuestAddr::HostPtr<const std::uint32_t>(allocation.address), allocation.size);
         } else if (allocation.buffer) {
             const auto bytes = allocation.buffer->Bytes();
             std::snprintf(line, sizeof(line), " data+0x%zx nz=%.2f", allocation.size, sample(reinterpret_cast<std::uint64_t>(bytes.data()), allocation.size));
@@ -6985,7 +7101,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const auto fast = buffer->Bytes().subspan(static_cast<std::size_t>(offset), bytes);
             VkDeviceSize slowOffset = 0;
             const auto slow = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, GuestMemory::CollectWrites(begin, bytes), &slowOffset);
-            const bool same = (slow == buffer && slowOffset == offset) || (slow != nullptr && slow->Bytes().size() >= slowOffset + fast.size() && std::memcmp(slow->Bytes().data() + slowOffset, fast.data(), fast.size()) == 0) || (slow == nullptr && std::memcmp(fast.data(), reinterpret_cast<const void*>(begin), bytes) == 0);
+            const bool same = (slow == buffer && slowOffset == offset) || (slow != nullptr && slow->Bytes().size() >= slowOffset + fast.size() && std::memcmp(slow->Bytes().data() + slowOffset, fast.data(), fast.size()) == 0) || (slow == nullptr && std::memcmp(fast.data(), GuestAddr::HostPtr<const void>(begin), bytes) == 0);
             if (!same) differing.fetch_add(1);
             if (checked.fetch_add(1) % 200000 == 199999) std::fprintf(stderr, "[draw-snapshots] verify: %llu fast answers checked, %llu differing%c", static_cast<unsigned long long>(checked.load()), static_cast<unsigned long long>(differing.load()), 10);
         }
@@ -6993,7 +7109,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
             const bool uploaded = bytes != 0 && bytes <= uploadLimit;
             if (uploaded) {
                 auto slice = recorder.DrawUpload(bytes);
-                std::memcpy(slice.bytes, reinterpret_cast<const void*>(begin), bytes);
+                std::memcpy(slice.bytes, GuestAddr::HostPtr<const void>(begin), bytes);
                 buffer = std::move(slice.buffer);
                 offset = slice.offset;
             } else {
@@ -7001,7 +7117,7 @@ std::shared_ptr<ShaderResources::DrawBindings> ShaderResources::PrepareDrawBindi
                 buffer = recorder.ReusableDrawSnapshot(begin, bytes, Recorder::SnapshotUse::Storage, nullptr, generation, &offset);
                 if (buffer == nullptr) {
                     buffer = std::make_shared<Buffer>(context, bytes, VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-                    std::memcpy(buffer->Bytes().data(), reinterpret_cast<const void*>(begin), bytes);
+                    std::memcpy(buffer->Bytes().data(), GuestAddr::HostPtr<const void>(begin), bytes);
                     recorder.KeepDrawSnapshot(begin, bytes, generation, registryGeneration, buffer);
                 }
             }
@@ -7248,6 +7364,32 @@ void ShaderResources::WriteBackBuffers() {
     }
     if (!SkipWriteBack()) guestMemory.WriteBack();
     if (unaligned) std::rethrow_exception(unaligned);
+}
+
+std::string ShaderResources::DebugAllocations() const {
+    std::string out;
+    char text[700];
+    for (std::size_t index = 0; index < allocations.size(); ++index) {
+        const auto& allocation = allocations[index];
+        if (allocation.role == ShaderRecompiler::DescriptorRole::BdaPagetable || allocation.role == ShaderRecompiler::DescriptorRole::FaultBuffer) continue;
+        std::string bound = "-";
+        std::string owner = "-";
+        if (allocation.guest && allocation.size != 0) {
+            try {
+                std::uint32_t adjustment = 0;
+                const auto info = guestMemory.Descriptor(allocation.address, allocation.size, adjustment);
+                char b[160];
+                std::snprintf(b, sizeof(b), "vkbuffer=0x%llx offset=0x%llx range=0x%llx adjust=%u", reinterpret_cast<unsigned long long>(info.buffer), static_cast<unsigned long long>(info.offset), static_cast<unsigned long long>(info.range), adjustment);
+                bound = b;
+                owner = guestMemory.DebugOwner(allocation.address, allocation.size);
+            } catch (const std::exception& error) {
+                bound = std::string("descriptor: ") + error.what();
+            }
+        }
+        std::snprintf(text, sizeof(text), "  alloc %zu role=%d guest=%d 0x%llx+0x%zx written=%d writeOnly=%d ownBuffer=%d pushByte=%d | %s | %s\n", index, static_cast<int>(allocation.role), allocation.guest ? 1 : 0, static_cast<unsigned long long>(allocation.address), allocation.size, allocation.written ? 1 : 0, allocation.writeOnly ? 1 : 0, allocation.buffer != nullptr ? 1 : 0, allocation.pushByte, bound.c_str(), owner.c_str());
+        out += text;
+    }
+    return out;
 }
 
 std::span<const std::byte> ShaderResources::AddressTableBytes() const {

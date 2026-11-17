@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Memory/BufferCopy.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -218,7 +219,7 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             return false;
         }
         std::array<std::uint32_t, 8> descriptors{};
-        std::memcpy(descriptors.data(), reinterpret_cast<const void*>(tableAddress), sizeof(descriptors));
+        std::memcpy(descriptors.data(), GuestAddr::HostPtr<const void>(tableAddress), sizeof(descriptors));
         const auto range = TableCopyRange(descriptors, groups[0]);
         if (!range || (tableAddress < range->destination + range->bytes && range->destination < tableAddress + 32)) {
             countCopy(CopyShape, range ? range->bytes : 0, started, locked);
@@ -247,9 +248,9 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             return false;
         }
         std::uint32_t count = 0, sourceOffset = 0, destinationOffset = 0;
-        std::memcpy(&count, reinterpret_cast<const void*>(record), 4);
-        std::memcpy(&sourceOffset, reinterpret_cast<const void*>(record + 4), 4);
-        std::memcpy(&destinationOffset, reinterpret_cast<const void*>(record + 8), 4);
+        std::memcpy(&count, GuestAddr::HostPtr<const void>(record), 4);
+        std::memcpy(&sourceOffset, GuestAddr::HostPtr<const void>(record + 4), 4);
+        std::memcpy(&destinationOffset, GuestAddr::HostPtr<const void>(record + 8), 4);
         const auto range = IndexedCopyRange(userData, groups[0], count, sourceOffset, destinationOffset);
         if (!range || (record < range->destination + range->bytes && range->destination < record + 12)) {
             countCopy(CopyShape, range ? range->bytes : 0, started, locked);
@@ -268,8 +269,8 @@ bool Driver::copyBuffer(QueueState& queue, std::uint32_t queueId, std::span<cons
             return false;
         }
         std::uint32_t count = 0, period = 0;
-        std::memcpy(&count, reinterpret_cast<const void*>(record), 4);
-        std::memcpy(&period, reinterpret_cast<const void*>(record + 4), 4);
+        std::memcpy(&count, GuestAddr::HostPtr<const void>(record), 4);
+        std::memcpy(&period, GuestAddr::HostPtr<const void>(record + 4), 4);
         bytes = static_cast<std::size_t>(count) * 4u;
 
         if (count == 0 || period < count || groups[0] != (count + 63u) / 64u || count > userData[2] || count > userData[6] || bytes > (16u << 20u) || source % 4 != 0 || destination % 4 != 0 || (record < destination + bytes && destination < record + 8)) {

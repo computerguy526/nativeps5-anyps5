@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/AbSwitch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/SubmissionRing.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
@@ -160,6 +161,7 @@ void Driver::run(std::uint32_t id) noexcept {
     char threadName[16];
     std::snprintf(threadName, sizeof threadName, "qworker 0x%x", id);
     NameDriverThread(threadName);
+    Graphics::AbSwitch::RegisterThread("qworker");
 
     GuestMemory::TagGpuLockThread(id);
     StartWorkerSampler(id);

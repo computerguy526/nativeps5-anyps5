@@ -384,7 +384,7 @@ void DefineModule(SpirvEmitterState& state) {
     }
     if (state.requirements.bufferU64View) {
         state.module.EmitCapability(spv::CapabilityInt64);
-        state.module.EmitCapability(spv::CapabilityInt64Atomics);
+        if (!state.requirements.bufferInt64AtomicsPlain) state.module.EmitCapability(spv::CapabilityInt64Atomics);
     }
     if (state.requirements.gdsInt64Atomics) {
         if (std::find(state.supportedCapabilities.begin(), state.supportedCapabilities.end(), static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)) == state.supportedCapabilities.end()) {

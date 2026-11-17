@@ -5,6 +5,8 @@
 #include "PipelineSpecialization.hpp"
 #include <spirv/unified1/spirv.hpp>
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
 #include <stdexcept>
 #include <string>
 
@@ -88,6 +90,20 @@ std::uint32_t TableStorageImagePointer(SpirvEmitterState& state, DescriptorBindi
     return pointer;
 }
 
+// nps5: a device without shaderStorageImageMultisample (Metal cannot write multisampled textures from a shader) gets a
+// storage image of a multisampled guest dimension declared as its single-sample shape. Such a shader is only correct for an
+// image with one sample; the driver cannot create a multisampled storage image on that device, so it never binds another.
+bool StorageMultisampleLowered(const SpirvEmitterState& state, const ImageResource& image) {
+    return image.resourceClass == ImageResourceClass::Storage && RdnaImageDimensionInfoFor(image.dimension).multisampled != 0u &&
+           std::ranges::find(state.supportedCapabilities, spv::CapabilityStorageImageMultisample) == state.supportedCapabilities.end();
+}
+
+void NoteStorageMultisampleLowered() {
+    static std::atomic<bool> noted{false};
+    if (noted.exchange(true)) return;
+    std::fprintf(stderr, "[shader] warning: a program accesses a multisampled storage image and the device has no shaderStorageImageMultisample; such programs are compiled for single-sample images only (sample 0 is the texel, other samples are dropped or read as zero). Reported once.\n");
+}
+
 bool TableModeEmitted(const ImageResource& mode) {
     return RdnaImageDimensionInfoFor(mode.dimension).multisampled == 0u;
 }
@@ -133,15 +149,20 @@ std::uint32_t ImageType(SpirvEmitterState& state, const ImageResource& image) {
         FailEmit("invalid image resource class");
     }
     const auto& info = RdnaImageDimensionInfoFor(image.dimension);
+    std::uint32_t multisampled = info.multisampled;
     if (info.multisampled != 0u) {
         if (sampled == 2u) {
-            if (std::ranges::find(state.supportedCapabilities, spv::CapabilityStorageImageMultisample) == state.supportedCapabilities.end()) FailEmit("storage image multisampling is unavailable on the target device");
-            state.module.EmitCapability(spv::CapabilityStorageImageMultisample);
-            if (info.arrayed != 0u) state.module.EmitCapability(spv::CapabilityImageMSArray);
+            if (StorageMultisampleLowered(state, image)) {
+                multisampled = 0u;
+                NoteStorageMultisampleLowered();
+            } else {
+                state.module.EmitCapability(spv::CapabilityStorageImageMultisample);
+                if (info.arrayed != 0u) state.module.EmitCapability(spv::CapabilityImageMSArray);
+            }
         }
     }
     const auto scalar = image.atomic64 ? TypeScalarU64(state) : ImageScalarType(state, image.numericClass);
-    return state.module.Type(spv::OpTypeImage, scalar, info.spirvDimension, image.depthCompare ? 1u : 0u, info.arrayed, info.multisampled, sampled, format);
+    return state.module.Type(spv::OpTypeImage, scalar, info.spirvDimension, image.depthCompare ? 1u : 0u, info.arrayed, multisampled, sampled, format);
 }
 
 std::uint32_t ImageViewSizeType(SpirvEmitterState& state, RdnaImageDimension dimension) {
@@ -245,6 +266,15 @@ std::uint32_t EmitStorageImageRead(SpirvEmitterState& state, std::uint32_t resou
     state.module.AddFunction(spv::OpLoad, imageType, descriptor, StorageImageDescriptorPointer(state, resource));
     const auto texel = state.module.AllocateId();
     const auto texelType = ImageVectorType(state, image.numericClass, 4u);
+    if (StorageMultisampleLowered(state, image)) {
+        // Single-sample image behind a multisampled guest dimension: sample 0 is the texel, no other sample exists (reads as zero).
+        if (sample == 0u) FailEmit("multisampled storage image read requires a sample");
+        const auto zero = state.module.Constant(spv::OpConstantNull, texelType);
+        return EmitValueOrDefaultIfCondition(state, Binary(state, spv::OpIEqual, TypeBool(state), sample, ConstantU32(state, 0u)), texelType, zero, [&]() {
+            state.module.AddFunction(spv::OpImageRead, texelType, texel, descriptor, coord);
+            return texel;
+        });
+    }
     if (RdnaImageDimensionInfoFor(image.dimension).multisampled != 0u) {
         if (sample == 0u) FailEmit("multisampled storage image read requires a sample");
         state.module.AddFunction(spv::OpImageRead, texelType, texel, descriptor, coord, spv::ImageOperandsSampleMask, sample);
@@ -281,6 +311,13 @@ void EmitStorageImageWrite(SpirvEmitterState& state, std::uint32_t resource, std
         state.module.AddFunction(spv::OpLoad, imageType, descriptor, pointer);
         return descriptor;
     };
+    if (StorageMultisampleLowered(state, image)) {
+        // Single-sample image behind a multisampled guest dimension: a store to sample 0 is the texel store, a store to any
+        // other sample addresses a sample the image does not have and is dropped.
+        if (sample == 0u || image.mipMode == ImageMipMode::DynamicStorage) FailEmit("multisampled storage image requires a sample and cannot have mip levels");
+        EmitIfCondition(state, Binary(state, spv::OpIEqual, TypeBool(state), sample, ConstantU32(state, 0u)), [&]() { state.module.AddFunction(spv::OpImageWrite, loadAt(arrayIndex), coord, texel); });
+        return;
+    }
     if (RdnaImageDimensionInfoFor(image.dimension).multisampled != 0u) {
         if (sample == 0u || image.mipMode == ImageMipMode::DynamicStorage) FailEmit("multisampled storage image requires a sample and cannot have mip levels");
         state.module.AddFunction(spv::OpImageWrite, loadAt(arrayIndex), coord, texel, spv::ImageOperandsSampleMask, sample);

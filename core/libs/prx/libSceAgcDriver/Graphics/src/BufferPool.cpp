@@ -241,6 +241,11 @@ std::size_t BufferPool::RetainedImages() {
     return imageSlots;
 }
 
+BufferPool::PoolTotals BufferPool::Totals() {
+    std::lock_guard lock(mutex);
+    return {smallTier.retainedBytes, smallTier.budget, largeTier.retainedBytes, largeTier.budget, deviceTier.retainedBytes, deviceTier.budget, imageBytes + retainedImageSlabBytes.load(std::memory_order_relaxed), imageBudget};
+}
+
 VkDeviceSize BufferPool::ReclaimTarget(VkDeviceSize bytes) {
     const auto reserve = std::max<VkDeviceSize>(bytes, VkDeviceSize{256} << 20u);
     const auto limit = std::numeric_limits<VkDeviceSize>::max();

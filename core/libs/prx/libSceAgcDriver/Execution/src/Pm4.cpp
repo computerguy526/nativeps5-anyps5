@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libkernel/include/Api.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
@@ -52,6 +53,12 @@ void RejectGdsImport() {
 
 std::uint64_t GdsAddress() {
     static const std::uint64_t address = [] {
+        // Base mode: a host address below the bias has no guest name, so the global data share lives in the driver
+        // scratch window of the guest arena (never freed: the share lives as long as the process).
+        if (GuestAddr::Bias() != 0) {
+            static GuestAddr::Scratch share(GdsBytes);
+            return share.guest();
+        }
         constexpr int ReadWrite = 0x3;
         constexpr int PrivateAnonymous = 0x1002;
         constexpr int Shared = 0x1;
@@ -65,13 +72,13 @@ std::uint64_t GdsAddress() {
                     std::memset(shared, 0, GdsBytes);
                     gdsShared.store(true, std::memory_order_release);
                     gdsImportable.store(true, std::memory_order_release);
-                    return reinterpret_cast<std::uint64_t>(shared);
+                    return GuestAddr::HostToGuest(shared);  // GDS is a host allocation; the driver names it by its guest-domain address
                 }
             }
         }
         void* mapped = mmap_nid_postfix(nullptr, GdsBytes, ReadWrite, PrivateAnonymous, -1, 0);
         if (mapped == nullptr || mapped == reinterpret_cast<void*>(static_cast<std::uintptr_t>(-1))) throw std::runtime_error("cannot allocate the global data share");
-        return reinterpret_cast<std::uint64_t>(mapped);
+        return GuestAddr::HostToGuest(mapped);
     }();
     return address;
 }
@@ -288,7 +295,7 @@ std::string_view UnsupportedReason(std::uint32_t header) {
             return "graphics draw, shader stages and guest render-target materialization are not implemented";
         case 0x33: case 0x3f: return "nested command buffers, branching and nested flip reservation are not implemented";
         case 0x3c: case 0x93: return {};
-        case 0x39: return {};
+        case 0x39: case 0x1e: return {};
         case 0x59: return {};
         case 0x84: case 0x85: case 0x86: case 0x88:
             return "separate CE/DE execution and counter synchronization are not implemented";
@@ -528,6 +535,15 @@ void Validate(std::span<const std::uint32_t> packet, std::uint32_t queue) {
             require((packet[1] & 7u) <= 6u, "invalid WAIT_REG_MEM compare function");
             break;
         }
+        case 0x1e: {
+            size(9);
+            const auto op = packet[1] & 0x7fu, low = op & 0x1fu;
+            require(low == 7 || low == 8 || (low >= 15 && low <= 25), "unsupported ATOMIC_MEM operation");
+            require(((packet[1] >> 8u) & 0xfu) != 1u && ((packet[1] >> 8u) & 0xfu) <= 3u, "ATOMIC_MEM loop-until-compare and reserved commands are not implemented");
+            const auto bytes = AtomicMemBytes(packet);
+            require(address(packet[2], packet[3]) != 0 && (packet[2] & (bytes - 1)) == 0, "null or misaligned ATOMIC_MEM address");
+            break;
+        }
         case 0x39:
             size(4);
             require((packet[3] >> 29u) == 6u || (packet[3] >> 29u) == 7u, "invalid MEM_SEMAPHORE operation");
@@ -636,6 +652,31 @@ bool waitCompares(std::span<const std::uint32_t> packet, bool wide, std::uint64_
 
 }
 
+std::uint64_t AtomicMemResult(std::uint32_t low, std::uint64_t old, std::uint64_t src, std::uint64_t cmp, unsigned width) {
+    const auto mask = width == 64 ? ~0ull : 0xffffffffull;
+    const auto sign = [&](std::uint64_t v) { return width == 64 ? static_cast<std::int64_t>(v) : static_cast<std::int64_t>(static_cast<std::int32_t>(v)); };
+    old &= mask; src &= mask; cmp &= mask;
+    switch (low) {
+        case 7: return src;
+        case 8: return old == cmp ? src : old;
+        case 15: return (old + src) & mask;
+        case 16: return (old - src) & mask;
+        case 17: return sign(src) < sign(old) ? src : old;
+        case 18: return src < old ? src : old;
+        case 19: return sign(src) > sign(old) ? src : old;
+        case 20: return src > old ? src : old;
+        case 21: return old & src;
+        case 22: return old | src;
+        case 23: return old ^ src;
+        case 24: return old >= src ? 0 : (old + 1) & mask;
+        default: return (old == 0 || old > src) ? src : old - 1;
+    }
+}
+
+std::size_t AtomicMemBytes(std::span<const std::uint32_t> packet) {
+    return (packet[1] & 0x40u) != 0 ? 8 : 4;
+}
+
 std::size_t WaitAwaitedBytes(std::span<const std::uint32_t> packet) {
     const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
     return wide && (packet.size() < 8 || packet[7] != 0) ? 8 : 4;
@@ -656,7 +697,7 @@ bool WaitSatisfiedUnchecked(std::span<const std::uint32_t> packet) {
     const bool wide = ((packet[0] >> 8u) & 0xffu) == 0x93u;
     const auto awaitedBytes = WaitAwaitedBytes(packet);
     const auto source = address(packet[2] & (awaitedBytes == 8 ? ~7u : ~3u), packet[3]);
-    const std::uint64_t value = awaitedBytes == 8 ? *reinterpret_cast<const volatile std::uint64_t*>(source) : *reinterpret_cast<const volatile std::uint32_t*>(source);
+    const std::uint64_t value = awaitedBytes == 8 ? *GuestAddr::HostPtr<const volatile std::uint64_t>(source) : *GuestAddr::HostPtr<const volatile std::uint32_t>(source);
     return waitCompares(packet, wide, value);
 }
 
@@ -801,6 +842,7 @@ std::vector<PacketStore> DecodeStores(std::span<const std::uint32_t> packet) {
             return {known(label->address, label->Bytes())};
         }
         case 0x39: return {runTime(address(packet[1], packet[2]), 8)};
+        case 0x1e: return {runTime(address(packet[2], packet[3]), AtomicMemBytes(packet))};
         case 0x40: {
             require(packet.size() == 6, "invalid COPY_DATA size");
             if (CopyDataToRegister(packet)) return {};
@@ -858,7 +900,7 @@ bool UsesGpuCacheBarrier(std::span<const std::uint32_t> packet) {
 
 bool AccessesMemory(std::uint32_t header) {
     switch ((header >> 8u) & 0xffu) {
-        case 0x22: case 0x27: case 0x39: case 0x3c: case 0x93: case 0x49: case 0x16: case 0x2d: case 0x35: case 0x24: case 0x25: case 0x2c: case 0x38: case 0x37: case 0x40: case 0x45: case 0x50: case 0x63: case 0x64: case 0x83: case 0x91: case 0x9f: return true;
+        case 0x1e: case 0x22: case 0x27: case 0x39: case 0x3c: case 0x93: case 0x49: case 0x16: case 0x2d: case 0x35: case 0x24: case 0x25: case 0x2c: case 0x38: case 0x37: case 0x40: case 0x45: case 0x50: case 0x63: case 0x64: case 0x83: case 0x91: case 0x9f: return true;
         default: return false;
     }
 }
@@ -1172,14 +1214,35 @@ void Execute(std::span<const std::uint32_t> packet, QueueState& queue) {
             }
             return;
         }
+        case 0x1e: {
+            const auto target = address(packet[2], packet[3]);
+            const auto bytes = AtomicMemBytes(packet);
+            const auto src = packet[4] | (static_cast<std::uint64_t>(packet[5]) << 32u);
+            const auto cmp = packet[6] | (static_cast<std::uint64_t>(packet[7]) << 32u);
+            GuestMemory::GuardRead(target, bytes);
+            GuestMemory::FlushGpuWrites(target, bytes);
+            GuestMemory::CheckRange(reinterpret_cast<const void*>(target), bytes, bytes, true);
+            GuestMemory::StoreOwnBytes(target, bytes, [&] {
+                if (bytes == 8) {
+                    std::atomic_ref<std::uint64_t> word(*GuestAddr::HostPtr<std::uint64_t>(target));
+                    auto old = word.load(std::memory_order_acquire);
+                    while (!word.compare_exchange_weak(old, AtomicMemResult(packet[1] & 0x1fu, old, src, cmp, 64), std::memory_order_acq_rel)) {}
+                } else {
+                    std::atomic_ref<std::uint32_t> word(*GuestAddr::HostPtr<std::uint32_t>(target));
+                    auto old = word.load(std::memory_order_acquire);
+                    while (!word.compare_exchange_weak(old, static_cast<std::uint32_t>(AtomicMemResult(packet[1] & 0x1fu, old, src, cmp, 32)), std::memory_order_acq_rel)) {}
+                }
+            });
+            return;
+        }
         case 0x39: {
             const auto semaphore = address(packet[1], packet[2]);
-            auto* word = reinterpret_cast<std::uint64_t*>(semaphore);
+            auto* word = GuestAddr::HostPtr<std::uint64_t>(semaphore);
             std::atomic_ref<std::uint64_t> shared(*word);
             const auto prepare = [&] {
                 GuestMemory::GuardRead(semaphore, sizeof(*word));
                 GuestMemory::FlushGpuWrites(semaphore, sizeof(*word));
-                GuestMemory::CheckRange(word, sizeof(*word), std::atomic_ref<std::uint64_t>::required_alignment, true);
+                GuestMemory::CheckRange(reinterpret_cast<const void*>(semaphore), sizeof(*word), std::atomic_ref<std::uint64_t>::required_alignment, true);
             };
             if ((packet[3] >> 29u) == 6u) {
                 prepare();

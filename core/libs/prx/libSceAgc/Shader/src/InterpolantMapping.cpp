@@ -7,6 +7,7 @@
 #include <prx/libc/include/General.hpp>
 
 #include "SceShaders.hpp"
+#include "prx/libSceAgc/Shader/include/ShaderView.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderUtils.hpp"
@@ -64,7 +65,11 @@ std::uint32_t ApplyInterpolantDefaultValue0100(std::uint32_t value, std::uint32_
     return value;
 }
 
-int CreateInterpolantMapping(const char* fn, ShaderRegister* regs, const Shader* gs, const Shader* ps, CreateInterpolantValueFn createValue, bool fillIdentityTail) {
+int CreateInterpolantMapping(const char* fn, ShaderRegister* regs, const Shader* gsHost, const Shader* psHost, CreateInterpolantValueFn createValue, bool fillIdentityTail) {
+    // Host pointers to guest-resident headers: read through host views, hand the driver the guest-valued pointers.
+    const Agc::Guest::ShaderView gsView(gsHost), psView(psHost);
+    const Shader* const gs = gsView.get();
+    const Shader* const ps = psView.get();
     if (regs == nullptr) {
         throw std::runtime_error(std::string(fn) + ": regs is null");
     }
@@ -75,7 +80,7 @@ int CreateInterpolantMapping(const char* fn, ShaderRegister* regs, const Shader*
         throw std::runtime_error(std::string(fn) + ": input semantic count exceeds 32");
     }
 
-    AgcDriver::ShaderPreparationScope transaction({ps != nullptr ? gs : nullptr, ps});
+    AgcDriver::ShaderPreparationScope transaction({ps != nullptr ? gsView.guest() : nullptr, psView.guest()});
     std::array<ShaderRegister, 32> values{};
     auto* output = regs;
     regs = values.data();
@@ -83,8 +88,8 @@ int CreateInterpolantMapping(const char* fn, ShaderRegister* regs, const Shader*
         const std::uint32_t count = fillIdentityTail ? InterpolantRegisterCount : 0;
         if (fillIdentityTail) FillIdentityInterpolants(regs, 0);
         if (ps != nullptr) {
-            AgcDriverResolveShaderAbi_nid_postfix(ps, {regs, count}, {});
-            if (gs != nullptr) AgcDriverResolveGraphicsAbi_nid_postfix(gs, ps, 0);
+            AgcDriverResolveShaderAbi_nid_postfix(psView.guest(), {regs, count}, {});
+            if (gs != nullptr) AgcDriverResolveGraphicsAbi_nid_postfix(gsView.guest(), psView.guest(), 0);
         }
         transaction.Commit();
         std::copy_n(values.begin(), count, output);
@@ -115,8 +120,8 @@ int CreateInterpolantMapping(const char* fn, ShaderRegister* regs, const Shader*
 
     const std::uint32_t count = fillIdentityTail ? InterpolantRegisterCount : ps->num_input_semantics;
     if (fillIdentityTail) FillIdentityInterpolants(regs, ps->num_input_semantics);
-    AgcDriverResolveShaderAbi_nid_postfix(ps, {regs, count}, {});
-    AgcDriverResolveGraphicsAbi_nid_postfix(gs, ps, 0);
+    AgcDriverResolveShaderAbi_nid_postfix(psView.guest(), {regs, count}, {});
+    AgcDriverResolveGraphicsAbi_nid_postfix(gsView.guest(), psView.guest(), 0);
     transaction.Commit();
     std::copy_n(values.begin(), count, output);
     return 0;
@@ -130,7 +135,10 @@ int APS5_VABI sceAgcCreateInterpolantMapping_0100(ShaderRegister* regs, const Sh
     return CreateInterpolantMapping(__func__, regs, gs, ps, CreateInterpolantValue, true);
 }
 
-int APS5_VABI sceAgcUpdateInterpolantMapping_0100(ShaderRegister* regs, const Shader* vs, const Shader* ps) {
+int APS5_VABI sceAgcUpdateInterpolantMapping_0100(ShaderRegister* regs, const Shader* vsHost, const Shader* psHost) {
+    const Agc::Guest::ShaderView vsView(vsHost), psView(psHost);
+    const Shader* const vs = vsView.get();
+    const Shader* const ps = psView.get();
     if (regs == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": regs is null");
     }

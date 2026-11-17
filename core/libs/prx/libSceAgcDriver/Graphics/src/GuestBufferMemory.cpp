@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ProfileOutput.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -29,6 +30,8 @@
 #else
 #include <fcntl.h>
 #ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 struct udmabuf_create {
     std::uint32_t memfd;
     std::uint32_t flags;
@@ -750,8 +753,92 @@ const char* bindImport(const Context& context, HostImport& entry, VkExternalMemo
     return nullptr;
 }
 
+#ifdef __APPLE__
+// Debug aid (APS5_CHECK_IMPORT_PROTECTION=1): the page runs of a host range the host maps without write access. Metal makes a
+// no-copy buffer over such a range without an error, but GPU writes through it never reach the range (nps5-fixmem probe).
+std::vector<std::pair<std::uintptr_t, std::uintptr_t>> hostReadOnlyRuns(std::uintptr_t begin, std::uintptr_t end) {
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> runs;
+    mach_vm_address_t at = begin;
+    while (at < end) {
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        mach_vm_address_t region = at;
+        if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS || region >= end) break;
+        const auto first = std::max<std::uintptr_t>(region, begin);
+        const auto last = std::min<std::uintptr_t>(region + size, end);
+        if ((info.protection & VM_PROT_WRITE) == 0 && first < last) {
+            if (!runs.empty() && runs.back().second == first) runs.back().second = last;
+            else runs.emplace_back(first, last);
+        }
+        at = region + size;
+    }
+    return runs;
+}
+#endif
+
+#ifdef __APPLE__
+struct GuestPageCounts {
+    std::uint64_t pages = 0;
+    std::uint64_t present = 0;
+    std::uint64_t dirty = 0;
+    std::uint64_t pagedOut = 0;
+};
+
+// Pages of the guest-side mapping [begin, begin + bytes) by disposition. 64 MiB per call; one syscall per 4096 pages.
+GuestPageCounts queryGuestPages(std::uint64_t begin, std::uint64_t bytes) {
+    GuestPageCounts counts;
+    static const std::uint64_t page = static_cast<std::uint64_t>(::getpagesize());
+    std::vector<int> dispositions(static_cast<std::size_t>((64ull << 20u) / page));
+    for (std::uint64_t at = 0; at < bytes;) {
+        const auto chunk = std::min<std::uint64_t>(bytes - at, 64ull << 20u);
+        mach_vm_size_t count = (chunk + page - 1) / page;
+        if (mach_vm_page_range_query(mach_task_self(), static_cast<mach_vm_offset_t>(GuestAddr::HostAddress(begin + at)), chunk, reinterpret_cast<mach_vm_address_t>(dispositions.data()), &count) != KERN_SUCCESS) break;
+        counts.pages += count;
+        for (mach_vm_size_t index = 0; index < count; ++index) {
+            const int value = dispositions[index];
+            if ((value & VM_PAGE_QUERY_PAGE_PRESENT) != 0) ++counts.present;
+            if ((value & VM_PAGE_QUERY_PAGE_DIRTY) != 0) ++counts.dirty;
+            if ((value & VM_PAGE_QUERY_PAGE_PAGED_OUT) != 0) ++counts.pagedOut;
+        }
+        at += chunk;
+    }
+    return counts;
+}
+#endif
+
 const char* createHostPointerImport(const Context& context, HostImport& entry, VkResult& failure) {
-    void* const host = entry.alias != nullptr ? entry.alias : reinterpret_cast<void*>(entry.base);
+#ifdef __APPLE__
+    static const bool checkProtection = std::getenv("APS5_CHECK_IMPORT_PROTECTION") != nullptr || std::getenv("APS5_TRACE_VOLUME") != nullptr;
+    static const bool forceWritable = std::getenv("APS5_IMPORT_PAGES_WRITABLE") != nullptr;
+    std::vector<std::pair<std::uintptr_t, std::uintptr_t>> readOnly;
+    if (checkProtection || forceWritable) {
+        const auto hostBegin = reinterpret_cast<std::uintptr_t>(entry.alias != nullptr ? entry.alias : GuestAddr::HostPtr<void>(entry.base));
+        readOnly = hostReadOnlyRuns(hostBegin, hostBegin + entry.bytes);
+        std::uint64_t pages = 0;
+        for (const auto& [first, last] : readOnly) pages += (last - first) / 4096;
+        entry.readOnlyAtCreate = static_cast<std::uint32_t>(std::min<std::uint64_t>(pages, 0xffffffffu));
+        if (pages != 0) {
+            std::size_t guestReadOnly = 0;
+            for (const auto& range : entry.ranges) guestReadOnly += range->writable ? 0u : 1u;
+            static std::atomic<std::uint64_t> reports{0};
+            if (reports.fetch_add(1, std::memory_order_relaxed) < 4000) std::fprintf(stderr, "[import-prot] present=%llu import 0x%llx+0x%llx: %llu of %llu 4K pages without host write access at creation in %zu runs (first run guest 0x%llx+0x%llx); %zu of %zu registered ranges are guest read-only; alias=%d forced=%d\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes), static_cast<unsigned long long>(pages), static_cast<unsigned long long>(entry.bytes / 4096), readOnly.size(), static_cast<unsigned long long>(entry.base + (readOnly.front().first - hostBegin)), static_cast<unsigned long long>(readOnly.front().second - readOnly.front().first), guestReadOnly, entry.ranges.size(), entry.alias != nullptr ? 1 : 0, forceWritable ? 1 : 0);
+        }
+        if (forceWritable) {
+            for (const auto& [first, last] : readOnly) ::mprotect(reinterpret_cast<void*>(first), last - first, PROT_READ | PROT_WRITE);
+        }
+    }
+    struct RestoreProtection {
+        const std::vector<std::pair<std::uintptr_t, std::uintptr_t>>& runs;
+        bool active;
+        ~RestoreProtection() {
+            if (!active) return;
+            for (const auto& [first, last] : runs) ::mprotect(reinterpret_cast<void*>(first), last - first, PROT_READ);
+        }
+    } restoreProtection{readOnly, forceWritable};
+#endif
+    void* const host = entry.alias != nullptr ? entry.alias : GuestAddr::HostPtr<void>(entry.base);  // the import is of host memory: translate the guest base
     VkMemoryHostPointerPropertiesEXT pointer{VK_STRUCTURE_TYPE_MEMORY_HOST_POINTER_PROPERTIES_EXT};
     if (const auto result = context.Function<PFN_vkGetMemoryHostPointerPropertiesEXT>("vkGetMemoryHostPointerPropertiesEXT")(context.device, VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT, host, &pointer); result != VK_SUCCESS) {
         failure = result;
@@ -1105,7 +1192,7 @@ const char* createBackingImport(const Context& context, HostImport& entry, int f
 }
 
 bool resolveBackingRuns(std::uint64_t rangeBase, std::uint64_t rangeBytes, int& file, std::array<GuestArena::SharedBackingRun, DmaBufRunLimit>& runs, std::size_t& count) {
-    const auto base = static_cast<std::uintptr_t>(rangeBase);
+    const auto base = GuestAddr::HostAddress(rangeBase);  // the arena is keyed by host address
     const auto bytes = static_cast<std::size_t>(rangeBytes);
     if (GuestArena::GuestArenaSharedBackingRuns_nid_postfix(base, bytes, &file, runs.data(), runs.size(), &count)) return true;
     std::uint64_t offset = 0;
@@ -2127,6 +2214,100 @@ ImportRun windowRun(const HostImports& state, ImportRun run, std::uint64_t begin
     return run;
 }
 
+// APS5_VERIFY_IMPORT_PAGES=1 (macOS, debug): a host-pointer import hands the GPU the physical pages the guest range maps when
+// it is made. If the guest address is given other pages afterwards (a mapping replaced without the import being retired, a
+// copy-on-write break), the GPU keeps reading the old ones while the CPU sees the new: frozen in-place inputs. Each import
+// gets a witness, a second shared mapping of the same pages (mach_vm_remap, no copy), and twice a second the witness is
+// compared with the guest range at a few offsets of every page. The two are one memory while the range still maps the
+// imported pages, so a difference that survives three reads means the pages were replaced; it is reported once per import
+// with the first differing page. Needs read traps off (a trapped page cannot be read here).
+#ifdef __APPLE__
+struct ImportWitness {
+    std::uint64_t bytes = 0;
+    mach_vm_address_t alias = 0;
+    bool reported = false;
+};
+
+bool importWitnessesEnabled() {
+    static const bool enabled = std::getenv("APS5_VERIFY_IMPORT_PAGES") != nullptr;
+    return enabled;
+}
+
+std::map<std::uint64_t, ImportWitness>& importWitnesses() {
+    static std::map<std::uint64_t, ImportWitness> witnesses;
+    return witnesses;
+}
+
+void dropImportWitness(std::map<std::uint64_t, ImportWitness>::iterator it) {
+    mach_vm_deallocate(mach_task_self(), it->second.alias, it->second.bytes);
+    importWitnesses().erase(it);
+}
+
+// Under the imports mutex.
+void noteImportWitness(std::uint64_t base, std::uint64_t bytes) {
+    if (!importWitnessesEnabled()) return;
+    auto& witnesses = importWitnesses();
+    if (const auto found = witnesses.find(base); found != witnesses.end()) dropImportWitness(found);
+    mach_vm_address_t alias = 0;
+    vm_prot_t current = 0;
+    vm_prot_t maximum = 0;
+    const auto status = mach_vm_remap(mach_task_self(), &alias, bytes, 0, VM_FLAGS_ANYWHERE, mach_task_self(), static_cast<mach_vm_address_t>(GuestAddr::HostAddress(base)), FALSE, &current, &maximum, VM_INHERIT_NONE);
+    if (status != KERN_SUCCESS || mach_vm_protect(mach_task_self(), alias, bytes, FALSE, VM_PROT_READ) != KERN_SUCCESS) {
+        std::fprintf(stderr, "[import-pages] no witness for the import of 0x%llx+0x%llx (mach_vm_remap %d, max protection 0x%x)\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), status, maximum);
+        if (status == KERN_SUCCESS) mach_vm_deallocate(mach_task_self(), alias, bytes);
+        return;
+    }
+    witnesses.insert_or_assign(base, ImportWitness{bytes, alias, false});
+}
+
+// Under the imports mutex.
+void verifyImportWitnesses(const std::map<std::uint64_t, HostImport>& imports) {
+    if (!importWitnessesEnabled()) return;
+    static auto last = std::chrono::steady_clock::now();
+    static const auto started = last;
+    static std::uint64_t rounds = 0;
+    const auto now = std::chrono::steady_clock::now();
+    if (now - last < std::chrono::milliseconds(500)) return;
+    last = now;
+    auto& witnesses = importWitnesses();
+    const std::uint64_t page = static_cast<std::uint64_t>(::getpagesize());
+    constexpr std::uint64_t chunk = 64;
+    std::uint64_t compared = 0;
+    for (auto it = witnesses.begin(); it != witnesses.end();) {
+        const auto current = it++;
+        const auto base = current->first;
+        auto& witness = current->second;
+        const auto import = imports.find(base);
+        if (import == imports.end() || import->second.bytes != witness.bytes) {
+            dropImportWitness(current);
+            continue;
+        }
+        if (witness.reported || !GuestMemory::Accessible(reinterpret_cast<const void*>(base), static_cast<std::size_t>(witness.bytes), false)) continue;
+        const auto* guest = GuestAddr::HostPtr<const std::uint8_t>(base);
+        const auto* alias = reinterpret_cast<const std::uint8_t*>(witness.alias);
+        std::uint64_t differing = 0;
+        std::uint64_t first = 0;
+        for (std::uint64_t at = 0; at < witness.bytes; at += page) {
+            bool differs = false;
+            for (std::uint64_t offset = 0; offset + chunk <= page && at + offset + chunk <= witness.bytes && !differs; offset += page / 8) {
+                differs = true;
+                for (int attempt = 0; attempt < 3 && differs; ++attempt) differs = std::memcmp(guest + at + offset, alias + at + offset, chunk) != 0;
+            }
+            if (!differs) continue;
+            if (differing++ == 0) first = at;
+        }
+        compared += witness.bytes / page;
+        if (differing == 0) continue;
+        witness.reported = true;
+        std::fprintf(stderr, "[import-pages] %.1f s: the import of 0x%llx+0x%llx (made by %s, joined %d) no longer covers the pages its range maps: %llu of %llu pages differ from the imported pages, first 0x%llx\n", std::chrono::duration<double>(now - started).count(), static_cast<unsigned long long>(base), static_cast<unsigned long long>(witness.bytes), "import", import->second.joined ? 1 : 0, static_cast<unsigned long long>(differing), static_cast<unsigned long long>(witness.bytes / page), static_cast<unsigned long long>(base + first));
+    }
+    if ((++rounds & (rounds - 1)) == 0 || rounds % 20 == 0) std::fprintf(stderr, "[import-pages] %.1f s: round %llu, %zu imports witnessed, %llu pages compared in %.1f ms\n", std::chrono::duration<double>(now - started).count(), static_cast<unsigned long long>(rounds), witnesses.size(), static_cast<unsigned long long>(compared), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - now).count());
+}
+#else
+void noteImportWitness(std::uint64_t, std::uint64_t) {}
+void verifyImportWitnesses(const std::map<std::uint64_t, HostImport>&) {}
+#endif
+
 const HostImport* peekImport(const HostImports& state, std::uint64_t begin, std::uint64_t end);
 const HostImport* findImport(HostImports& state, std::uint64_t begin, std::uint64_t end);
 const HostImport* importRunAt(const Context& context, HostImports& state, ImportRun run, bool joined, std::uint64_t address, const GuestAllocations::Lease& lease, std::uint64_t end, bool evict, ImportRequester requester);
@@ -2473,8 +2654,8 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
         bool boundsRefused = false;
         try {
             entry.alias = entry.ranges.size() == 1
-                ? GuestArena::GuestArenaMapAliasForImport_nid_no_patch(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes), &boundsRefused)
-                : GuestArena::GuestArenaMapAlias_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes));
+                ? GuestArena::GuestArenaMapAliasForImport_nid_no_patch(GuestAddr::HostAddress(base), static_cast<std::size_t>(bytes), &boundsRefused)
+                : GuestArena::GuestArenaMapAlias_nid_postfix(GuestAddr::HostAddress(base), static_cast<std::size_t>(bytes));
         } catch (const std::runtime_error&) {
             if (entry.ranges.size() == 1) {
                 if (!boundsRefused) throw;
@@ -2497,6 +2678,10 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
 #endif
     const bool watchedHostPointer = watching.hostPointer;
     const bool watchedDmaBuf = watching.dmaBuf;
+#ifdef __APPLE__
+    static const bool traceResidency = std::getenv("APS5_IMPORT_RESIDENCY") != nullptr;
+    const GuestPageCounts residentBefore = traceResidency ? queryGuestPages(base, bytes) : GuestPageCounts{};
+#endif
 #ifndef _WIN32
     const bool dmaBufOnly = state.dmaBufSelected && sharedBacked(context, base, bytes);
 #else
@@ -2566,6 +2751,13 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     }
 #endif
     entry.unwatched = step == nullptr && !(entry.dmaBuf ? watchedDmaBuf : watchedHostPointer);
+#ifdef __APPLE__
+    if (traceResidency && step == nullptr) {
+        const auto after = queryGuestPages(base, bytes);
+        const double page = static_cast<double>(::getpagesize());
+        std::fprintf(stderr, "[import-res] made 0x%llx+%.1fMiB by %s present=%llu: resident before %.1f MiB after %.1f MiB (dirty %.1f -> %.1f MiB)\n", static_cast<unsigned long long>(base), bytes / 1048576.0, ImportRequesterName(requester), static_cast<unsigned long long>(Recorder::Presents()), residentBefore.present * page / 1048576.0, after.present * page / 1048576.0, residentBefore.dirty * page / 1048576.0, after.dirty * page / 1048576.0);
+    }
+#endif
     if (step != nullptr) {
 #ifdef _WIN32
         GuestArena::GuestArenaUnmapAlias_nid_postfix(std::exchange(entry.alias, nullptr));
@@ -2625,8 +2817,11 @@ const HostImport* importRunAt(const Context& context, HostImports& state, Import
     for (auto it = state.refusals.lower_bound({base, 0}); it != state.refusals.end() && it->first.first < base + bytes;) it = it->first.first + it->first.second <= base + bytes ? state.refusals.erase(it) : std::next(it);
     if (trace) std::fprintf(stderr, "[gpu] host import of 0x%llx+0x%llx ok (%zu live, %.1f MiB live, %.1f MiB ever)%s by %s\n", static_cast<unsigned long long>(base), static_cast<unsigned long long>(bytes), state.imports.size() + 1, state.liveBytes / 1048576.0, importedBytes / 1048576.0, joined ? ", joined at bind" : "", ImportRequesterName(requester));
     entry.joined = joined;
+    entry.requester = static_cast<std::uint8_t>(requester);
+    entry.madeAtPresent = Recorder::Presents();
     entry.lastUse = ++state.useCounter;
     state.pendingImports.insert(base);
+    noteImportWitness(base, bytes);
 #ifdef _WIN32
     if (deferredSettles.load(std::memory_order_relaxed) && entry.alias == nullptr && state.watchPrivateImports && writable) {
         if (entry.unwatched) {
@@ -3274,7 +3469,7 @@ constexpr std::uint8_t SparseZero = 2;
 // Compares a block's guest bytes with the mirror's shadow and copies a changed block into the device
 bool compareBlock(const RefreshBlock& block) {
     const auto offset = static_cast<std::size_t>(block.address - block.mirror->base);
-    const auto* guest = reinterpret_cast<const std::byte*>(block.address);
+    const auto* guest = GuestAddr::HostPtr<const std::byte>(block.address);
     if (block.mirror->resident != nullptr) {
         auto* target = block.mirror->resident->Block(block.address);
         if (block.fill == SparseZero) {
@@ -4505,12 +4700,12 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
         if (!collect(probe.writtenAfterSecondSubmit)) return "the collect after the second submission";
         if (const char* step = execute(commands[1])) return step;
         if (!collect(probe.writtenAfterFill)) return "the collect after the fill";
-        *reinterpret_cast<volatile std::uint8_t*>(base) = 2;
+        *GuestAddr::HostPtr<volatile std::uint8_t>(base) = 2;
         if (!collect(probe.writtenByCpu)) return "the collect after a CPU store";
-        for (std::uint64_t offset = 0; offset < bytes; offset += 4096) reinterpret_cast<volatile std::uint8_t*>(base)[offset] = 4;
+        for (std::uint64_t offset = 0; offset < bytes; offset += 4096) GuestAddr::HostPtr<volatile std::uint8_t>(base)[offset] = 4;
         if (const char* step = execute(commands[2])) return step;
         for (std::uint64_t offset = 0; offset < bytes; offset += 4096) {
-            if (reinterpret_cast<volatile std::uint8_t*>(base)[offset] != 5) ++probe.staleAfterFill;
+            if (GuestAddr::HostPtr<volatile std::uint8_t>(base)[offset] != 5) ++probe.staleAfterFill;
         }
         return nullptr;
     };
@@ -4526,7 +4721,7 @@ void runImportProbe(const Context& context, std::uint64_t base, std::uint64_t by
 #ifndef _WIN32
 bool collectWriteWatch(std::uint64_t base, std::uint64_t bytes, std::uint32_t& pages) {
     pages = 0;
-    return GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(static_cast<std::uintptr_t>(base), static_cast<std::size_t>(bytes), [](void* count, std::uintptr_t begin, std::uintptr_t end) { *static_cast<std::uint32_t*>(count) += static_cast<std::uint32_t>((end - begin) / 4096); }, &pages);
+    return GuestWriteWatch::GuestWriteWatchCollect_nid_postfix(GuestAddr::HostAddress(base), static_cast<std::size_t>(bytes), [](void* count, std::uintptr_t begin, std::uintptr_t end) { *static_cast<std::uint32_t*>(count) += static_cast<std::uint32_t>((end - begin) / 4096); }, &pages);
 }
 #endif
 
@@ -4548,8 +4743,8 @@ ImportProbe ProbeImportWriteProtection(const Context& context) {
         probe.failure = "VirtualAlloc";
         return probe;
     }
-    const auto base = (reinterpret_cast<std::uint64_t>(raw) + alignment - 1) / alignment * alignment;
-    auto* scratch = reinterpret_cast<volatile std::uint8_t*>(base);
+    const auto base = GuestAddr::GuestAddress((reinterpret_cast<std::uintptr_t>(raw) + alignment - 1) / alignment * alignment);  // a host scratch range, named by its guest-domain address
+    auto* scratch = GuestAddr::HostPtr<volatile std::uint8_t>(base);
     for (std::uint64_t offset = 0; offset < bytes; offset += page) scratch[offset] = 1;
     std::vector<void*> written(static_cast<std::size_t>(bytes / page));
     const auto collect = [&](std::uint32_t& pages) {
@@ -4581,12 +4776,12 @@ ImportProbe ProbeImportWriteProtection(const Context& context) {
         probe.failure = "mmap";
         return probe;
     }
-    const auto base = (reinterpret_cast<std::uint64_t>(raw) + alignment - 1) / alignment * alignment;
-    auto* scratch = reinterpret_cast<volatile std::uint8_t*>(base);
+    const auto base = GuestAddr::GuestAddress((reinterpret_cast<std::uintptr_t>(raw) + alignment - 1) / alignment * alignment);  // a host scratch range, named by its guest-domain address
+    auto* scratch = GuestAddr::HostPtr<volatile std::uint8_t>(base);
     for (std::uint64_t offset = 0; offset < bytes; offset += page) scratch[offset] = 1;
-    if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
+    if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(GuestAddr::HostPtr<const void>(base), bytes);
     runImportProbe(context, base, bytes, [&](HostImport& import, VkResult& result) { return createImport(context, import, result, false); }, [&](std::uint32_t& pages) { return collectWriteWatch(base, bytes, pages); }, probe);
-    if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
+    if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(GuestAddr::HostPtr<const void>(base), bytes);
     munmap(raw, bytes + alignment);
     return probe;
 #endif
@@ -4623,10 +4818,10 @@ ImportProbe ProbeDmaBufImportWriteProtection(const Context& context) {
         probe.failure = "the shared scratch mapping";
         return probe;
     }
-    const auto base = reinterpret_cast<std::uint64_t>(mapped);
-    auto* scratch = reinterpret_cast<volatile std::uint8_t*>(base);
+    const auto base = GuestAddr::HostToGuest(mapped);
+    auto* scratch = GuestAddr::HostPtr<volatile std::uint8_t>(base);
     for (std::uint64_t offset = 0; offset < bytes; offset += page) scratch[offset] = 1;
-    if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
+    if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(GuestAddr::HostPtr<const void>(base), bytes);
     runImportProbe(context, base, bytes, [&](HostImport& import, VkResult& result) -> const char* {
         const int copy = dup(file);
         if (copy < 0) {
@@ -4636,7 +4831,7 @@ ImportProbe ProbeDmaBufImportWriteProtection(const Context& context) {
         const GuestArena::SharedBackingRun whole{0, import.bytes};
         return createDmaBufImport(context, import, copy, std::span<const GuestArena::SharedBackingRun>(&whole, 1), result);
     }, [&](std::uint32_t& pages) { return GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix() ? collectWriteWatch(base, bytes, pages) : (pages = 0, true); }, probe);
-    if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(reinterpret_cast<const void*>(base), bytes);
+    if (GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) GuestWriteWatch::GuestWriteWatchUnregister_nid_postfix(GuestAddr::HostPtr<const void>(base), bytes);
     munmap(mapped, bytes);
     close(file);
     return probe;
@@ -4800,6 +4995,39 @@ std::uint64_t HostImportBudgetRemaining(const Context& context) {
     const auto budget = effectiveBudget(context, state);
     const auto pinned = pinnedTotal(state);
     return budget > pinned ? budget - pinned : 0;
+}
+
+
+void LogHostImportResidency(const char* tag) {
+#ifdef __APPLE__
+    struct Row {
+        std::uint64_t base, bytes, age, madeAt;
+        bool joined;
+        std::uint8_t requester;
+        std::size_t ranges;
+    };
+    std::vector<Row> rows;
+    std::uint64_t now = 0;
+    {
+        auto& state = Imports();
+        std::lock_guard lock(state.mutex);
+        now = state.useCounter;
+        for (const auto& [base, entry] : state.imports) rows.push_back({entry.base, entry.bytes, state.useCounter - entry.lastUse, entry.madeAtPresent, entry.joined, entry.requester, entry.ranges.size()});
+    }
+    const double page = static_cast<double>(::getpagesize());
+    std::uint64_t total = 0, present = 0, dirty = 0, out = 0;
+    for (const auto& row : rows) {
+        const auto counts = queryGuestPages(row.base, row.bytes);
+        total += row.bytes;
+        present += counts.present;
+        dirty += counts.dirty;
+        out += counts.pagedOut;
+        std::fprintf(stderr, "[import-res] %s 0x%llx+%.1fMiB by %s%s ranges=%zu made@present=%llu idle=%llu uses | resident %.1f MiB dirty %.1f MiB paged-out %.1f MiB\n", tag, static_cast<unsigned long long>(row.base), row.bytes / 1048576.0, ImportRequesterName(static_cast<ImportRequester>(row.requester)), row.joined ? " joined" : "", row.ranges, static_cast<unsigned long long>(row.madeAt), static_cast<unsigned long long>(row.age), counts.present * page / 1048576.0, counts.dirty * page / 1048576.0, counts.pagedOut * page / 1048576.0);
+    }
+    std::fprintf(stderr, "[import-res] %s total %zu imports %.1f MiB virtual, guest-side resident %.1f MiB dirty %.1f MiB paged-out %.1f MiB (useCounter %llu)\n", tag, rows.size(), total / 1048576.0, present * page / 1048576.0, dirty * page / 1048576.0, out * page / 1048576.0, static_cast<unsigned long long>(now));
+#else
+    static_cast<void>(tag);
+#endif
 }
 
 const char* ImportRequesterName(ImportRequester requester) {
@@ -5051,6 +5279,9 @@ bool ImportMappedRanges(const Context& context, const GuestAllocations::Mapped& 
                 if (leasedRangeOwner(current, range->address) != range) continue;
             }
             if (!state.importedAtMap.emplace(range->address, range->bytes).second && findImport(state, range->address, range->address + range->bytes) == nullptr) continue;
+            // APS5_NO_MAP_IMPORT=1: no whole-range import at map time. Metal wires a no-copy buffer whole while it is in the
+            // residency set, so a 4.6 GiB range costs 4.6 GiB of RAM; the Build/Access paths import 64 MiB windows on demand.
+            if (std::getenv("APS5_NO_MAP_IMPORT") != nullptr) continue;
             importAllocation(context, state, range->address, current, ImportRequester::Map, 0, false);
         } catch (const DmaBufImportFailure&) {
             throw;
@@ -5271,6 +5502,7 @@ void GuestBufferMemory::AcquireRegistered() {
                 spaces.current.compare_exchange_strong(expected, current);
             }
             importFloor = state.useCounter + 1;
+            verifyImportWitnesses(state.imports);
             if (hit) {
                 const auto stamp = ++state.useCounter;
                 static const bool stampOnce = std::getenv("APS5_NO_SPACE_STAMP_ONCE") == nullptr;
@@ -5332,6 +5564,7 @@ void GuestBufferMemory::AcquireRegistered() {
             auto& state = Imports();
             std::lock_guard lock(state.mutex);
             if (importable) refreshImports(context, state, lease);
+            verifyImportWitnesses(state.imports);
             if (importFloor == 0) importFloor = state.useCounter + 1;
             state.buildFloor = importFloor;
             if (importable) promoteGrowth(context, state, lease);
@@ -5888,7 +6121,7 @@ void noteEpochMirrors(bool reused, const GuestBufferMemory::AddressSpace& space)
                 const auto next = std::min(region.end, (at / block + 1) * block);
                 const auto offset = static_cast<std::size_t>(at - mirror.base);
                 compared.fetch_add(1, std::memory_order_relaxed);
-                if (std::memcmp(mirror.shadow.data() + offset, reinterpret_cast<const void*>(at), static_cast<std::size_t>(next - at)) != 0) differing.fetch_add(1, std::memory_order_relaxed);
+                if (std::memcmp(mirror.shadow.data() + offset, GuestAddr::HostPtr<const void>(at), static_cast<std::size_t>(next - at)) != 0) differing.fetch_add(1, std::memory_order_relaxed);
                 at = next;
             }
         }
@@ -5968,7 +6201,7 @@ SnapshotService GuestBufferMemory::SnapshotsServedInPlace(std::span<const GuestM
         if (overlap != BaseOverlap::Inside || owner == nullptr) return SnapshotService::Outside;
         if (!(owner->writable || owner->hostBacked || owner->mirror != nullptr)) return SnapshotService::Outside;
         if (AnyShadowedOverlaps(snapshot.address, snapshot.bytes.size())) return SnapshotService::Changed;
-        if (std::memcmp(reinterpret_cast<const void*>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()) != 0) return SnapshotService::Changed;
+        if (std::memcmp(GuestAddr::HostPtr<const void>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()) != 0) return SnapshotService::Changed;
     }
     return SnapshotService::Served;
 }
@@ -6018,7 +6251,7 @@ void GuestBufferMemory::AddSnapshot(const GuestMemorySnapshot& snapshot) {
             return;
         }
         const auto offset = static_cast<std::size_t>(snapshot.address - owner->begin);
-        const auto* source = live ? reinterpret_cast<const std::byte*>(snapshot.address) : owner->snapshot.data() + offset;
+        const auto* source = live ? GuestAddr::HostPtr<const std::byte>(snapshot.address) : owner->snapshot.data() + offset;
         if (std::memcmp(source, snapshot.bytes.data(), snapshot.bytes.size()) != 0) {
             std::size_t first = 0;
             while (first < snapshot.bytes.size() && source[first] == snapshot.bytes[first]) ++first;
@@ -7046,7 +7279,7 @@ void GuestBufferMemory::recordGpuCopies(std::span<Region* const> copies, bool ad
         auto copyOffset = region->begin - region->copySourceBase;
         if (!pendingWriter && !writable) {
             inputSnapshot = std::make_shared<Buffer>(context, static_cast<std::size_t>(bytes), VK_BUFFER_USAGE_TRANSFER_SRC_BIT);
-            std::memcpy(inputSnapshot->Bytes().data(), reinterpret_cast<const void*>(address), static_cast<std::size_t>(bytes));
+            std::memcpy(inputSnapshot->Bytes().data(), GuestAddr::HostPtr<const void>(address), static_cast<std::size_t>(bytes));
             copySource = inputSnapshot->Handle();
             copyOffset = 0;
             recorder->Keep(inputSnapshot, inputSnapshot->Bytes().size());
@@ -7232,6 +7465,15 @@ void GuestBufferMemory::RecordCopyBacks(Recorder& recorder) {
     Recorder::CountBarriers(Recorder::CommandClass::StagingOut);
     recorder.MarkCovered(copiedAccess);
     recorder.EndGpuTiming(timing, copiedBytes);
+}
+
+std::string GuestBufferMemory::DebugOwner(std::uint64_t address, std::size_t bytes) const {
+    const auto* found = owner(address, address + bytes);
+    if (found == nullptr) return "no owner";
+    const auto& region = *found;
+    char text[400];
+    std::snprintf(text, sizeof(text), "owner [0x%llx,0x%llx) %s%s%s%s%s%s%s%s%s snapshot=%zu importBase=0x%llx importBuffer=0x%llx roAtCreate=%u copySource=0x%llx space=%d", static_cast<unsigned long long>(region.begin), static_cast<unsigned long long>(region.end), region.direct != nullptr ? "direct " : "", region.mirror != nullptr ? "mirror " : "", region.buffer != nullptr ? "ownbuffer " : "", region.gpuCopy ? "gpuCopy " : "", region.deviceLocal ? "deviceLocal " : "", region.overlay ? "overlay " : "", region.hostBacked ? "hostBacked " : "", region.sparse ? "sparse " : "", region.writable ? "writable" : "readonly", region.snapshot.size(), region.direct != nullptr ? static_cast<unsigned long long>(region.direct->base) : 0ull, region.direct != nullptr ? reinterpret_cast<unsigned long long>(region.direct->buffer) : 0ull, region.direct != nullptr ? region.direct->readOnlyAtCreate : 0u, reinterpret_cast<unsigned long long>(region.copySource), space != nullptr ? 1 : 0);
+    return text;
 }
 
 VkDescriptorBufferInfo GuestBufferMemory::Descriptor(std::uint64_t address, std::size_t bytes, std::uint32_t& adjustment) const {
@@ -7897,6 +8139,43 @@ HostImportsProof HostImportsIdentity(const Context& context) {
     std::lock_guard lock(state.mutex);
     if (importsStale(context, state)) return {};
     return {state.device, state.epoch, state.refreshedGeneration, state.inserted};
+}
+
+// Debug aid (APS5_TRACE_VOLUME): how the GPU sees [address, address + bytes) through a host import: the import, the device
+// address the bytes have in it, and (with APS5_VERIFY_IMPORT_PAGES=1) whether the witness mapping of the imported pages
+// still holds the bytes guest memory holds.
+std::string DebugDescribeImportAt(std::uint64_t address, std::size_t bytes) {
+    auto& state = Imports();
+    std::lock_guard lock(state.mutex);
+    auto it = state.imports.upper_bound(address);
+    if (it == state.imports.begin()) return "no import";
+    --it;
+    const auto& entry = it->second;
+    if (address >= entry.base + entry.bytes) return "no import";
+    char text[512];
+    int used = std::snprintf(text, sizeof(text), "import 0x%llx+0x%llx roAtCreate=%u joined=%d ranges=%zu unwatched=%d epoch=%llu", static_cast<unsigned long long>(entry.base), static_cast<unsigned long long>(entry.bytes), entry.readOnlyAtCreate, entry.joined ? 1 : 0, entry.ranges.size(), entry.unwatched ? 1 : 0, static_cast<unsigned long long>(state.epoch));
+#ifdef __APPLE__
+    if (importWitnessesEnabled()) {
+        const auto found = importWitnesses().find(entry.base);
+        if (found == importWitnesses().end()) {
+            std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), " witness=none");
+        } else {
+            const auto span = std::min<std::uint64_t>(bytes, entry.base + entry.bytes - address);
+            const auto* alias = reinterpret_cast<const std::uint8_t*>(found->second.alias) + (address - entry.base);
+            const auto* guest = GuestAddr::HostPtr<const std::uint8_t>(address);
+            std::uint64_t first = span;
+            for (std::uint64_t at = 0; at < span; ++at) {
+                if (alias[at] != guest[at]) {
+                    first = at;
+                    break;
+                }
+            }
+            if (first == span) std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), " witness=same");
+            else std::snprintf(text + used, sizeof(text) - static_cast<std::size_t>(used), " witness=DIFFERS at +%llu (imported %02x%02x%02x%02x guest %02x%02x%02x%02x)", static_cast<unsigned long long>(first), alias[first], alias[std::min(first + 1, span - 1)], alias[std::min(first + 2, span - 1)], alias[std::min(first + 3, span - 1)], guest[first], guest[std::min(first + 1, span - 1)], guest[std::min(first + 2, span - 1)], guest[std::min(first + 3, span - 1)]);
+        }
+    }
+#endif
+    return text;
 }
 
 }

@@ -1,4 +1,5 @@
 #include "prx/libSceAgc/Command/include/Draw.hpp"
+#include "prx/libSceAgc/include/GuestPtr.hpp"
 #include "prx/libSceAgc/DcbDraw/include/DrawNonIndexed.hpp"
 
 #include "prx/libSceAgc/Command/include/Packet.hpp"
@@ -22,7 +23,7 @@ std::uint32_t APS5_VABI sceAgcDcbDrawIndirectGetSize() {
 std::uint32_t* APS5_VABI sceAgcDcbDrawIndirectMulti(CommandBuffer* buf, std::uint32_t dataOffsetInBytes, std::uint32_t countIndirect, std::uint32_t maxCountOrCount, const volatile void* countAddress, std::uint32_t strideInBytes, std::uint64_t modifier) {
     Agc::Command::CheckBits(countIndirect, 1, __func__);
     Agc::Command::Require((dataOffsetInBytes & 3u) == 0 && (strideInBytes & 3u) == 0 && strideInBytes >= 16, __func__, "invalid indirect draw offset or stride");
-    const auto address = reinterpret_cast<std::uintptr_t>(countAddress);
+    const auto address = Agc::Guest::Address(countAddress);
     if (countIndirect != 0) {
         Agc::Command::CheckAddress(address, 4, __func__);
     } else {

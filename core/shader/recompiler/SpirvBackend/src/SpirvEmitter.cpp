@@ -298,11 +298,15 @@ std::vector<std::uint32_t> SpirvEmitter::Emit(const IrProgram& program, const Sh
         state.requirements.ldsBufferInt64Atomics = true;
     }
     const bool int64Atomics = std::ranges::find(state.supportedCapabilities, static_cast<std::uint32_t>(spv::CapabilityInt64Atomics)) != state.supportedCapabilities.end();
-    if (!int64Atomics && state.requirements.bufferInt64Atomics && !state.requirements.bufferInt64AtomicsExact) {
+    if (!int64Atomics && state.requirements.bufferInt64Atomics && state.requirements.bufferInt64AtomicsPlainOnly) {
+        // nps5: an atomic 64-bit load or store only; one aligned 64-bit access needs no 64-bit atomic (docs/nps5-atomics64.md).
+        state.requirements.bufferInt64Atomics = false;
+        state.requirements.bufferInt64AtomicsPlain = true;
+    } else if (!int64Atomics && state.requirements.bufferInt64Atomics && !state.requirements.bufferInt64AtomicsExact) {
         state.requirements.bufferInt64Atomics = false;
         state.requirements.bufferInt64AtomicsSplit = true;
     }
-    state.requirements.bufferU64View = state.requirements.bufferInt64Atomics || (state.requirements.coherentBufferPairs && int64Atomics);
+    state.requirements.bufferU64View = state.requirements.bufferInt64Atomics || state.requirements.bufferInt64AtomicsPlain || (state.requirements.coherentBufferPairs && int64Atomics);
     if (HostSubgroupSingleLane(state)) {
         state.requirements.subgroupBallot = false;
         state.requirements.subgroupShuffle = false;

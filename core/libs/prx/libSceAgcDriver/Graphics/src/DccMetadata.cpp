@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/DccMetadata.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/GuestBufferMemory.hpp"
@@ -330,7 +331,7 @@ LandedKeys KeysAfterPendingWrites(const Recorder& recorder, std::uint64_t begin,
     }
     for (const auto& [from, to] : unwritten) {
         if (landed.mixed) break;
-        const auto* keys = reinterpret_cast<const std::uint8_t*>(from);
+        const auto* keys = GuestAddr::HostPtr<const std::uint8_t>(from);
         if (AllKeysEqual(keys + 1, static_cast<std::size_t>(to - from) - 1, keys[0])) see(keys[0]);
         else landed.mixed = true;
     }
@@ -367,7 +368,7 @@ std::optional<DccKeys> PendingStoreKeys(Recorder& recorder, std::uint64_t begin,
 // Whether the keys already read as uncompressed: scans the same bytes as ReadDccKeys, so it counts
 // as a scan too.
 bool AlreadyUncompressed(std::uint64_t metaAddress, std::size_t count) {
-    const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
+    const auto* keys = GuestAddr::HostPtr<const std::uint8_t>(metaAddress);
     const auto start = ScanProfileEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool uncompressed = AllKeysEqual(keys, count, 0xff);
     if (ScanProfileEnabled()) CountScan(count, start);
@@ -509,7 +510,7 @@ DccKeys readDccKeys(std::uint64_t metaAddress, std::size_t count, bool& memoized
             recorder->SyncThrough(metaAddress, count);
         }
     }
-    const auto* keys = reinterpret_cast<const std::uint8_t*>(metaAddress);
+    const auto* keys = GuestAddr::HostPtr<const std::uint8_t>(metaAddress);
     const auto first = keys[0];
     const auto start = ScanProfileEnabled() ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     const bool uniform = AllKeysEqual(keys + 1, count - 1, first);
@@ -624,7 +625,7 @@ std::optional<std::uint8_t> LandedUniformMetadataByte(std::uint64_t address, std
         if (landed.mixed || landed.unknown || landed.value < 0) return std::nullopt;
         return static_cast<std::uint8_t>(landed.value);
     }
-    const auto* data = reinterpret_cast<const std::uint8_t*>(address);
+    const auto* data = GuestAddr::HostPtr<const std::uint8_t>(address);
     if (!AllKeysEqual(data + 1, bytes - 1, data[0])) return std::nullopt;
     return data[0];
 }

@@ -14,7 +14,9 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <sstream>
 #include <unordered_set>
+#include <vector>
 
 #include "SDL_keyboard.h"
 #include "SDL_filesystem.h"
@@ -415,6 +417,121 @@ void Pad::ApplyInputMapping(InputConfiguration& configuration, std::istream& inp
 
 namespace {
 
+// A just-enough JSON reader for the input file: objects, arrays, strings, numbers, booleans and null.
+struct JsonReader {
+    std::string_view text;
+    std::size_t pos = 0;
+    std::string_view source;
+
+    [[noreturn]] void fail(const std::string& what) const {
+        throw std::runtime_error("Pad: invalid input mapping " + std::string(source) + ": " + what + " (at byte " + std::to_string(pos) + ")");
+    }
+    void skip() {
+        while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos])) != 0) ++pos;
+    }
+    bool take(char c) {
+        skip();
+        if (pos < text.size() && text[pos] == c) { ++pos; return true; }
+        return false;
+    }
+    void expect(char c) {
+        if (!take(c)) fail(std::string("expected '") + c + "'");
+    }
+    std::string string() {
+        expect('"');
+        std::string out;
+        while (pos < text.size() && text[pos] != '"') {
+            char c = text[pos++];
+            if (c == '\\' && pos < text.size()) {
+                const char e = text[pos++];
+                switch (e) {
+                    case 'n': c = '\n'; break;
+                    case 't': c = '\t'; break;
+                    case 'u': fail("\\u escapes are not supported");
+                    default: c = e; break;
+                }
+            }
+            out.push_back(c);
+        }
+        if (pos >= text.size()) fail("unterminated string");
+        ++pos;
+        return out;
+    }
+    // A scalar becomes its text ("true"/"false" for booleans; null is empty).
+    std::string scalar() {
+        skip();
+        if (pos < text.size() && text[pos] == '"') return string();
+        const auto start = pos;
+        while (pos < text.size() && (std::isalnum(static_cast<unsigned char>(text[pos])) != 0 || text[pos] == '.' || text[pos] == '-' || text[pos] == '+')) ++pos;
+        if (start == pos) fail("expected a value");
+        const std::string word(text.substr(start, pos - start));
+        return word == "null" ? std::string() : word;
+    }
+    // Reads a member value as a list of scalars (a scalar is a one-element list).
+    std::vector<std::string> values() {
+        std::vector<std::string> out;
+        if (take('[')) {
+            if (take(']')) return out;
+            do out.push_back(scalar()); while (take(','));
+            expect(']');
+        } else {
+            out.push_back(scalar());
+        }
+        return out;
+    }
+};
+
+void jsonSection(JsonReader& reader, std::string& ini, bool bindings) {
+    reader.expect('{');
+    if (reader.take('}')) return;
+    do {
+        const auto key = reader.string();
+        reader.expect(':');
+        for (const auto& value : reader.values()) {
+            if (bindings && value.empty()) continue;
+            ini += key + " = " + value + "\n";
+        }
+    } while (reader.take(','));
+    reader.expect('}');
+}
+
+}
+
+std::string Pad::InputJsonToIni(std::string_view json, std::string_view source) {
+    JsonReader reader{json, 0, source};
+    if (json.starts_with("\xEF\xBB\xBF")) reader.pos = 3;
+    std::string ini;
+    reader.expect('{');
+    if (!reader.take('}')) {
+        do {
+            const auto key = reader.string();
+            reader.expect(':');
+            const auto lower = upper(key);
+            if (lower == "BINDINGS") jsonSection(reader, ini, true);
+            else if (lower == "SETTINGS") jsonSection(reader, ini, false);
+            else if (lower == "$COMMENT" || lower == "COMMENT" || lower == "VERSION") reader.values();
+            else for (const auto& value : reader.values()) ini += key + " = " + value + "\n"; // flat form: "Cross": "KEY:Return"
+        } while (reader.take(','));
+        reader.expect('}');
+    }
+    reader.skip();
+    if (reader.pos != json.size()) reader.fail("unexpected text after the closing brace");
+    return ini;
+}
+
+void Pad::ApplyInputMappingJson(InputConfiguration& configuration, std::string_view json, std::string_view source) {
+    std::istringstream stream(InputJsonToIni(json, source));
+    applyInputStream(configuration, stream, source);
+}
+
+std::filesystem::path Pad::InputJsonPath() {
+    if (const char* configured = std::getenv("NPS5_INPUT_JSON")) return configured;
+    if (const char* home = std::getenv("HOME")) return std::filesystem::path(home) / "Library" / "Application Support" / "nativeps5" / "input.json";
+    return {};
+}
+
+namespace {
+
 Pad::InputFileStamp fileStamp(const std::filesystem::path& path) {
     Pad::InputFileStamp stamp;
     std::error_code error;
@@ -508,6 +625,13 @@ Pad::InputConfiguration Pad::LoadInputMapping(std::string_view titleId) {
     const auto configured = configuredPath();
     const bool explicitPath = !configured.empty();
     const std::filesystem::path path = explicitPath ? configured : defaultConfigPath();
+    if (const auto jsonPath = Pad::InputJsonPath(); !jsonPath.empty() && std::filesystem::is_regular_file(jsonPath)) {
+        std::ifstream file(jsonPath);
+        if (!file) throw std::runtime_error("Pad: cannot read input mapping '" + pathToUtf8(jsonPath) + "'");
+        std::ostringstream content;
+        content << file.rdbuf();
+        Pad::ApplyInputMappingJson(configuration, content.str(), pathToUtf8(jsonPath));
+    }
     if (explicitPath || std::filesystem::exists(path)) loadInputFile(configuration, path);
     const auto profile = InputProfileName(titleId);
     if (!profile.empty()) {

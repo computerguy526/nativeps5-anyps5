@@ -17,6 +17,7 @@ add_library(libSceVideoOut SHARED EXCLUDE_FROM_ALL
         ${CMAKE_CURRENT_SOURCE_DIR}/src/InputMapping.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/KeyboardMouse.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/src/HostHdrProbe.cpp
+        ${CMAKE_CURRENT_SOURCE_DIR}/src/DisplayLinkBeat.cpp
         ${CMAKE_CURRENT_SOURCE_DIR}/../libkernel/Time/TimedWait.cpp
 )
 
@@ -552,3 +553,77 @@ if(BUILD_TESTING)
             "PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceVideoOut>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libScePad>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceIme>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libSceUserService>;PATH=path_list_prepend:$<TARGET_FILE_DIR:libc>")
     endif()
 endif()
+
+# nps5: static flavours for the native arm64 macOS link (SDL2 + Vulkan window, no guest .prx packaging).
+# EXCLUDE_FROM_ALL. nps5_VideoOut is the three requested libraries' VideoOut part;
+# nps5_VideoOutDeps holds the Mouse/Keyboard/Ime sources VideoOut calls into
+# (sources live in their own dirs; compile unchanged on arm64).
+set(NPS5_VIDEO_SRC ${CMAKE_CURRENT_SOURCE_DIR})
+add_library(nps5_VideoOut STATIC EXCLUDE_FROM_ALL
+    ${NPS5_VIDEO_SRC}/Unimplemented.cpp
+    ${NPS5_VIDEO_SRC}/InventoryExports.cpp
+    ${NPS5_VIDEO_SRC}/src/Event.cpp
+    ${NPS5_VIDEO_SRC}/src/Buffer.cpp
+    ${NPS5_VIDEO_SRC}/src/Output.cpp
+    ${NPS5_VIDEO_SRC}/src/VideoOutDriver.cpp
+    ${NPS5_VIDEO_SRC}/src/DisplayWindow.cpp
+    ${NPS5_VIDEO_SRC}/src/HostFullscreen.cpp
+    ${NPS5_VIDEO_SRC}/src/PadInput.cpp
+    ${NPS5_VIDEO_SRC}/src/PadStatusSdl.cpp
+    ${NPS5_VIDEO_SRC}/src/Telemetry.cpp
+    ${NPS5_VIDEO_SRC}/src/MouseInput.cpp
+    ${NPS5_VIDEO_SRC}/src/KeyboardInput.cpp
+    ${NPS5_VIDEO_SRC}/src/ImeTextInput.cpp
+    ${NPS5_VIDEO_SRC}/src/DialogInput.cpp
+    ${NPS5_VIDEO_SRC}/src/InputMapping.cpp
+    ${NPS5_VIDEO_SRC}/src/KeyboardMouse.cpp
+    ${NPS5_VIDEO_SRC}/src/HostHdrProbe.cpp
+    ${NPS5_VIDEO_SRC}/src/DisplayLinkBeat.cpp
+    ${NPS5_VIDEO_SRC}/../libkernel/Time/TimedWait.cpp
+)
+target_include_directories(nps5_VideoOut PRIVATE
+    ${CMAKE_SOURCE_DIR}/core/Decoder/Png/include ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR}
+    ${CMAKE_BINARY_DIR}/core/libs/prx/libSceAgcDriver/generated)
+add_dependencies(nps5_VideoOut agc_trace_revision)
+set_target_properties(nps5_VideoOut PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+
+add_library(nps5_VideoOutDeps STATIC EXCLUDE_FROM_ALL
+    ${NPS5_VIDEO_SRC}/../libSceMouse/InventoryExports.cpp
+    ${NPS5_VIDEO_SRC}/../libSceMouse/Export.cpp
+    ${NPS5_VIDEO_SRC}/../libSceMouse/src/mouse_impl.cpp
+    ${NPS5_VIDEO_SRC}/../libSceKeyboard/Export.cpp
+    ${NPS5_VIDEO_SRC}/../libSceKeyboard/PadEmulate.cpp
+    ${NPS5_VIDEO_SRC}/../libSceKeyboard/src/keyboard_impl.cpp
+    ${NPS5_VIDEO_SRC}/../libSceIme/Export.cpp
+    ${NPS5_VIDEO_SRC}/../libSceIme/src/ModalDialog.cpp
+    ${NPS5_VIDEO_SRC}/../libSceIme/src/PsnDialogNotice.cpp
+)
+target_include_directories(nps5_VideoOutDeps PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR})
+set_target_properties(nps5_VideoOutDeps PROPERTIES CXX_EXTENSIONS OFF POSITION_INDEPENDENT_CODE ON)
+
+# Host smoke test: real DisplayWindow + Vulkan clear/present + pad/user-service poll, no guest code.
+add_executable(nps5_video_pad_smoke EXCLUDE_FROM_ALL ${NPS5_VIDEO_SRC}/smoke/VideoPadSmoke.cpp ${NPS5_VIDEO_SRC}/smoke/HostStubs.cpp)
+target_include_directories(nps5_video_pad_smoke PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/Decoder/Png/include)
+target_link_libraries(nps5_video_pad_smoke PRIVATE nps5_VideoOut nps5_VideoOutDeps nps5_Pad nps5_UserService libSceAgcDriver libkernel libc decoder_png SDL2-static "-framework Cocoa" "-framework CoreFoundation" "-framework CoreVideo" "-framework CoreGraphics")
+set_target_properties(nps5_video_pad_smoke PROPERTIES CXX_EXTENSIONS OFF)
+
+# nps5: one dylib holding VideoOut, Pad, UserService (+ Mouse/Keyboard/Ime) with their exported names.
+# The nativeps5 runtime defines C functions with the same names (its own HLE); a dylib keeps the two sets apart
+# (the runtime reaches these through dlsym on this image, never through the linker). Every object is loaded
+# (-force_load) so every export is present. docs/nps5-int.md.
+# KytyHost.cpp: helpers the runtime's NPS5_GPU=kyty seam reaches through dlsym (event queues, pad, exit); unused otherwise.
+add_library(nps5_gpu SHARED EXCLUDE_FROM_ALL ${CMAKE_SOURCE_DIR}/core/libs/nps5/GpuBridge.cpp ${CMAKE_SOURCE_DIR}/core/libs/nps5/KytyHost.cpp)
+target_include_directories(nps5_gpu PRIVATE ${LIBS_INCLUDE_DIR})
+add_dependencies(nps5_gpu nps5_VideoOut nps5_VideoOutDeps nps5_Pad nps5_UserService)
+target_link_libraries(nps5_gpu PRIVATE
+    "-Wl,-force_load,$<TARGET_FILE:nps5_VideoOut>" "-Wl,-force_load,$<TARGET_FILE:nps5_VideoOutDeps>"
+    "-Wl,-force_load,$<TARGET_FILE:nps5_Pad>" "-Wl,-force_load,$<TARGET_FILE:nps5_UserService>"
+    libSceAgcDriver libkernel libc decoder_png SDL2-static "-framework Cocoa" "-framework CoreFoundation" "-framework CoreVideo" "-framework CoreGraphics")
+set_target_properties(nps5_gpu PROPERTIES CXX_EXTENSIONS OFF
+    LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/core/libs/libs/unpatched BUILD_RPATH "@loader_path")
+
+# nps5: SDL controller host test (virtual joysticks stand in for DualSense / Switch Pro / Xbox). Needs no hardware or window.
+add_executable(nps5_pad_host_tests EXCLUDE_FROM_ALL ${NPS5_VIDEO_SRC}/tests/Nps5PadHost.cpp ${NPS5_VIDEO_SRC}/smoke/HostStubs.cpp)
+target_include_directories(nps5_pad_host_tests PRIVATE ${LIBS_INCLUDE_DIR} ${ANYPS5_SDL2_INCLUDE_DIR} ${ANYPS5_VULKAN_HEADERS_INCLUDE_DIR} ${CMAKE_SOURCE_DIR}/core/Decoder/Png/include)
+target_link_libraries(nps5_pad_host_tests PRIVATE nps5_VideoOut nps5_VideoOutDeps nps5_Pad nps5_UserService libSceAgcDriver libkernel libc decoder_png SDL2-static "-framework Cocoa" "-framework CoreFoundation" "-framework CoreVideo" "-framework CoreGraphics")
+set_target_properties(nps5_pad_host_tests PROPERTIES CXX_EXTENSIONS OFF)

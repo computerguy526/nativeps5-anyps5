@@ -1,4 +1,5 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgc/include/GuestPtr.hpp"
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 
 #include <algorithm>
@@ -67,10 +68,12 @@ void Reserve(CommandBuffer* buffer, std::uint32_t count, const char* function) {
 
 std::uint32_t* Allocate(CommandBuffer* buffer, std::uint32_t count, const char* function) {
     Reserve(buffer, count, function);
-    auto* result = buffer->cursor_up;
-    AgcDriverPrepareCommandWrite_nid_no_patch(reinterpret_cast<std::uint64_t>(result), static_cast<std::size_t>(count) * sizeof(std::uint32_t));
+    // The cursors live in guest-visible memory and hold guest values: advance them in the guest domain, hand the
+    // caller a host pointer to write the packet words through.
+    auto* const guestResult = buffer->cursor_up;
+    AgcDriverPrepareCommandWrite_nid_no_patch(reinterpret_cast<std::uint64_t>(guestResult), static_cast<std::size_t>(count) * sizeof(std::uint32_t));
     buffer->cursor_up += count;
-    return result;
+    return Agc::Guest::Host(guestResult);
 }
 
 std::uint32_t* Emit(CommandBuffer* buffer, std::uint32_t opcode, std::initializer_list<std::uint32_t> payload, const char* function) {
@@ -113,7 +116,7 @@ std::uint32_t* WriteRegisterRange(CommandBuffer* buffer, std::uint32_t opcode, s
 std::uint32_t* WriteRegisters(CommandBuffer* buffer, std::uint32_t opcode, const volatile ShaderRegister* registers, std::uint32_t count, bool snapshotAll, const char* function) {
     if (count == 0) {
         Require(buffer != nullptr, function, "null command buffer");
-        return buffer->cursor_up;
+        return Agc::Guest::Host(buffer->cursor_up);
     }
     CheckAddress(reinterpret_cast<std::uintptr_t>(registers), 1, function);
     const auto* bytes = reinterpret_cast<const std::byte*>(const_cast<const ShaderRegister*>(registers));
@@ -151,7 +154,7 @@ std::uint32_t* WriteRegisters(CommandBuffer* buffer, std::uint32_t opcode, const
 }
 
 std::uint32_t* WriteIndirectRegisters(CommandBuffer* buffer, std::uint32_t opcode, const volatile ShaderRegister* registers, std::uint32_t count, const char* function) {
-    const auto address = reinterpret_cast<std::uintptr_t>(registers);
+    const auto address = Agc::Guest::Address(registers);
     if (address != 0 || count != 0) CheckAddress(address, 4, function);
     CheckBits(count, 0x3fffu, function);
     return Emit(buffer, opcode, {static_cast<std::uint32_t>(address), static_cast<std::uint32_t>(address >> 32u), 0x80000000u, count}, function);
@@ -160,7 +163,7 @@ std::uint32_t* WriteIndirectRegisters(CommandBuffer* buffer, std::uint32_t opcod
 void PatchIndirectAddress(std::uint32_t* packet, std::uint32_t opcode, const volatile ShaderRegister* registers, const char* function) {
     ValidatePacket(packet, opcode, 5, function);
     Require(packet[3] == 0x80000000u && (packet[4] & ~0x3fffu) == 0, function, "invalid indirect register packet");
-    const auto address = reinterpret_cast<std::uintptr_t>(registers);
+    const auto address = Agc::Guest::Address(registers);
     CheckAddress(address, 4, function);
     packet[1] = static_cast<std::uint32_t>(address);
     packet[2] = static_cast<std::uint32_t>(address >> 32u);

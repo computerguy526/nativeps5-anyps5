@@ -19,7 +19,7 @@ void Driver::maybeReportDrawCache(bool profile) {
     auto& counters = drawEntryCounters;
     if (!profile && !traceDrawCache()) return;
     const auto now = std::chrono::steady_clock::now();
-    if (now - counters.lastReport < std::chrono::seconds(10)) return;
+    if (now - counters.lastReport < ProfileInterval()) return;
     reportDrawCache(counters, profile);
     counters.lastReport = now;
 }
@@ -35,6 +35,12 @@ void Driver::reportDrawCache(DrawEntryCounters& counters, bool profile) {
         std::snprintf(line, sizeof(line), "[draw-cache] 10 s: %llu lookups, %llu hits (%.1f%%), %llu stage misses, %llu without an entry, %llu data-only hits (stages: %llu reused, %llu compiled; %llu verified); no entry: new registers %llu, user words/pointers only %llu, evicted %llu, seen but never inserted %llu; stage misses: front differing %llu, fragment differing %llu, other differing %llu, recaptured over queued stores %llu, layout %llu, gate %llu, stage count %llu; differing captures: same runs %llu (%.1f words changed each), other runs %llu; %zu entries, %llu evicted (%llu over the byte budget)\n", count(counters.lookups), count(counters.hits), counters.lookups != 0 ? 100.0 * static_cast<double>(counters.hits) / static_cast<double>(counters.lookups) : 0.0, count(misses), count(counters.absent), count(counters.dataHits), count(counters.dataStagesReused), count(counters.dataStagesCompiled), count(counters.dataVerified), count(counters.absentNewRegisters), count(counters.absentUserWords), count(counters.absentEvicted), count(counters.absentNeverInserted), miss(DrawMiss::FrontDiffering), miss(DrawMiss::FragmentDiffering), miss(DrawMiss::OtherDiffering), miss(DrawMiss::QueuedStores), miss(DrawMiss::Layout), miss(DrawMiss::Gate), miss(DrawMiss::Stages), count(counters.differingSameRuns), counters.differingSameRuns != 0 ? static_cast<double>(counters.differingWords) / static_cast<double>(counters.differingSameRuns) : 0.0, count(counters.differingRunsChanged), drawCache.size(), count(counters.evictions), count(counters.byteEvictions));
         text += line;
         std::snprintf(line, sizeof(line), "[draw-cache] register-key miss component changes (10 s): stable registers %llu, user data %llu, auxiliary registers %llu, device %llu, first shader set %llu, unchanged components %llu\n", count(counters.registerKeyMissChanges[0]), count(counters.registerKeyMissChanges[1]), count(counters.registerKeyMissChanges[2]), count(counters.registerKeyMissChanges[3]), count(counters.registerKeyMissChanges[4]), count(counters.registerKeyMissChanges[5]));
+        text += line;
+    }
+    if (traceDrawCache()) {
+        const auto& s = counters.shapeStage;
+        char line[1024];
+        std::snprintf(line, sizeof(line), "[draw-cache] shape-matched stages (10 s): %llu seen, %llu validated equal (reused), %llu no variants, validate differing %llu, other %llu; used words moved: pointers only (relocatable) %llu, walked but not relocatable %llu, read directly %llu; relocatable probe: content behind the moved pointer equal %llu, differs %llu, unreadable %llu; every moved word forwarded as runtime data %llu, some baked %llu; moved words all vertex-fetch pointers %llu\n", count(s[0]), count(s[1]), count(s[2]), count(s[8]), count(s[9]), count(s[5]), count(s[6]), count(s[7]), count(s[10]), count(s[11]), count(s[12]), count(s[13]), count(s[14]), count(s[15]));
         text += line;
     }
     if (profile) text += profileDrawCacheLines(counters);

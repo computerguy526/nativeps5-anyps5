@@ -6,6 +6,7 @@
 
 #include "SceShaders.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
+#include "prx/libSceAgc/include/GuestPtr.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderUtils.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 
@@ -28,7 +29,7 @@ int APS5_VABI sceAgcCreateShader(Shader** dst, void* header, const volatile void
     if (h->file_header != ShaderRegs::SHADER_FILE_HEADER_MAGIC || h->version != ShaderRegs::SHADER_VERSION) {
         throw std::runtime_error(std::string(fn) + ": invalid shader header or version");
     }
-    const auto base = reinterpret_cast<std::uint64_t>(code);
+    const auto base = Agc::Guest::Address(code);
     if ((base & ShaderRegs::SHADER_BASE_ALIGN_MASK) != 0 || h->shader_size == 0 || (h->shader_size & 3u) != 0) {
         throw std::runtime_error(std::string(fn) + ": invalid shader code address or size");
     }
@@ -42,23 +43,26 @@ int APS5_VABI sceAgcCreateShader(Shader** dst, void* header, const volatile void
     ResolveRelativePtr(h->input_semantics);
     ResolveRelativePtr(h->output_semantics);
 
+    // The header's pointer fields are now guest values; reach the pointees through the host mapping.
     if (h->user_data != nullptr) {
-        ResolveRelativePtr(h->user_data->direct_resource_offset);
-        ResolveRelativePtr(h->user_data->sharp_resource_offset[0]);
-        ResolveRelativePtr(h->user_data->sharp_resource_offset[1]);
-        ResolveRelativePtr(h->user_data->sharp_resource_offset[2]);
-        ResolveRelativePtr(h->user_data->sharp_resource_offset[3]);
+        auto* const userData = Agc::Guest::Host(h->user_data);
+        ResolveRelativePtr(userData->direct_resource_offset);
+        ResolveRelativePtr(userData->sharp_resource_offset[0]);
+        ResolveRelativePtr(userData->sharp_resource_offset[1]);
+        ResolveRelativePtr(userData->sharp_resource_offset[2]);
+        ResolveRelativePtr(userData->sharp_resource_offset[3]);
     }
 
-    h->code = code;
+    h->code = Agc::Guest::Guest(code);
 
-    int result = PatchProgramAddressRegister(h->sh_registers, h->num_sh_registers, h->type, base);
+    int result = PatchProgramAddressRegister(Agc::Guest::Host(h->sh_registers), h->num_sh_registers, h->type, base);
     if (result != 0) {
         return result;
     }
 
-    AgcDriverRegisterShader_nid_postfix(h);
-    *dst = h;
+    // The driver and the title know the header by its guest address.
+    AgcDriverRegisterShader_nid_postfix(Agc::Guest::Guest(h));
+    *dst = Agc::Guest::Guest(h);
     return 0;
 }
 

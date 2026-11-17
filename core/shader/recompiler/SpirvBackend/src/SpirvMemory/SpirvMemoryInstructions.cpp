@@ -943,6 +943,27 @@ std::uint32_t Atomic32(SpirvValueEmitContext& ctx, const IrValue& inst, const Me
 std::uint32_t BufferAtomic64(SpirvValueEmitContext& ctx, const IrValue& inst) {
     auto& state = ctx.state;
     static_cast<void>(BufferMemory(ctx, inst));
+    if (state.requirements.bufferInt64AtomicsPlain) {
+        // The device has no 64-bit atomics and the program needs none: each of its 64-bit buffer atomics is a load (or/xor/add of
+        // zero) or a store (exchange, result unused). One naturally aligned, volatile 64-bit access between device-scope barriers
+        // replaces it; that such an access is not torn is a property of the host GPU, measured for Apple GPUs by mesa/tests/atomics.
+        const bool store = IsPlainStoreBufferAtomic64(&inst);
+        if (!store && !IsPlainLoadBufferAtomic64(&inst)) ctx.Fail(inst, "64-bit buffer atomic needs shaderBufferInt64Atomics");
+        const std::uint32_t memoryAccess = spv::MemoryAccessVolatileMask | spv::MemoryAccessAlignedMask;
+        return EmitRuntimeBufferAtomic(ctx, inst, 64u, ActiveArgument(ctx, inst), [&](std::uint32_t pointer) {
+            if (store) {
+                const auto value = Unary(state, spv::OpBitcast, TypeScalarU64(state), ctx.Arg(inst, inst.ArgumentCount() - 2u));
+                state.module.AddFunction(spv::OpStore, pointer, value, memoryAccess, 8u);
+                EmitDeviceAtomicMemoryBarrier(state);
+                return ConstantU64(state, 0u);
+            }
+            EmitDeviceAtomicMemoryBarrier(state);
+            const auto old = state.module.AllocateId();
+            state.module.AddFunction(spv::OpLoad, TypeScalarU64(state), old, pointer, memoryAccess, 8u);
+            EmitDeviceAtomicMemoryBarrier(state);
+            return Unary(state, spv::OpBitcast, TypeU64(state), old);
+        });
+    }
     if (state.requirements.bufferInt64AtomicsSplit) {
         if (!IsSplittableBufferAtomic64(&inst)) ctx.Fail(inst, "64-bit buffer atomic needs shaderBufferInt64Atomics");
         const auto data = Unary(state, spv::OpBitcast, TypeScalarU64(state), ctx.Arg(inst, inst.ArgumentCount() - 2u));

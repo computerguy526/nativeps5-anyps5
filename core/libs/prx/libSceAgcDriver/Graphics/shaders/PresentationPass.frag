@@ -52,7 +52,29 @@ void main() {
         color = texel(pixel);
         return;
     }
-    vec2 position = (vec2(pixel) + 0.5) * vec2(parameters.sourceSize) / vec2(parameters.size) - 0.5;
+    vec2 ratio = vec2(parameters.sourceSize) / vec2(parameters.size);
+    if ((parameters.mode & 32u) == 0u && (ratio.x > 1.0 || ratio.y > 1.0)) {
+        // Minification: the mean of the source texels the destination pixel covers (edge texels by
+        // their covered share). Two bilinear taps skip most of them at 2x and beyond, which turns
+        // per-pixel dither in the display buffer into a visible low-frequency pattern.
+        vec2 low = vec2(pixel) * ratio;
+        vec2 high = low + ratio;
+        ivec2 first = ivec2(floor(low));
+        ivec2 last = min(ivec2(ceil(high)) - 1, first + 15);
+        vec4 sum = vec4(0.0);
+        float total = 0.0;
+        for (int y = first.y; y <= last.y; ++y) {
+            float wy = min(float(y + 1), high.y) - max(float(y), low.y);
+            for (int x = first.x; x <= last.x; ++x) {
+                float w = wy * (min(float(x + 1), high.x) - max(float(x), low.x));
+                sum += texel(ivec2(x, y)) * w;
+                total += w;
+            }
+        }
+        color = sum / total;
+        return;
+    }
+    vec2 position = (vec2(pixel) + 0.5) * ratio - 0.5;
     vec2 base = floor(position);
     vec2 weight = position - base;
     ivec2 corner = ivec2(base);

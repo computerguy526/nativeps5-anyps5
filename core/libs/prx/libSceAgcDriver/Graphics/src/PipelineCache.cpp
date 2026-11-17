@@ -1,8 +1,10 @@
 #include "prx/libSceAgcDriver/Graphics/include/PipelineCache.hpp"
 #include "prx/libc/include/HostThread.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJobs.hpp"
 #include "ShaderCacheDirectory.hpp"
 #include "ShaderDiskCache.hpp"
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -13,11 +15,19 @@
 #include <span>
 #include <string>
 #include <vector>
+#ifdef __APPLE__
+#include <sys/sysctl.h>
+#include <sys/types.h>
+#endif
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#endif
+
+#ifdef __APPLE__
+extern char** environ;
 #endif
 
 namespace AgcDriver::Graphics {
@@ -26,6 +36,30 @@ namespace {
 
 constexpr std::uint32_t FileMagic = 0x50565041u;
 constexpr std::uint32_t FileFormat = 1;
+
+// nps5: the pipeline cache file is capped (APS5_VK_PIPELINE_CACHE_MAX_MIB, default 512; 0 turns the cap off). A file above the cap is not read
+// (it is replaced by the next save), and a cache whose blob grows past it is not written: a driver that keeps every variant it ever
+// saw would otherwise grow without bound and make every launch read and checksum a huge file (the persisted cache is also size-capped in ARMSX3).
+std::uint64_t cacheCapBytes() {
+    const char* text = std::getenv("APS5_VK_PIPELINE_CACHE_MAX_MIB");
+    if (text == nullptr || *text < '0' || *text > '9') return 512ull << 20u;
+    return std::strtoull(text, nullptr, 10) << 20u;
+}
+
+// Temporary files of a save a killed process left behind (name.tmp.<id>): the atomic write names them so, so an interrupted save is
+// never mistaken for a cache. Older than ten minutes means no live save owns them.
+void removeStaleTemporaries(const std::filesystem::path& file) {
+    std::error_code error;
+    const auto directory = file.parent_path();
+    const auto prefix = file.filename().string() + ".tmp.";
+    for (std::filesystem::directory_iterator it(directory, error), end; !error && it != end; it.increment(error)) {
+        const auto name = it->path().filename().string();
+        if (name.rfind(prefix, 0) != 0) continue;
+        const auto modified = std::filesystem::last_write_time(it->path(), error);
+        if (error) { error.clear(); continue; }
+        if (std::filesystem::file_time_type::clock::now() - modified > std::chrono::minutes(10)) std::filesystem::remove(it->path(), error);
+    }
+}
 
 bool profiling() {
     static const bool profile = std::getenv("APS5_PROFILE_DRAW") != nullptr;
@@ -42,6 +76,114 @@ std::mutex& pathMutex(const std::filesystem::path& path) {
     return registry.paths[path];
 }
 
+}
+
+#ifdef __APPLE__
+
+// The environment switches that change what the driver generates (KosmicKrisp's MESA_KK_* and KK_*, and lower-case kk_*
+// workaround toggles). The paths this code itself exports are not part of the identity.
+static std::string driverFlagsHash() {
+    std::vector<std::string> flags;
+    for (char** entry = environ; entry != nullptr && *entry != nullptr; ++entry) {
+        const std::string text = *entry;
+        if (text.rfind("MESA_KK_", 0) != 0 && text.rfind("KK_", 0) != 0 && text.rfind("kk_", 0) != 0) continue;
+        const auto name = text.substr(0, text.find('='));
+        if (name == "KK_PIPELINE_ARCHIVE" || name == "KK_METALLIB_DIR" || name == "KK_MSL_COLLECT_DIR" || name.find("_DEBUG") != std::string::npos) continue;
+        flags.push_back(text);
+    }
+    std::sort(flags.begin(), flags.end());
+    std::string joined;
+    for (const auto& flag : flags) joined += flag + "\n";
+    char digits[17];
+    std::snprintf(digits, sizeof(digits), "%016llx", static_cast<unsigned long long>(std::hash<std::string>{}(joined)));
+    return flags.empty() ? "none" : digits;
+}
+
+// nps5: the pipeline stamp (recompiler version, driver build, driver switches, macOS build, GPU) of this run against the one the cache
+// was last fully built for. A stale stamp is not an error: the key list (pipelines.journal) is bound to the GPU and the recompiler only,
+// so after a KosmicKrisp, macOS or driver-flag change the replay rebuilds the binary caches from it at utility QoS. The stamp
+// is rewritten when that replay finishes. A recompiler change moves everything to a new <version> directory whose journal starts
+// empty: the old journals hold SPIR-V of the old recompiler and cannot be rebuilt (the journal has no recompile requests).
+static void ConfigurePipelineStamp(const std::filesystem::path& directory, const char* version, const GpuCache::StageVersions& stages, const char* driverInfo, const VkPhysicalDeviceProperties& properties) {
+    static_cast<void>(driverInfo);
+    static_cast<void>(properties);
+    PipelineStamp stamp;
+    stamp.recompiler = version;
+    stamp.driver = stages[GpuCache::Stage::Mesa];
+    stamp.flags = driverFlagsHash();
+    stamp.macos = stages[GpuCache::Stage::MacOs];
+    stamp.gpu = stages[GpuCache::Stage::Gpu];
+    const auto file = directory / "pipeline.stamp";
+    const auto saved = ReadStampFile(file);
+    const auto check = CompareStamp(saved, stamp);
+    SetCurrentPipelineStamp(stamp, file, check);
+    std::error_code error;
+    const bool journal = std::filesystem::exists(directory / version / "pipelines.journal", error);
+    if (check.state == StampState::Fresh) {
+        std::fprintf(stderr, "[pipeline-stamp] fresh (%s)\n", file.string().c_str());
+        return;
+    }
+    std::string changed;
+    for (const auto& name : check.changed) changed += (changed.empty() ? "" : ", ") + name;
+    if (check.state == StampState::Absent) {
+        std::fprintf(stderr, "[pipeline-stamp] none yet; the journal (%s) is replayed and the stamp written when the replay finishes\n", journal ? "present" : "absent");
+        return;
+    }
+    const bool recompilerChanged = std::find(check.changed.begin(), check.changed.end(), "recompiler") != check.changed.end();
+    std::fprintf(stderr, "[pipeline-stamp] stale (changed: %s). %s\n", changed.c_str(),
+                 recompilerChanged && !journal ? "The recompiler changed: the older journals cannot be rebuilt; this run records a new one." : journal ? "The key journal is kept: the replay rebuilds the pipeline caches from it in the background (utility QoS), the draws it needs first run its jobs themselves." : "No journal to rebuild from.");
+}
+#endif
+
+void ConfigureDriverPipelineArchive(const VkPhysicalDeviceProperties& properties, const char* driverInfo) {
+#ifdef __APPLE__
+    if (driverInfo == nullptr || std::strstr(driverInfo, "KosmicKrisp") == nullptr) return;
+    if (std::getenv("KK_PIPELINE_ARCHIVE") != nullptr) return;
+    if (const char* off = std::getenv("APS5_KK_PIPELINE_ARCHIVE"); off != nullptr && std::strcmp(off, "0") == 0) return;
+    const auto directory = ShaderRecompiler::ShaderCacheDirectory();
+    if (directory.empty()) return;
+    std::string uuid;
+    for (const auto byte : properties.pipelineCacheUUID) {
+        char digits[3];
+        std::snprintf(digits, sizeof(digits), "%02x", static_cast<unsigned>(byte));
+        uuid += digits;
+    }
+    char osBuild[64] = "unknown";
+    std::size_t osBuildSize = sizeof(osBuild);
+    if (sysctlbyname("kern.osversion", osBuild, &osBuildSize, nullptr, 0) != 0) std::snprintf(osBuild, sizeof(osBuild), "unknown");
+    char version[17];
+    std::snprintf(version, sizeof(version), "%016llx", static_cast<unsigned long long>(ShaderRecompiler::ShaderDiskCache::SourceVersion()));
+    GpuCache::StageVersions stages;
+    stages[GpuCache::Stage::Recompiler] = version;
+    stages[GpuCache::Stage::Mesa] = std::string(driverInfo) + "|" + uuid + "|" + std::to_string(properties.driverVersion);
+    stages[GpuCache::Stage::MacOs] = osBuild;
+    char gpu[320];
+    std::snprintf(gpu, sizeof(gpu), "%s|%04x:%04x", properties.deviceName, properties.vendorID, properties.deviceID);
+    stages[GpuCache::Stage::Gpu] = gpu;
+    std::error_code error;
+    std::filesystem::create_directories(directory / version, error);
+    if (error) return;
+    ConfigurePipelineStamp(directory, version, stages, driverInfo, properties);
+    if (ConfigureDriverGpuCacheStore(directory, stages)) return;
+    // Loose-file fallback (APS5_GPUCACHE=0): the layout used before the indexed store.
+    char name[200];
+    std::snprintf(name, sizeof(name), "kk-archive-%04x-%04x-%08x-%s-%s.mtl4a", properties.vendorID, properties.deviceID, properties.driverVersion, uuid.c_str(), osBuild);
+    const auto path = (directory / version / name).string();
+    ExportDriverPipelineArchivePath(path.c_str());
+    std::fprintf(stderr, "[pipeline-cache] KosmicKrisp Metal pipeline archive: %s\n", path.c_str());
+    const auto metallibOff = std::getenv("APS5_KK_METALLIB");
+    if (metallibOff == nullptr || std::strcmp(metallibOff, "0") != 0) {
+        const auto prebuilt = (directory / version / "kk-metallib").string();
+        const auto collect = (directory / version / "kk-msl").string();
+        const auto collecting = std::getenv("APS5_KK_COLLECT_MSL");
+        const bool collectOn = collecting != nullptr && std::strcmp(collecting, "1") == 0;
+        ExportDriverMetallibDirs(prebuilt.c_str(), collectOn ? collect.c_str() : nullptr);
+        std::fprintf(stderr, "[pipeline-cache] KosmicKrisp prebuilt Metal libraries: %s%s\n", prebuilt.c_str(), collectOn ? " (collecting MSL)" : "");
+    }
+#else
+    static_cast<void>(properties);
+    static_cast<void>(driverInfo);
+#endif
 }
 
 PipelineCache::PipelineCache(const Context& context, const VkPhysicalDeviceProperties& properties, bool loadFromFile) : context(context), properties(properties) {
@@ -63,6 +205,7 @@ PipelineCache::PipelineCache(const Context& context, const VkPhysicalDevicePrope
     std::vector<std::byte> initialData;
     if (!path.empty()) {
         std::lock_guard pathLock(pathMutex(path));
+        removeStaleTemporaries(path);
         if (loadFromFile) load(initialData);
     }
     VkPipelineCacheCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
@@ -110,6 +253,16 @@ PipelineCache::File PipelineCache::readFile() const {
     if (path.empty()) {
         file.state = FileState::Missing;
         return file;
+    }
+    {
+        std::error_code sizeError;
+        const auto cap = cacheCapBytes();
+        const auto onDisk = std::filesystem::file_size(path, sizeError);
+        if (!sizeError && cap != 0 && onDisk > cap + sizeof(FileHeader)) {
+            file.state = FileState::Invalid;
+            file.invalidReason = "larger than the size cap (APS5_VK_PIPELINE_CACHE_MAX_MIB)";
+            return file;
+        }
     }
     if (!ShaderRecompiler::ReadWholeFile(path, file.contents)) {
         std::error_code error;
@@ -281,6 +434,17 @@ void PipelineCache::save(bool final, bool waitForPipelines) try {
         const auto result = getData(context.device, source, &size, file.data() + sizeof(FileHeader));
         if (result != VK_SUCCESS && result != VK_INCOMPLETE) return;
         file.resize(sizeof(FileHeader) + size);
+    }
+    if (const auto cap = cacheCapBytes(); cap != 0 && size > cap) {
+        // The driver's blob is opaque: single pipelines cannot be evicted from it. Evict the whole generation instead: the persisted file
+        // is removed so the next launch (which would otherwise refuse an over-cap file or, with the old file kept, never persist anything
+        // new again) starts empty, rebuilds what it needs (the journal replay does it ahead of the draws) and saves a cache under the cap.
+        static std::atomic<bool> reported{false};
+        std::error_code removeError;
+        const bool removed = std::filesystem::remove(path, removeError);
+        if (!reported.exchange(true)) std::fprintf(stderr, "[pipeline-cache] %s: the cache holds %.1f MiB, over the %.0f MiB cap (APS5_VK_PIPELINE_CACHE_MAX_MIB); %s so the next launch starts a new generation\n", path.string().c_str(), static_cast<double>(size) / (1024.0 * 1024.0), static_cast<double>(cap) / (1024.0 * 1024.0), removed ? "the old file is removed" : "the old file could not be removed");
+        settle(removed ? std::nullopt : onDisk);
+        return;
     }
     destroyMerged.Reset();
     if (size < floor) {

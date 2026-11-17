@@ -2,6 +2,7 @@
 #define CORE_SHADER_RECOMPILER_CACHEKEY_HPP
 
 #include "Recompiler.hpp"
+#include "Float32FlushExt.hpp"
 #include "RdnaDecoder/RdnaDescriptorFormat.hpp"
 #include "prx/libc/include/HostThreadLocal.hpp"
 #include <algorithm>
@@ -375,6 +376,7 @@ private:
         append(key, value.spannedWaves);
         append(key, value.robustBufferAccess2);
         append(key, value.float32FlushToZero);
+        append(key, value.float32FlushToZero ? Float32FlushExtMask() : 0u);
         append(key, value.waveLdsMemoryBarriers);
         append(key, value.float32DenormPreserve);
         append(key, value.exactRobustLoads);

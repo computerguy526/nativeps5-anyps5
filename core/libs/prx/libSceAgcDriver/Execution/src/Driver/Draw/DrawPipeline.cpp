@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Graphics/include/AbSwitch.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Draw/DrawPipeline.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -387,7 +388,7 @@ void DrawPipeline::enqueue(Item item) {
     static const bool stats = std::getenv("APS5_PIPELINE_STATS") != nullptr;
     if (!profile && !stats) return;
     const auto now = std::chrono::steady_clock::now();
-    if (now - lastReport >= std::chrono::seconds(10)) report(now);
+    if (now - lastReport >= ProfileInterval()) report(now);
 }
 
 void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
@@ -436,6 +437,7 @@ void DrawPipeline::report(std::chrono::steady_clock::time_point now) {
 
 void DrawPipeline::run() {
     NameDriverThread("draw-commit");
+    Graphics::AbSwitch::RegisterThread("commit");
     PerformanceTrace::BindThread("draw committer");
     ReserveCommitterCore();
     StartCommitterSampler();

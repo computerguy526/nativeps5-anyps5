@@ -1,5 +1,6 @@
 #include "prx/libSceVideoOut/include/Buffer.hpp"
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
@@ -38,6 +39,7 @@ AgcDriver::DisplayBuffer DescribeVideoOutBuffer(const VideoOutBuffer& buffer, co
 namespace {
 
 int CommitBufferGroup(const std::string& function, VideoOutConfig& cfg, int setIndex, int bufferIndexStart, const VideoOutBuffers* buffers, int bufferNum, const BufferAttributeGroup& group) {
+    if (std::getenv("APS5_TRACE_VIDEOOUT")) std::fprintf(stderr, "[vo-trace] %s: set=%d start=%d num=%d %ux%u fmt=%u tiling=%u\n", function.c_str(), setIndex, bufferIndexStart, bufferNum, group.attribute.width, group.attribute.height, group.attribute.pixel_format, group.attribute.tiling_mode);
     std::unique_lock lock(cfg.mutex);
     cfg.Check();
     if (cfg.closing) {
@@ -74,8 +76,7 @@ int CommitBufferGroup(const std::string& function, VideoOutConfig& cfg, int setI
     cfg.height = group.attribute.height;
     for (int i = 0; i < bufferNum; i++) {
         cfg.buffers[bufferIndexStart + i] = registered[i];
-        auto& label = cfg.bufferLabels[bufferIndexStart + i];
-        AgcDriverStoreGuestLabel_nid_postfix(&label, 0);
+        AgcDriverStoreGuestLabel_nid_postfix(reinterpret_cast<std::uint64_t*>(cfg.BufferLabelGuest(bufferIndexStart + i)), 0);
     }
     if (group.ps4) cfg.ps4 = true;
     return setIndex;
@@ -111,7 +112,7 @@ int APS5_VABI sceVideoOutGetBufferLabelAddress(int handle, uintptr_t* address) t
     std::lock_guard lock(cfg->mutex);
     cfg->CheckAlive();
     if (cfg->Closed()) return VIDEO_OUT_ERROR_INVALID_HANDLE;
-    const auto labels = reinterpret_cast<uintptr_t>(cfg->bufferLabels.data());
+    const auto labels = static_cast<uintptr_t>(cfg->BufferLabelGuest(0));
     std::memcpy(address, &labels, sizeof(labels));
     return VIDEO_OUT_BUFFER_NUM_MAX;
 } catch (const ProcessShutdown&) {
@@ -176,8 +177,8 @@ int APS5_VABI sceVideoOutRegisterBuffers2(int handle, int setIndex, int bufferIn
     if (category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_UNCOMPRESSED && category != VIDEO_OUT_BUFFER_ATTRIBUTE_CATEGORY_COMPRESSED) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_CATEGORY");
     }
-    AgcDriverCheckGuestMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute2));
-    AgcDriverCheckGuestMemory_nid_postfix(buffers, static_cast<std::size_t>(bufferNum) * sizeof(*buffers), alignof(VideoOutBuffers));
+    AgcDriverCheckHostMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute2));
+    AgcDriverCheckHostMemory_nid_postfix(buffers, static_cast<std::size_t>(bufferNum) * sizeof(*buffers), alignof(VideoOutBuffers));
     BufferAttributeGroup group{};
     group.attribute = *attribute;
     group.category = category;
@@ -212,8 +213,8 @@ int APS5_VABI sceVideoOutRegisterBuffers(int handle, int bufferIndexStart, void*
     if (bufferIndexStart < 0 || bufferIndexStart >= VIDEO_OUT_BUFFER_NUM_MAX || bufferNum < 1 || bufferNum > VIDEO_OUT_BUFFER_NUM_MAX || bufferIndexStart + bufferNum > VIDEO_OUT_BUFFER_NUM_MAX) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_VALUE");
     }
-    AgcDriverCheckGuestMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute));
-    AgcDriverCheckGuestMemory_nid_postfix(addresses, static_cast<std::size_t>(bufferNum) * sizeof(*addresses), alignof(void*));
+    AgcDriverCheckHostMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute));
+    AgcDriverCheckHostMemory_nid_postfix(addresses, static_cast<std::size_t>(bufferNum) * sizeof(*addresses), alignof(void*));
     if (!Ps4BufferOptionAccepted(attribute->option) || attribute->reserved0 != 0 || attribute->reserved1 != 0) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_OPTION");
     }
@@ -256,7 +257,7 @@ int APS5_VABI sceVideoOutSubmitChangeBufferAttribute(int handle, int setIndex, c
     if (!cfg->groups[setIndex].ps4) {
         throw std::runtime_error(std::string(__func__) + ": changing a PS5 buffer group through the PS4 call is not implemented");
     }
-    AgcDriverCheckGuestMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute));
+    AgcDriverCheckHostMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute));
     if (attribute->reserved0 != 0 || attribute->reserved1 != 0) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_OPTION");
     }
@@ -306,7 +307,7 @@ int APS5_VABI sceVideoOutSubmitChangeBufferAttribute2(int handle, int setIndex, 
     if (cfg->closing || !cfg->groups[setIndex].occupied) {
         throw std::runtime_error(std::string(__func__) + ": VIDEO_OUT_ERROR_INVALID_INDEX");
     }
-    AgcDriverCheckGuestMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute2));
+    AgcDriverCheckHostMemory_nid_postfix(attribute, sizeof(*attribute), alignof(VideoOutBufferAttribute2));
     auto group = cfg->groups[setIndex];
     group.attribute = *attribute;
     if (group.ps4) group.ps4Pitch = Ps4TiledPitch(attribute->tiling_mode, attribute->width, attribute->pitch_in_pixel);

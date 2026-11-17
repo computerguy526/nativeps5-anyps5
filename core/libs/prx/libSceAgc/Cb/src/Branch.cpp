@@ -1,4 +1,5 @@
 #include "prx/libSceAgc/Cb/include/Branch.hpp"
+#include "prx/libSceAgc/include/GuestPtr.hpp"
 
 #include "prx/libSceAgc/Command/include/Packet.hpp"
 #include <cstdint>
@@ -15,9 +16,9 @@ std::uint32_t* APS5_VABI sceAgcCbBranch(CommandBuffer* buf, std::uint8_t mode, s
     Agc::Command::CheckBits(cachePolicy2, 3, __func__);
     Agc::Command::CheckBits(sizeInDwords1, 0xfffffu, __func__);
     Agc::Command::CheckBits(sizeInDwords2, 0xfffffu, __func__);
-    const auto address = reinterpret_cast<std::uintptr_t>(compareAddress);
-    const auto first = reinterpret_cast<std::uintptr_t>(buffer1);
-    const auto second = reinterpret_cast<std::uintptr_t>(buffer2);
+    const auto address = Agc::Guest::Address(compareAddress);
+    const auto first = Agc::Guest::Address(buffer1);
+    const auto second = Agc::Guest::Address(buffer2);
     if (compareFunction != 0) Agc::Command::CheckAddress(address, 8, __func__);
     if (first != 0 || sizeInDwords1 != 0) Agc::Command::CheckAddress(first, 4, __func__);
     if (second != 0 || sizeInDwords2 != 0) Agc::Command::CheckAddress(second, 4, __func__);
@@ -31,8 +32,8 @@ std::uint32_t APS5_VABI sceAgcCbBranchGetSize() {
 std::uint32_t* APS5_VABI sceAgcCbCondWrite(CommandBuffer* buf, std::uint32_t compareFunction, std::uint32_t writeSpace, const volatile void* writeAddress, std::uint32_t writeData, const volatile void* pollAddress, std::uint32_t reference, std::uint32_t mask) {
     Agc::Command::Require(compareFunction <= 6, __func__, "invalid write comparison");
     Agc::Command::Require(writeSpace == 1, __func__, "only memory writes are supported");
-    const auto destination = reinterpret_cast<std::uintptr_t>(writeAddress);
-    const auto source = reinterpret_cast<std::uintptr_t>(pollAddress);
+    const auto destination = Agc::Guest::Address(writeAddress);
+    const auto source = Agc::Guest::Address(pollAddress);
     Agc::Command::CheckAddress(destination, 4, __func__);
     Agc::Command::CheckAddress(source, 4, __func__);
     Agc::Command::CheckBits(destination, 0xffffffffffffull, __func__);

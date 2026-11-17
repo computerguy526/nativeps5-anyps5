@@ -1,5 +1,6 @@
 #include "Translation/TranslationContext.hpp"
 #include "Recompiler.hpp"
+#include "Float32FlushExt.hpp"
 #include <stdexcept>
 
 namespace ShaderRecompiler {
@@ -28,11 +29,31 @@ bool TranslationContext::flushesInHardware(const RdnaInstruction& inst) const {
     case RdnaOpcode::VSubrevF32:
     case RdnaOpcode::VMulF32: return true;
     case RdnaOpcode::VFloorF32:
-    case RdnaOpcode::VCeilF32: return float32FlushDeclared;
+    case RdnaOpcode::VCeilF32: return float32FlushDeclared || (Float32FlushExtMask() & Float32FlushExtRound) != 0u;
+    case RdnaOpcode::VFractF32: return (Float32FlushExtMask() & Float32FlushExtRound) != 0u;
     case RdnaOpcode::VFmaF32:
     case RdnaOpcode::VMacF32:
     case RdnaOpcode::VMadmkF32:
     case RdnaOpcode::VMadakF32: return !roundsProductSeparately(inst);
+    default: return false;
+    }
+}
+
+// True when the instruction gives the same result for a denormal f32 input as for the flushed (signed zero) input, so
+// the software input flush is redundant (NPS5_HW_F32_FLUSH_EXT bit 2): truncating or rounding conversions to an
+// integer or normalised value, and conversions to f16 under round to nearest even or toward zero (a denormal f32 is far
+// below the smallest f16 denormal, so both give a signed zero).
+bool TranslationContext::convertIgnoresDenormalInput(const RdnaInstruction& inst) const {
+    const std::uint32_t declaredRound = floatMode.has_value() ? floatMode->floatMode & 3u : 0u;
+    const bool roundToNearest = declaredRound == 0u && (rounding.value & 3u) == 0u && (rounding.unknown & 3u) == 0u;
+    switch (inst.op) {
+    case RdnaOpcode::VCvtI32F32:
+    case RdnaOpcode::VCvtU32F32:
+    case RdnaOpcode::VCvtPknormI16F32:
+    case RdnaOpcode::VCvtPknormU16F32:
+    case RdnaOpcode::VCvtPkrtzF16F32: return true;
+    case RdnaOpcode::VCvtF16F32: return roundToNearest;
+    case RdnaOpcode::VCvtPkU8F32: return declaredRound != 1u;
     default: return false;
     }
 }
@@ -140,7 +161,9 @@ std::uint32_t TranslationContext::f32DenormalFlushFor(const RdnaInstruction& ins
     case RdnaOpcode::VCvtPkU8F32:
     case RdnaOpcode::VCvtPkrtzF16F32:
     case RdnaOpcode::VCvtF16F32:
-        return floatMode.has_value() && ((floatMode->floatMode >> 4u) & 1u) != 0u ? 0u : 1u;
+        if (floatMode.has_value() && ((floatMode->floatMode >> 4u) & 1u) != 0u) return 0u;
+        if (float32FlushToZero && (Float32FlushExtMask() & Float32FlushExtConvert) != 0u && convertIgnoresDenormalInput(inst)) return 0u;
+        return 1u;
     case RdnaOpcode::VDivScaleF32:
     case RdnaOpcode::VDivFixupF32:
         if (floatMode.has_value() && (floatMode->floatMode & 3u) == 0u) {

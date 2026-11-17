@@ -3,7 +3,9 @@
 
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <cstdio>
 #include <deque>
 #include <exception>
@@ -17,6 +19,12 @@
 #include <vector>
 
 namespace AgcDriver {
+
+// The profile reports repeat every 10 s; APS5_PROFILE_INTERVAL_MS shortens that (a 1-3 s offline replay would otherwise print one line).
+inline std::chrono::steady_clock::duration ProfileInterval() {
+    static const auto interval = [] { const char* text = std::getenv("APS5_PROFILE_INTERVAL_MS"); const long long ms = text ? std::strtoll(text, nullptr, 10) : 0; return std::chrono::duration_cast<std::chrono::steady_clock::duration>(std::chrono::milliseconds(ms > 0 ? ms : 10000)); }();
+    return interval;
+}
 
 class ProfileOutput {
 public:

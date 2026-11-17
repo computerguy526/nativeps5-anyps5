@@ -1,4 +1,5 @@
 #include "prx/libSceAgc/Patch/include/WaitRegMem.hpp"
+#include "prx/libSceAgc/include/GuestPtr.hpp"
 #include "prx/libSceAgc/include/Agc.hpp"
 
 #include "prx/libSceAgc/Command/include/Memory.hpp"
@@ -46,7 +47,7 @@ extern "C" {
 
 int APS5_VABI sceAgcWaitRegMemPatchAddress(std::uint32_t* cmd, const volatile void* address) {
     auto* wait = Agc::Command::ValidateWait(cmd, __func__);
-    const auto guestAddress = reinterpret_cast<std::uintptr_t>(address);
+    const auto guestAddress = Agc::Guest::Address(address);
     const auto is32Bit = ((wait[0] >> 8u) & 0xffu) == 0x3cu;
     const auto lowMask = is32Bit ? 3u : 7u;
     if (guestAddress != 0) Agc::Command::CheckAddress(guestAddress, is32Bit ? 4 : 8, __func__);

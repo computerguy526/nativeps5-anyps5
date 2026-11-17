@@ -19,6 +19,8 @@
 #include <string>
 #include <thread>
 #include "prx/libSceVideoOut/include/Telemetry.hpp"
+#include "prx/libSceVideoOut/include/VirtualPadScript.hpp"
+#include <vector>
 
 class DisplayWindow;
 
@@ -28,6 +30,10 @@ public:
     ~PadInput();
     PadInput(const PadInput&) = delete;
     PadInput& operator=(const PadInput&) = delete;
+    // nps5: SDL hints the controller drivers read at SDL_Init (HIDAPI drivers for DualSense/Switch Pro/Xbox, positional
+    // face buttons). Idempotent; VideoOutDriver calls it before SDL_InitSubSystem, PadInput again for hosts that init SDL
+    // themselves. A hint already set in the environment (SDL_JOYSTICK_HIDAPI_SWITCH=0 ...) wins.
+    static void ConfigureSdl();
     void HandleEvent(const SDL_Event& event, DisplayWindow& window);
     void Update(const DisplayWindow& window);
     bool MouseModeEnabled() const { return keyboardMouse.MouseMode(); }
@@ -52,6 +58,8 @@ private:
         Pad::IdentifyScheduler identify;
         AgcDriver::PadKind kind = AgcDriver::PadKind::Unknown;
         std::string name;
+        PadInputState logged{};
+        bool loggedValid = false;
     };
 
     explicit PadInput(Pad::InputConfiguration configuration);
@@ -81,6 +89,9 @@ private:
     void openHaptics(SDL_GameController* controller);
     void closeHaptics();
     void streamHaptics();
+    void attachScriptedPad();
+    void advanceScriptedPad(const DisplayWindow& window);
+    void logPadState(int slot);
 
     Pad::InputMappingStore mappings;
     std::shared_ptr<const Pad::InputConfiguration> appliedMapping;
@@ -98,6 +109,21 @@ private:
     std::thread hapticsThread;
     bool hapticsRumbled = false;
     std::atomic<std::chrono::steady_clock::rep> hapticsReconfigureAt{0};
+    bool padLog = false;
+    SDL_Joystick* scriptedJoystick = nullptr;
+    int scriptedDevice = -1;
+    std::vector<Pad::VirtualPadEvent> script;
+    std::size_t scriptNext = 0;
+    bool scriptStarted = false;
+    std::chrono::steady_clock::time_point scriptStart{};
+    std::uint64_t scriptStartFrame = 0;
+    struct TapStamp { std::uint64_t ms = 0; std::uint64_t reads = 0; };
+    std::array<TapStamp, 64> tapStamps{};   // press time / guest-read count per scripted button index (one entry per tap, not one overwritten pair)
+    bool tapCapLogged = false;
+    void notePress(int index, std::uint64_t elapsedMs);
+    bool tapHeldLongEnough(int index, std::uint64_t elapsedMs);
+    std::thread scriptThread;            // NPS5_VPAD_ASYNC=1: millisecond script events applied from their own thread
+    std::atomic<bool> scriptStop{false};
     std::thread mappingWatchThread;
     std::atomic<bool> mappingWatchStop{false};
 };

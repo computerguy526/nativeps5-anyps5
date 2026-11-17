@@ -1,6 +1,7 @@
 #ifndef CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 #define CORE_LIBS_PRX_LIBSCEAGCDRIVER_EXECUTION_INCLUDE_GUESTMEMORY_HPP
 
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Mutex.hpp"
 #include <array>
 #include <atomic>
@@ -16,9 +17,18 @@
 
 namespace AgcDriver::GuestMemory {
 
+// The pointer arguments of CheckRange and Accessible are guest-valued (they carry a guest address, see
+// GuestAddr.hpp). The Host variants take a real host pointer (an HLE argument the thunk already translated,
+// a driver-owned buffer) and validate the guest-domain name of the same memory.
 void CheckRange(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
+inline void CheckHostRange(const void* host, std::size_t bytes, std::size_t alignment, bool writable = false) {
+    CheckRange(reinterpret_cast<const void*>(GuestAddr::HostToGuest(host)), bytes, alignment, writable);
+}
 // CheckRange without throwing: whether the whole range is mapped with the requested access.
 bool Accessible(const void* pointer, std::size_t bytes, bool writable = false);
+inline bool AccessibleHost(const void* host, std::size_t bytes, bool writable = false) {
+    return Accessible(reinterpret_cast<const void*>(GuestAddr::HostToGuest(host)), bytes, writable);
+}
 // The accessible parts [begin, end) of a range, in address order. GPU heaps are often bound whole while
 // the guest commits their pages on demand, so a binding can cover reserved but uncommitted pages.
 std::vector<std::pair<std::uint64_t, std::uint64_t>> CommittedRanges(std::uint64_t address, std::size_t bytes, bool writable = false);
@@ -65,6 +75,11 @@ void WriteChangedKeepingGuest(std::uint64_t address, std::span<const std::byte> 
 // page tables and are reported with MarkWritten. Without write watching CollectWrites returns 0 and
 // UnchangedSince is always false, so callers fall back to comparing bytes.
 bool WriteWatched();
+// APS5_UNTRACKED_STATS=1 accounting of byte comparisons of unwatched surfaces (kinds: 0 registered+watched,
+// 1 registered unwatched, 2 alias unwatch, 3 driver unwatch, 4 unregister, 5 import leaving the watch).
+bool UntrackedStatsEnabled();
+void NoteUntrackedEvent(std::uint64_t address, std::uint64_t bytes, int kind);
+void NoteUntrackedCompare(std::uint64_t surface, std::uint64_t surfaceBytes, std::uint64_t bytes, std::uint64_t ns, bool equal);
 void Unwatch(std::uint64_t address, std::size_t bytes);
 void Rewatch(std::span<const std::pair<std::uint64_t, std::uint64_t>> ranges);
 bool ImportWatched(std::uint64_t address, std::size_t bytes, const std::function<bool()>& import, bool staysWatched = true, bool importMayWriteGuest = true);
@@ -316,6 +331,9 @@ std::size_t CaptureCallerOffsets(std::span<unsigned long long> frames, unsigned 
 }
 
 extern "C" void AgcDriverCheckGuestMemory_nid_postfix(const void* pointer, std::size_t bytes, std::size_t alignment, bool writable = false);
+// Same check for a HOST pointer (an HLE argument the runtime's thunk already translated; nativeps5 passes pointer
+// parameters of exports as host pointers, docs/nps5-gpu-addr.md).
+extern "C" void AgcDriverCheckHostMemory_nid_postfix(const void* host, std::size_t bytes, std::size_t alignment, bool writable = false);
 extern "C" void AgcDriverStoreGuestLabel_nid_postfix(std::uint64_t* pointer, std::uint64_t value);
 
 #endif

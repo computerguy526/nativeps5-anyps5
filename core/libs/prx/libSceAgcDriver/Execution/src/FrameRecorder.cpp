@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/State/include/Configuration.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameRecorder.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Driver.hpp"
@@ -31,6 +32,10 @@ extern char** environ;
 #ifdef __linux__
 #include "prx/libc/include/specifics/linux/HostMapping.hpp"
 #include <sys/uio.h>
+#endif
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #endif
 
 namespace AgcDriver {
@@ -105,7 +110,7 @@ std::uint32_t windowsProtection(const HostMapping::Mapping& mapping) {
 bool pageReadable(std::uint64_t address) {
     char byte = 0;
     iovec local{&byte, 1};
-    iovec remote{reinterpret_cast<void*>(static_cast<std::uintptr_t>(address)), 1};
+    iovec remote{GuestAddr::HostPtr<void>(static_cast<std::uintptr_t>(address)), 1};
     const auto read = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
     if (read == 1) return true;
     if (read < 0 && errno == EFAULT) return false;
@@ -308,6 +313,7 @@ void FrameRecorder::FrameBoundary() {
 
 void FrameRecorder::frameBoundaryLocked() {
     ++boundaries;
+    if (std::getenv("APS5_TRACE_SAMPLED") != nullptr) std::fprintf(stderr, "[boundary] %llu\n", static_cast<unsigned long long>(boundaries));
     if (state == State::Recording) {
         if (++recordedFrames >= frames) finish();
         return;
@@ -381,6 +387,7 @@ void FrameRecorder::collectShaderPages(std::span<const Shader* const> shaders, s
     std::uintptr_t arenaBase = 0;
     std::size_t arenaBytes = 0;
     GuestArena::GuestArenaRange_nid_postfix(&arenaBase, &arenaBytes);
+    arenaBase = static_cast<std::uintptr_t>(GuestAddr::GuestAddress(arenaBase));  // the arena is host-keyed; shader pointers are guest values
     const auto note = [&](const void* address, std::uint64_t bytes = 0) {
         if (address == nullptr) return;
         const auto at = pointer(address);
@@ -393,17 +400,20 @@ void FrameRecorder::collectShaderPages(std::span<const Shader* const> shaders, s
     };
     for (const auto* shader : shaders) {
         if (shader == nullptr || !GuestMemory::Accessible(shader, sizeof(Shader))) continue;
+        // `shader` and the pointer fields inside the header are guest values: dereference through the choke point.
+        const Shader& header = *GuestAddr::HostPtr<const Shader>(reinterpret_cast<std::uintptr_t>(shader));
         note(shader);
-        note(const_cast<const void*>(shader->code), shader->shader_size);
-        note(shader->user_data);
-        note(shader->cx_registers);
-        note(shader->sh_registers);
-        note(shader->specials);
-        note(shader->input_semantics);
-        note(shader->output_semantics);
-        if (shader->user_data == nullptr || !GuestMemory::Accessible(shader->user_data, sizeof(ShaderUserData))) continue;
-        note(shader->user_data->direct_resource_offset);
-        for (const auto* sharps : shader->user_data->sharp_resource_offset) note(sharps);
+        note(const_cast<const void*>(header.code), header.shader_size);
+        note(header.user_data);
+        note(header.cx_registers);
+        note(header.sh_registers);
+        note(header.specials);
+        note(header.input_semantics);
+        note(header.output_semantics);
+        if (header.user_data == nullptr || !GuestMemory::Accessible(header.user_data, sizeof(ShaderUserData))) continue;
+        const ShaderUserData& userData = *GuestAddr::HostPtr<const ShaderUserData>(reinterpret_cast<std::uintptr_t>(header.user_data));
+        note(userData.direct_resource_offset);
+        for (const auto* sharps : userData.sharp_resource_offset) note(sharps);
     }
 }
 
@@ -485,7 +495,7 @@ void FrameRecorder::writeDelta(std::span<Span> spans, std::span<const std::uint6
     for (const auto page : hostPages) {
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes)) continue;
         bytes.resize(HostPageBytes);
-        std::memcpy(bytes.data(), reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page)), HostPageBytes);
+        std::memcpy(bytes.data(), GuestAddr::HostPtr<const void>(static_cast<std::uintptr_t>(page)), HostPageBytes);
         const auto hash = contentHash(bytes);
         auto& known = hostPageHashes[page];
         if (known == hash) continue;
@@ -581,7 +591,7 @@ void FrameRecorder::start() {
         if (!writer) return;
     }
     for (const auto page : prologueHostPages) {
-        const auto* address = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page));
+        const auto* address = reinterpret_cast<const void*>(static_cast<std::uintptr_t>(page));  // guest-valued, for GuestMemory
         if (!GuestMemory::Accessible(address, HostPageBytes)) continue;
         const bool covered = std::ranges::any_of(ranges, [&](const auto& range) {
             return range.readable && range.address <= page && page - range.address <= range.bytes && HostPageBytes <= range.bytes - (page - range.address);
@@ -644,7 +654,8 @@ std::string FrameRecorder::header() const {
     std::string text = "{\"magic\":\"aps5-frame-capture 1\"";
     text += ",\"commit\":" + jsonString(APS5_TRACE_COMMIT);
     text += std::string(",\"dirty\":") + (APS5_TRACE_DIRTY < 0 ? "null" : APS5_TRACE_DIRTY != 0 ? "true" : "false");
-    text += ",\"arena_base\":" + std::to_string(arenaBase) + ",\"arena_bytes\":" + std::to_string(arenaBytes);
+    // The capture format is guest-addressed (replay works on any bias): the arena base is recorded as a guest address.
+    text += ",\"arena_base\":" + std::to_string(GuestAddr::GuestAddress(arenaBase)) + ",\"arena_bytes\":" + std::to_string(arenaBytes);
     text += ",\"start_boundary\":" + std::to_string(startBoundary) + ",\"frames\":" + std::to_string(recordedFrames);
     text += ",\"calls\":" + std::to_string(recordedCalls) + ",\"prologue_calls\":" + std::to_string(prologue.size());
     text += ",\"ranges\":" + std::to_string(ranges.size()) + ",\"late_ranges\":" + std::to_string(lateRanges) + ",\"snapshot_bytes\":" + std::to_string(snapshotBytes) + ",\"unreadable_bytes\":" + std::to_string(unreadableBytes) + ",\"host_only_sample_bytes\":" + std::to_string(hostOnlySampleBytes);
@@ -666,12 +677,50 @@ std::string FrameRecorder::header() const {
     return text + "]}\n";
 }
 
+#ifdef __APPLE__
+std::vector<GuestRegion> AppleWalkGuestRegions(std::uint64_t first, std::uint64_t end) {
+    // mach_vm_region_recurse replaces /proc/self/maps and VirtualQuery. A region is a run of pages with one protection and
+    // share mode. The kernel API is host-keyed (host = guest + bias): query the host address of the guest cursor and
+    // translate each region back, so the recorded ranges and the capture format stay guest-addressed.
+    std::vector<GuestRegion> regions;
+    for (std::uint64_t cursor = first; cursor < end;) {
+        const std::uint64_t hostCursor = GuestAddr::HostAddress(cursor);
+        const std::uint64_t hostToGuestDelta = hostCursor - cursor;  // the bias, modulo 2^64
+        mach_vm_address_t regionStart = hostCursor;
+        mach_vm_size_t regionBytes = 0;
+        natural_t depth = 1024;
+        vm_region_submap_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (mach_vm_region_recurse(mach_task_self(), &regionStart, &regionBytes, &depth, reinterpret_cast<vm_region_recurse_info_t>(&info), &count) != KERN_SUCCESS) break;
+        const std::uint64_t guestRegionStart = regionStart - hostToGuestDelta;
+        if (guestRegionStart >= end) break;
+        const std::uint64_t address = std::max<std::uint64_t>(cursor, guestRegionStart);
+        const std::uint64_t regionEnd = std::min<std::uint64_t>(end, guestRegionStart + regionBytes);
+        cursor = regionEnd;
+        const bool isReadable = (info.protection & VM_PROT_READ) != 0;
+        const bool isWritable = (info.protection & VM_PROT_WRITE) != 0;
+        const bool isExecutable = (info.protection & VM_PROT_EXECUTE) != 0;
+        if (!isReadable && !isWritable && !isExecutable) continue;
+        const bool shared = info.share_mode == SM_TRUESHARED || info.share_mode == SM_SHARED || info.share_mode == SM_SHARED_ALIASED || info.share_mode == SM_LARGE_PAGE;
+        GuestRegion region;
+        region.address = address;
+        region.bytes = regionEnd - address;
+        region.protection = isExecutable ? (isWritable ? 0x40u : isReadable ? 0x20u : 0x10u) : isWritable ? 0x04u : isReadable ? 0x02u : 0x01u;
+        region.readable = isReadable;
+        region.privateMemory = !shared && info.external_pager == 0;
+        regions.push_back(region);
+    }
+    return regions;
+}
+#endif
+
 std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
 #ifdef _WIN32
     std::uintptr_t base = 0;
     std::size_t size = 0;
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
     if (size == 0) throw std::runtime_error("frame capture: the guest arena is not reserved");
+    base = static_cast<std::uintptr_t>(GuestAddr::GuestAddress(base));  // the arena is host-keyed; allocations are guest-valued
     std::vector<Range> result;
     for (const auto& allocation : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
         if (!allocation->readable) continue;
@@ -682,7 +731,7 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
         const auto access = FrameRangeAccess::Readable | (allocation->writable ? FrameRangeAccess::Writable : 0u) | (allocation->gpu ? FrameRangeAccess::Gpu : 0u);
         for (auto address = first; address < end;) {
             MEMORY_BASIC_INFORMATION info{};
-            if (VirtualQuery(reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), &info, sizeof(info)) == 0) throw std::runtime_error("frame capture: VirtualQuery failed inside the guest arena");
+            if (VirtualQuery(GuestAddr::HostPtr<const void>(static_cast<std::uintptr_t>(address)), &info, sizeof(info)) == 0) throw std::runtime_error("frame capture: VirtualQuery failed inside the guest arena");
             const auto regionEnd = std::min<std::uint64_t>(end, reinterpret_cast<std::uintptr_t>(info.BaseAddress) + info.RegionSize);
             if (info.State == MEM_COMMIT) {
                 Range range;
@@ -708,6 +757,7 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
     std::size_t size = 0;
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
     if (size == 0) throw std::runtime_error("frame capture: the guest arena is not reserved");
+    base = static_cast<std::uintptr_t>(GuestAddr::GuestAddress(base));  // the arena is host-keyed; allocations are guest-valued
     std::vector<Range> result;
     for (const auto& allocation : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
         if (!allocation->readable) continue;
@@ -742,8 +792,40 @@ std::vector<FrameRecorder::Range> FrameRecorder::committedRanges() {
         });
     }
     return result;
+#elif defined(__APPLE__)
+    std::uintptr_t base = 0;
+    std::size_t size = 0;
+    GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    if (size == 0) throw std::runtime_error("frame capture: the guest arena is not reserved");
+    base = static_cast<std::uintptr_t>(GuestAddr::GuestAddress(base));  // the arena is host-keyed; allocations are guest-valued
+    std::vector<Range> result;
+    for (const auto& allocation : GuestAllocations::GuestAllocationsAcquireAll_nid_postfix()) {
+        if (!allocation->readable) continue;
+        const auto first = allocation->address;
+        const auto end = first + allocation->bytes;
+        const auto firstRange = result.size();
+        const bool host = first < base || end > base + size;
+        const auto access = FrameRangeAccess::Readable | (allocation->writable ? FrameRangeAccess::Writable : 0u) | (allocation->gpu ? FrameRangeAccess::Gpu : 0u);
+        // The kernel walk is host-keyed; AppleWalkGuestRegions takes and returns guest addresses.
+        for (const auto& region : AppleWalkGuestRegions(first, end)) {
+            Range range;
+            range.address = region.address;
+            range.bytes = region.bytes;
+            range.protection = region.protection;
+            range.access = access;
+            range.readable = region.readable;
+            if (host) range.kind = FrameRangeKind::Host;
+            else if (GuestMemory::Watched(range.address, static_cast<std::size_t>(range.bytes))) range.kind = FrameRangeKind::Watched;
+            else if (region.privateMemory) range.kind = FrameRangeKind::Unwatched;
+            else range.kind = FrameRangeKind::Section;
+            auto& last = result.empty() ? range : result.back();
+            if (result.size() > firstRange && last.address + last.bytes == range.address && last.kind == range.kind && last.protection == range.protection && last.readable == range.readable && last.access == range.access) last.bytes += range.bytes;
+            else result.push_back(range);
+        }
+    }
+    return result;
 #else
-    throw std::runtime_error("frame capture: guest memory capture is implemented on Windows and Linux only");
+    throw std::runtime_error("frame capture: guest memory capture is implemented on Windows, Linux and macOS only");
 #endif
 }
 

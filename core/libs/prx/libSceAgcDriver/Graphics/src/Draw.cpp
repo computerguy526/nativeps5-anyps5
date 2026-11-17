@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/Draw.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include "prx/libc/include/RunReport.hpp"
@@ -1451,6 +1452,13 @@ struct DrawTimer {
 // `waitedBefore` is the thread's GPU waits at the draw's start and `ownWaitedMs` the draw's own
 // syncs (see DrawOutcome::hookWaitUs).
 void reportDrawEnd(const State& state, const DrawTimer& timer, const ShaderResources::BuildTiming* built, DrawOutcome& outcome, double waitedBefore, double ownWaitedMs, const char* suffix) {
+    {
+        // Debug aid (APS5_TRACE_VOLUME): how a draw into the 32^3 tonemap LUT ended (recorded or synchronous, its pass, its sync reason).
+        static const bool traceLutEnd = std::getenv("APS5_TRACE_VOLUME") != nullptr;
+        if (traceLutEnd && ((state.color.volume && state.color.extent.width == 32u && state.color.depth == 32u) || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return color.volume && color.extent.width == 32u && color.depth == 32u; }))) {
+            std::fprintf(stderr, "[lut-end] present=%llu recorded=%d waited=%d completion=%d passBegun=%d passContinued=%d passBreak=%d reason=%d kind=%zu address=%d batch=%llu suffix='%s'\n", static_cast<unsigned long long>(Recorder::Presents()), outcome.recorded ? 1 : 0, outcome.waited ? 1 : 0, outcome.completion ? 1 : 0, outcome.passBegun ? 1 : 0, outcome.passContinued ? 1 : 0, static_cast<int>(outcome.passBreak), static_cast<int>(outcome.reason), outcome.kind, outcome.addressDraw ? 1 : 0, static_cast<unsigned long long>(Recorder::Active() != nullptr ? Recorder::Active()->OpenSerial() : 0), suffix != nullptr ? suffix : "");
+        }
+    }
     if (!timer.profile) return;
     static const bool traceDraws = std::getenv("APS5_TRACE_DRAWS") != nullptr;
     outcome.hookWaitUs = std::max(0.0, Recorder::ThreadWaitedMs() - waitedBefore - ownWaitedMs) * 1000.0;
@@ -1567,7 +1575,7 @@ const HostImport* InPlaceDrawInput(const Context& context, std::uint64_t address
 }
 
 InPlaceIndices InPlaceIndexRange(Recorder& recorder, std::uint64_t address, std::size_t bytes, std::uint32_t indexSize, bool skipRestart) {
-    const std::span<const std::byte> range(reinterpret_cast<const std::byte*>(address), bytes);
+    const std::span<const std::byte> range(GuestAddr::HostPtr<const std::byte>(address), bytes);
     InPlaceIndices indices;
     const auto scan = [&] {
         const auto bounds = DrawIndexRange(range, indexSize, skipRestart);
@@ -1950,7 +1958,7 @@ DrawInputs prepareDrawInputs(const Context& context, const State& state, const P
         inputs.maxIndex = *highest;
         inputs.minIndex = lowest;
         if (skipRestart && state.stages.mesh && (state.stages.mesh->inputPrimitive == 5 || state.stages.mesh->inputPrimitive == 6)) {
-            const auto indexSpan = import != nullptr ? std::span<const std::byte>(reinterpret_cast<const std::byte*>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
+            const auto indexSpan = import != nullptr ? std::span<const std::byte>(GuestAddr::HostPtr<const std::byte>(draw.indexAddress), static_cast<std::size_t>(indexBytes)) : copy.buffer->Bytes().first(static_cast<std::size_t>(indexBytes));
             inputs.restartTable = MeshRestartTable(indexSpan, draw.indexSize);
         }
         if (import != nullptr) {
@@ -2074,6 +2082,12 @@ std::shared_ptr<StorageTexture> refreshResidentTarget(const Context& context, co
     const auto lookupStart = std::chrono::steady_clock::now();
     const auto walkedBefore = profile ? GuestMemory::ThreadCollectedBytes() : 0;
     std::shared_ptr<StorageTexture> resident;
+    const bool fullWrite = state.scissor.offset.x <= 0 && state.scissor.offset.y <= 0 && state.scissor.extent.width >= color.extent.width && state.scissor.extent.height >= color.extent.height && color.partialWriteMask == 0;
+    const bool blended = state.blends.at(color.exportIndex).blendEnable != 0;
+    struct UseScope {
+        const char* previous;
+        ~UseScope() { StorageTexture::UseTag() = previous; }
+    } useScope{std::exchange(StorageTexture::UseTag(), blended ? "target-blend" : fullWrite ? "target-opaque-full" : "target-opaque-partial")};
     try {
         resident = lookup();
         if (resident != nullptr) materializeRegisterClear(context, color, *resident);
@@ -2146,7 +2160,7 @@ bool snapshotsInTable(std::span<const std::byte> table, std::span<const GuestMem
 }
 
 bool snapshotsEqualMemory(std::span<const GuestMemorySnapshot> snapshots) {
-    return std::ranges::all_of(snapshots, [](const GuestMemorySnapshot& snapshot) { return snapshot.bytes.empty() || std::memcmp(reinterpret_cast<const void*>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()) == 0; });
+    return std::ranges::all_of(snapshots, [](const GuestMemorySnapshot& snapshot) { return snapshot.bytes.empty() || std::memcmp(GuestAddr::HostPtr<const void>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()) == 0; });
 }
 
 void verifyServedSpace(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, std::uint64_t indexBytes, const ShaderResources& served) {
@@ -2159,6 +2173,174 @@ void verifyServedSpace(const Context& context, const State& state, const Pm4::Dr
     char message[320];
     std::snprintf(message, sizeof(message), "APS5_VERIFY_ADDRESS_DRAW_REUSE: a served address-based draw hit disagrees with a fresh build or guest memory in its %s (BDA table %zu bytes served, %zu fresh; %zu / %zu sampled textures; %zu snapshots)", what, servedTable.size(), freshTable.size(), served.SampledTextures().size(), fresh.SampledTextures().size(), snapshots.size());
     throw std::runtime_error(message);
+}
+
+// Debug aid (APS5_TRACE_VOLUME): what a draw into the 32^3 tonemap LUT reads. Its snapshots (bytes), every guest pointer
+// found in the small ones, the guest bytes at each pointer's target, the BDA table entry that serves the target and the
+// host import behind it. A line is printed when anything changed since the last one, and every 120th draw.
+void traceLutInputs(std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, const ShaderResources& resources, bool cachedHit) {
+    static std::mutex mutex;
+    static std::uint64_t lastHash = 0;
+    static std::uint64_t draws = 0;
+    std::lock_guard lock(mutex);
+    const auto table = resources.AddressTableBytes();
+    ShaderRecompiler::BdaAbi::Header header{};
+    std::vector<ShaderRecompiler::BdaAbi::Range> ranges;
+    if (table.size() >= sizeof(header)) {
+        std::memcpy(&header, table.data(), sizeof(header));
+        if (header.entryBytes == sizeof(ShaderRecompiler::BdaAbi::Range) && (table.size() - sizeof(header)) / sizeof(ShaderRecompiler::BdaAbi::Range) >= header.count) {
+            ranges.resize(header.count);
+            if (!ranges.empty()) std::memcpy(ranges.data(), table.data() + sizeof(header), ranges.size() * sizeof(ranges.front()));
+        }
+    }
+    const auto covering = [&](std::uint64_t address) -> const ShaderRecompiler::BdaAbi::Range* {
+        for (const auto& range : ranges) {
+            if (address >= range.begin && address < range.end) return &range;
+        }
+        return nullptr;
+    };
+    std::string text;
+    char line[1024];
+    std::uint64_t hash = 0xcbf29ce484222325ull;
+    const auto mix = [&](const void* data, std::size_t size) {
+        const auto* bytes = static_cast<const std::uint8_t*>(data);
+        for (std::size_t i = 0; i < size; ++i) hash = (hash ^ bytes[i]) * 0x100000001b3ull;
+    };
+    const auto hex = [&](const std::uint8_t* bytes, std::size_t size) {
+        std::string out;
+        char two[12];
+        for (std::size_t i = 0; i < size; i += 4) {
+            std::uint32_t word = 0;
+            std::memcpy(&word, bytes + i, std::min<std::size_t>(4, size - i));
+            std::snprintf(two, sizeof(two), "%08x ", word);
+            out += two;
+        }
+        return out;
+    };
+    std::vector<std::uint64_t> targets;
+    for (const auto& snapshot : snapshots) {
+        mix(snapshot.bytes.data(), snapshot.bytes.size());
+        const bool live = snapshot.bytes.empty() || std::memcmp(GuestAddr::HostPtr<const void>(snapshot.address), snapshot.bytes.data(), snapshot.bytes.size()) == 0;
+        const auto* entry = covering(snapshot.address);
+        std::snprintf(line, sizeof(line), "  snap 0x%llx+%zu equalsMemory=%d table=[0x%llx,0x%llx)->0x%llx perm=%u%s", static_cast<unsigned long long>(snapshot.address), snapshot.bytes.size(), live ? 1 : 0, entry ? static_cast<unsigned long long>(entry->begin) : 0ull, entry ? static_cast<unsigned long long>(entry->end) : 0ull, entry ? static_cast<unsigned long long>(entry->deviceAddress) : 0ull, entry ? static_cast<unsigned>(entry->permissions) : 0u, snapshot.bytes.size() <= 64 ? " bytes=" : "\n");
+        text += line;
+        if (snapshot.bytes.size() <= 64) text += hex(reinterpret_cast<const std::uint8_t*>(snapshot.bytes.data()), snapshot.bytes.size()) + "\n";
+        if (snapshot.bytes.size() > 64) continue;
+        for (std::size_t at = 0; at + 8 <= snapshot.bytes.size(); at += 4) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, snapshot.bytes.data() + at, 8);
+            value &= 0x0000ffffffffffffull;
+            if (value < 0x100000000ull || covering(value) == nullptr) continue;
+            if (std::find(targets.begin(), targets.end(), value) == targets.end() && targets.size() < 24) targets.push_back(value);
+        }
+    }
+    {
+        const auto described = resources.DebugAllocations();
+        mix(described.data(), described.size());
+        text += described;
+    }
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        for (const auto& binding : shader.program->bindings) {
+            if (binding.role != ShaderRecompiler::DescriptorRole::GuestBuffers) continue;
+            std::snprintf(line, sizeof(line), "  guestDescriptor stage=%d binding=%u count=%u: ", static_cast<int>(shader.stage), static_cast<unsigned>(binding.binding), static_cast<unsigned>(binding.count));
+            text += line;
+            text += hex(reinterpret_cast<const std::uint8_t*>(binding.guestDescriptor.data()), std::min<std::size_t>(binding.guestDescriptor.size() * 4u, 96)) + "\n";
+        }
+    }
+    for (const auto& shader : shaders) {
+        if (shader.program == nullptr) continue;
+        const auto& push = shader.program->pushConstants;
+        mix(push.data(), push.size());
+        std::snprintf(line, sizeof(line), "  push stage=%d bytes=%zu: ", static_cast<int>(shader.stage), push.size());
+        text += line;
+        text += hex(reinterpret_cast<const std::uint8_t*>(push.data()), std::min<std::size_t>(push.size(), 128)) + "\n";
+        for (std::size_t at = 0; at + 8 <= push.size(); at += 4) {
+            std::uint64_t value = 0;
+            std::memcpy(&value, push.data() + at, 8);
+            value &= 0x0000ffffffffffffull;
+            if (value < 0x100000000ull || covering(value) == nullptr) continue;
+            if (std::find(targets.begin(), targets.end(), value) == targets.end() && targets.size() < 24) targets.push_back(value);
+        }
+    }
+    struct Seen { std::uint64_t address; std::size_t span; std::array<std::uint8_t, 768> bytes; };
+    static std::vector<Seen> previous;
+    for (const auto& seen : previous) {
+        std::array<std::uint8_t, 768> now{};
+        const auto outcome = GuestMemory::CopyMapped(seen.address, std::span<std::byte>(reinterpret_cast<std::byte*>(now.data()), seen.span));
+        if (outcome != GuestMemory::Compare::Unmapped && std::memcmp(now.data(), seen.bytes.data(), seen.span) == 0) continue;
+        std::snprintf(line, sizeof(line), "  later 0x%llx CHANGED since the previous LUT draw (mapped=%d) now: ", static_cast<unsigned long long>(seen.address), outcome != GuestMemory::Compare::Unmapped ? 1 : 0);
+        text += line;
+        text += hex(now.data(), std::min<std::size_t>(seen.span, 128)) + "\n";
+    }
+    previous.clear();
+    for (const auto target : targets) {
+        const auto* entry = covering(target);
+        const auto span = static_cast<std::size_t>(std::min<std::uint64_t>(768, entry->end - target));
+        std::array<std::uint8_t, 768> bytes{};
+        const auto outcome = GuestMemory::CopyMapped(target, std::span<std::byte>(reinterpret_cast<std::byte*>(bytes.data()), span));
+        const bool readable = outcome != GuestMemory::Compare::Unmapped;
+        const bool accessible = GuestMemory::Accessible(reinterpret_cast<const void*>(target), span, false);
+        mix(bytes.data(), span);
+        mix(&entry->deviceAddress, sizeof(entry->deviceAddress));
+        previous.push_back({target, span, bytes});
+        std::uint64_t content = 0xcbf29ce484222325ull;
+        for (std::size_t i = 0; i < span; ++i) content = (content ^ bytes[i]) * 0x100000001b3ull;
+        std::snprintf(line, sizeof(line), "  ptr 0x%llx mapped=%d accessible=%d cpu256=%08x table=[0x%llx,0x%llx)->0x%llx at-dev=0x%llx perm=%u | %s | ", static_cast<unsigned long long>(target), readable ? 1 : 0, accessible ? 1 : 0, static_cast<unsigned>(content ^ (content >> 32)), static_cast<unsigned long long>(entry->begin), static_cast<unsigned long long>(entry->end), static_cast<unsigned long long>(entry->deviceAddress), static_cast<unsigned long long>(entry->deviceAddress + (target - entry->begin)), static_cast<unsigned>(entry->permissions), DebugDescribeImportAt(target, span).c_str());
+        text += line;
+        if (target >= 0x3000000000ull) {
+            // A per-frame ring buffer: every nonzero word of it, as offset:word.
+            char word[32];
+            for (std::size_t at = 0; at + 4 <= span; at += 4) {
+                std::uint32_t value = 0;
+                std::memcpy(&value, bytes.data() + at, 4);
+                if (value == 0) continue;
+                std::snprintf(word, sizeof(word), "%zx:%08x ", at, value);
+                text += word;
+            }
+            text += "\n";
+        } else {
+            text += hex(bytes.data(), std::min<std::size_t>(span, 96)) + "\n";
+        }
+    }
+    if (auto* recorder = Recorder::Active(); recorder != nullptr) {
+        // Whether the guest rewrote the per-frame ring buffers this draw reads in place before the batch the draw goes into
+        // completed on the GPU: every ring target is read again when that batch is reaped.
+        auto seen = std::make_shared<std::vector<Seen>>();
+        for (const auto& entry : previous) {
+            if (entry.address >= 0x3000000000ull) seen->push_back(entry);
+        }
+        if (!seen->empty()) {
+            const auto builtAt = Recorder::Presents();
+            const auto started = std::chrono::steady_clock::now();
+            const auto batch = recorder->OpenSerial();
+            recorder->DebugOnComplete([seen, builtAt, started, batch] {
+                std::size_t rewritten = 0;
+                std::string detail;
+                char part[160];
+                for (const auto& entry : *seen) {
+                    std::array<std::uint8_t, 768> now{};
+                    const auto outcome = GuestMemory::CopyMapped(entry.address, std::span<std::byte>(reinterpret_cast<std::byte*>(now.data()), entry.span));
+                    if (outcome != GuestMemory::Compare::Unmapped && std::memcmp(now.data(), entry.bytes.data(), entry.span) == 0) continue;
+                    ++rewritten;
+                    std::uint32_t before = 0, after = 0, scaleBefore = 0, scaleAfter = 0;
+                    if (entry.span >= 0xe4) {
+                        std::memcpy(&before, entry.bytes.data() + 0xdc, 4);
+                        std::memcpy(&after, now.data() + 0xdc, 4);
+                        std::memcpy(&scaleBefore, entry.bytes.data() + 0xe0, 4);
+                        std::memcpy(&scaleAfter, now.data() + 0xe0, 4);
+                    }
+                    std::snprintf(part, sizeof(part), " 0x%llx(dc %08x->%08x e0 %08x->%08x)", static_cast<unsigned long long>(entry.address), before, after, scaleBefore, scaleAfter);
+                    detail += part;
+                }
+                std::fprintf(stderr, "[lut-done] built=%llu done=%llu batch=%llu ms=%.1f targets=%zu rewritten=%zu%s\n", static_cast<unsigned long long>(builtAt), static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(batch), std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - started).count(), seen->size(), rewritten, detail.c_str());
+            });
+        }
+    }
+    const bool changed = hash != lastHash;
+    lastHash = hash;
+    if (!changed && draws++ % 120 != 0) return;
+    std::fprintf(stderr, "[lut-probe] present=%llu draw=%llu changed=%d cachedHit=%d spaceReuse=%d tableEntries=%zu snapshots=%zu targets=%zu\n%s", static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(draws), changed ? 1 : 0, cachedHit ? 1 : 0, resources.SpaceReuse() ? 1 : 0, ranges.size(), snapshots.size(), targets.size(), text.c_str());
 }
 
 bool drawStagingEnabled() {
@@ -2302,10 +2484,64 @@ void CompactIndirectListRestart(const Context& context, const Pm4::DrawParameter
     inputs.indexOffset = 0;
 }
 
+// Debug aid (APS5_TRACE_MESH_BASE=1, off by default): KosmicKrisp before mesa patch 0007 lowered a mesh shader's
+// gl_WorkGroupID with a base read from the root-table words that hold the vertex binding strides 0..2 of the command
+// buffer's graphics state. A mesh draw recorded after a draw that read vertex buffers then ran with its workgroup id
+// shifted by those strides (x = primitive group, y = instance, z = layer): it emitted nothing or the wrong instances.
+// This follows the strides each command buffer was left with and counts the mesh draws recorded over nonzero ones:
+// one line per draw into the 32^3 tonemap LUT, and totals by colour target every 600 presents.
+void traceMeshBase(const Context& context, VkCommandBuffer commands, const State& state, const DrawInputs& inputs) {
+    static const bool on = std::getenv("APS5_TRACE_MESH_BASE") != nullptr;
+    if (!on) return;
+    struct Left {
+        std::uint64_t batch = 0;
+        std::array<std::uint32_t, 3> strides{};
+    };
+    struct Totals {
+        std::mutex mutex;
+        std::unordered_map<VkCommandBuffer, Left> left;
+        std::map<std::string, std::array<std::uint64_t, 2>> targets;
+        std::uint64_t mesh = 0;
+        std::uint64_t shifted = 0;
+        std::uint64_t vertex = 0;
+        std::uint64_t reportedAt = 0;
+    };
+    static auto* totals = new Totals();
+    std::lock_guard lock(totals->mutex);
+    const auto batch = context.recorder != nullptr ? context.recorder->OpenBatchSerial() : 0;
+    auto& left = totals->left[commands];
+    if (left.batch != batch || batch == 0) left = Left{batch, {}};
+    const auto present = Recorder::Presents();
+    if (!state.stages.mesh) {
+        ++totals->vertex;
+        for (const auto& binding : inputs.VertexLayout().bindings) {
+            if (binding.binding < left.strides.size()) left.strides[binding.binding] = binding.stride;
+        }
+    } else {
+        const bool shifted = left.strides[0] != 0 || left.strides[1] != 0 || left.strides[2] != 0;
+        ++totals->mesh;
+        if (shifted) ++totals->shifted;
+        const auto& color = !state.colors.empty() ? state.colors.front() : state.color;
+        char key[160];
+        std::snprintf(key, sizeof(key), "color %ux%ux%u%s fmt %d depth %ux%u groups %u", state.hasColorTarget ? color.extent.width : 0u, state.hasColorTarget ? color.extent.height : 0u, color.depth, color.volume ? " volume" : "", static_cast<int>(color.format), state.depth.has_value() ? state.depth->extent.width : 0u, state.depth.has_value() ? state.depth->extent.height : 0u, inputs.meshGroups);
+        ++totals->targets[key][shifted ? 1 : 0];
+        if (color.volume && color.extent.width == 32u && color.depth == 32u) std::fprintf(stderr, "[mesh-base] lut present=%llu batch=%llu base=%u,%u,%u\n", static_cast<unsigned long long>(present), static_cast<unsigned long long>(batch), left.strides[0], left.strides[1], left.strides[2]);
+    }
+    if (present >= totals->reportedAt + 600) {
+        std::fprintf(stderr, "[mesh-base] presents %llu..%llu: mesh draws %llu, over nonzero vertex strides %llu, other draws %llu\n", static_cast<unsigned long long>(totals->reportedAt), static_cast<unsigned long long>(present), static_cast<unsigned long long>(totals->mesh), static_cast<unsigned long long>(totals->shifted), static_cast<unsigned long long>(totals->vertex));
+        for (const auto& [name, counts] : totals->targets) std::fprintf(stderr, "[mesh-base]   %s: clean %llu shifted %llu\n", name.c_str(), static_cast<unsigned long long>(counts[0]), static_cast<unsigned long long>(counts[1]));
+        totals->targets.clear();
+        totals->mesh = totals->shifted = totals->vertex = 0;
+        totals->reportedAt = present;
+        if (totals->left.size() > 4096) totals->left.clear();
+    }
+}
+
 // The draw commands of one draw: the vertex and index buffer binds, then the direct draw, the
 // GPU-side indirect draw from `argumentBuffer` or the CPU-read records with the driver's rules.
 bool recordDrawCommandsImpl(const Context& context, VkCommandBuffer commands, const State& state, const Pm4::DrawParameters& draw, const DrawInputs& inputs, const IndirectRecord* indirect, VkBuffer argumentBuffer, VkDeviceSize argumentOffset, const DrawTraceContext* trace, std::uint32_t& subdraw, std::optional<std::uint32_t> pieceFirstIndex = std::nullopt) {
     bool emitted = false;
+    traceMeshBase(context, commands, state, inputs);
     if (context.recorder != nullptr) context.recorder->NoteSampledDraw(commands);
     const auto recorded = [&](std::uint32_t index) {
         if (trace != nullptr && context.recorder != nullptr) {
@@ -2772,7 +3008,7 @@ void captureInputs(const Context& context, Recorder& recorder, VkCommandBuffer c
         }
         const auto* imported = HostImportFor(context, begin, bytes);
         Require(imported != nullptr, "capture input has no host import");
-        addSample(begin, bytes, imported->buffer, HostImportOffset(*imported, begin), reinterpret_cast<const std::byte*>(begin));
+        addSample(begin, bytes, imported->buffer, HostImportOffset(*imported, begin), GuestAddr::HostPtr<const std::byte>(begin));
     }
     CaptureTrace::Log("input-capture draw=%llu batch=%llu target=%llx ranges=%zu bytes=%zu", draw, batch, static_cast<unsigned long long>(target), samples.size(), total);
     if (samples.empty()) return;
@@ -3040,6 +3276,30 @@ void recordDraw(const Context& context, const State& state, const Pm4::DrawParam
         };
     }
     recorder->LeaveRenderPassOpen(passKey, drawTiming, fenced, passAccess, std::move(storeProxies));
+    if (Recorder::PassProfileEnabled()) {
+        std::uint64_t vertexId = 0, fragmentId = 0;
+        for (const auto& shader : shaders) {
+            if (shader.program == nullptr) continue;
+            if (shader.stage == ShaderRecompiler::ShaderStage::Fragment) fragmentId = shader.program->variantId;
+            else if (vertexId == 0) vertexId = shader.program->variantId;
+        }
+        recorder->NotePassDraw([&] {
+            std::string text;
+            char piece[160];
+            std::size_t colors = 0;
+            const GuestTextureResource* first = nullptr;
+            for (const auto& target : record.targets) {
+                if (target == nullptr) continue;
+                if (first == nullptr) first = &target->Descriptor();
+                ++colors;
+            }
+            if (first != nullptr) std::snprintf(piece, sizeof(piece), "RT 0x%llx %ux%u fmt%u x%u", static_cast<unsigned long long>(first->baseAddress), first->width, first->height, first->format, first->samples);
+            else std::snprintf(piece, sizeof(piece), "RT none");
+            text = piece;
+            std::snprintf(piece, sizeof(piece), " +%zuC%s ext %ux%u |", colors, state.depth.has_value() ? " +D" : "", state.renderExtent.width, state.renderExtent.height);
+            return text + piece;
+        }, vertexId, fragmentId);
+    }
     timer.phase(PhaseRecord);
     keepRecordedDraw(*recorder, record.resources, std::move(record.pipeline), std::move(record.framebuffer), inputs, std::move(record.targets), std::move(record.targetSlices), state.scissor, std::move(scratch), std::move(checkRecords), record.listed, record.completion, outcome, drawUse, record.spaceKeep != nullptr && *record.spaceKeep != nullptr ? record.spaceKeep->get() : nullptr);
     timer.phase(PhaseKeep);
@@ -3318,7 +3578,37 @@ bool storesIntoResident(const ShaderResources& resources, const StorageTexture& 
     return std::ranges::any_of(resources.StorageImages(), [&](const std::pair<VkImage, bool>& image) { return image.first == resident.Image() && image.second; });
 }
 
+// nps5-popskip (rps5e's rule): while its pipeline compiles, a draw may be skipped or borrow a look-alike pipeline only if all it does
+// is colour into render targets that already hold the previous contents. Depth-only and depth-writing draws (shadow maps, z
+// prepass: a missing or culled-wrong caster is a visible shadow/occlusion error), stencil draws, draws that store anywhere else
+// (UAV, storage buffer, raw address, GDS) and draws with no colour write always wait for their exact pipeline. So do rect-list and
+// screen-sized (<= 4 vertices) draws: skipping a full-screen pass leaves the target at its cleared (black) contents.
+bool PopSkipEligible(const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders) {
+    if (!WritesOnlyRenderTargets(shaders)) return false;
+    if (state.depthWrite || state.stencilTest || state.depthCopySource || state.rectList || state.tessellationCapture != nullptr) return false;
+    if (draw.indirect.has_value() || draw.indexCount <= 4) return false;
+    bool colour = false;
+    for (std::size_t i = 0; i < state.colors.size(); ++i) {
+        if (i < state.blends.size() && state.blends[i].colorWriteMask != 0) colour = true;
+    }
+    return colour;
+}
+
 bool prepareDraw(const Context& context, const State& state, const Pm4::DrawParameters& draw, std::span<const CompiledShader> shaders, std::span<const GuestMemorySnapshot> snapshots, PreparedDraw& prepared) {
+    {
+        // nps5: a draw into a volume (3D) colour target starts a batch of its own. Interim workaround for KosmicKrisp before
+        // mesa/patches/0007: its mesh shaders read a workgroup id base from the root-table words that hold the vertex binding
+        // strides 0..2, so a mesh draw recorded after a vertex-buffer draw in the same command buffer ran with shifted
+        // group / instance / layer ids and emitted nothing (docs/nps5-mesh-shaders.md section 5). On PPSA30552 that froze the
+        // fade-to-black of the level load into Unreal's 32^3 tonemap LUT (seconds to minutes of black or dim gameplay) and
+        // dropped most injections into the 64^3 translucency lighting volumes. A fresh command buffer has zero strides.
+        // Costs one submit per such draw (5-9 per gameplay frame). Not needed on KosmicKrisp with patch 0007:
+        // APS5_NO_VOLUME_DRAW_OWN_BATCH=1 records the draw into the open batch (APS5_TRACE_MESH_BASE=1 counts exposed draws).
+        static const bool ownBatch = std::getenv("APS5_NO_VOLUME_DRAW_OWN_BATCH") == nullptr;
+        if (ownBatch && ((state.color.volume && state.color.depth > 1u) || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return color.volume && color.depth > 1u; }))) {
+            if (auto* active = Recorder::Active(); active != nullptr) active->Submit();
+        }
+    }
     auto*& recipeOut = prepared.recipeOut;
     auto& stencilReferences = prepared.stencilReferences;
     for (const auto& shader : shaders) {
@@ -3449,6 +3739,20 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             timer.phase(PhaseReadTarget);
             binding.proxied = AttachmentProxyFormat(context, color.format) != VK_FORMAT_UNDEFINED;
             targetViews.push_back(binding.proxied ? binding.resident->AttachmentProxyView() : binding.resident->AttachmentView(color.format, color.mip, color.depthSlice, color.layers, color.arraySlice));
+            if (color.volume && color.extent.width == 32u && color.depth == 32u) {
+                // Debug aid (APS5_TRACE_VOLUME): the Vulkan image and attachment view a draw into the 32^3 tonemap LUT renders to,
+                // to compare with the sampledView/storageImage of the [volume-lookup] lines; printed on change and every 64th draw.
+                static const bool traceVolume = std::getenv("APS5_TRACE_VOLUME") != nullptr;
+                if (traceVolume) {
+                    static std::uint64_t lastImage = 0, lastView = 0, count = 0;
+                    const auto image = reinterpret_cast<std::uint64_t>(binding.resident->Image());
+                    const auto view = reinterpret_cast<std::uint64_t>(targetViews.back());
+                    if (image != lastImage || view != lastView || count % 64 == 0) std::fprintf(stderr, "[volume-target] present=%llu 0x%llx resident=%p storageImage=0x%llx attachmentView=0x%llx proxied=%d depthSlice=%u layers=%u renderLayers=%u mip=%u draws=%llu\n", static_cast<unsigned long long>(Recorder::Presents()), static_cast<unsigned long long>(color.address), static_cast<const void*>(binding.resident.get()), static_cast<unsigned long long>(image), static_cast<unsigned long long>(view), binding.proxied ? 1 : 0, static_cast<unsigned>(color.depthSlice), static_cast<unsigned>(color.layers), static_cast<unsigned>(state.renderLayers), static_cast<unsigned>(color.mip), static_cast<unsigned long long>(count));
+                    lastImage = image;
+                    lastView = view;
+                    ++count;
+                }
+            }
             continue;
         }
         materializeCmaskClear(context, color, nullptr);
@@ -3513,6 +3817,10 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     bool recordable = recordDraws && recorder != nullptr && dumpLimit == 0 && std::all_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.resident != nullptr || binding.multisampled; });
     auto& resolved = prepared.resolved;
     resolved = resolveDrawResources(context, state, draw, shaders, snapshots, indexBytes, recordable, plan, outcome, timer);
+    {
+        static const bool traceLut = std::getenv("APS5_TRACE_VOLUME") != nullptr;
+        if (traceLut && resolved.resources != nullptr && ((state.color.volume && state.color.extent.width == 32u && state.color.depth == 32u) || std::any_of(state.colors.begin(), state.colors.end(), [](const auto& color) { return color.volume && color.extent.width == 32u && color.depth == 32u; }))) traceLutInputs(shaders, snapshots, *resolved.resources, resolved.built == nullptr);
+    }
     if (stopAfterResolve.load(std::memory_order_relaxed) != 0) {
         const auto stop = stopAfterResolve.exchange(0, std::memory_order_relaxed);
         if (stop == 1) return false;
@@ -3718,7 +4026,7 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
     if (!stencilReplay.empty()) {
         pipeline = stencilReplay.front().second;
     } else {
-        const bool memoized = stencilReferences.empty() && std::none_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied || binding.multisampled; });
+        bool memoized = stencilReferences.empty() && std::none_of(targets.begin(), targets.end(), [](const TargetBinding& binding) { return binding.proxied || binding.multisampled; });
         const auto layouts = resources->SetLayouts();
         std::uint64_t storeHash = 0;
         if (memoized) pipeline = shapePipeline(context, prepared.shape, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
@@ -3727,7 +4035,16 @@ bool prepareDraw(const Context& context, const State& state, const Pm4::DrawPara
             noteShapeMemoVerified(true);
         }
         const bool repeated = pipeline != nullptr;
-        if (!repeated) pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash);
+        if (!repeated) {
+            bool pending = false;
+            bool fallback = false;
+            // APS5_ASYNC_PIPELINES: a missing pipeline is built in the background. Meanwhile the draw uses a compiled pipeline that differs
+            // only in look-changing state (fallback), or is skipped if it writes nothing but its render targets; any other draw waits for
+            // its pipeline (compute always does). None of these is memoized.
+            pipeline = CachedPipeline(context, pipelineState, inputs.VertexLayout(), layouts, shaders, attachmentLayout, nullptr, &storeHash, &pending, AsyncPipelinesEnabled() && PopSkipEligible(pipelineState, draw, shaders), &fallback);
+            if (pending) return false;
+            if (fallback) memoized = false;
+        }
         if (memoized) rememberShape(context, prepared.shape, targets, repeated ? nullptr : &pipeline, storeHash, inputs.VertexLayout(), layouts, shaders, attachmentLayout, inputs.fragmentOutputs);
     }
     // Resident targets' views are stable while their storage image lives, so the framebuffer is

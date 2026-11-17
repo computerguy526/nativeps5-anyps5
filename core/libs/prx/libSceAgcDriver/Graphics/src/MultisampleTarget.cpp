@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/MemoryAccounting.hpp"
 #include <shared_mutex>
 #include "prx/libSceAgcDriver/Graphics/include/MultisampleTarget.hpp"
@@ -1215,7 +1216,7 @@ MultisampleTarget& createFilled(const Context& context, const GuestTextureResour
         GuestMemory::FlushGpuWrites(resource.dccAddress, static_cast<std::size_t>(htileBytes));
         if (!GuestMemory::Accessible(reinterpret_cast<const void*>(resource.dccAddress), static_cast<std::size_t>(htileBytes))) refuse(std::string("whose HTILE ") + htileRange + " is not mapped");
         std::vector<std::uint32_t> words(static_cast<std::size_t>(htileBytes / sizeof(std::uint32_t)));
-        std::memcpy(words.data(), reinterpret_cast<const void*>(resource.dccAddress), words.size() * sizeof(std::uint32_t));
+        std::memcpy(words.data(), GuestAddr::HostPtr<const void>(resource.dccAddress), words.size() * sizeof(std::uint32_t));
         htileCleared = words.front() == 0u;
         const auto mixed = std::find_if(words.begin(), words.end(), [&](std::uint32_t word) { return htileCleared ? word != 0u : (word & 15u) != 15u; });
         if (mixed != words.end()) {
@@ -1224,7 +1225,7 @@ MultisampleTarget& createFilled(const Context& context, const GuestTextureResour
             refuse(std::string("whose HTILE ") + htileRange + text + ", which is neither all cleared to 0.0 nor all expanded");
         }
     }
-    const auto* memory = reinterpret_cast<const std::byte*>(use.address);
+    const auto* memory = GuestAddr::HostPtr<const std::byte>(use.address);
     std::uint32_t value = 0;
     if (!htileCleared) std::memcpy(&value, memory, sizeof(value));
     char held[16];

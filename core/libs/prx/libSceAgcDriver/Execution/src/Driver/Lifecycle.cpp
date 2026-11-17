@@ -1,3 +1,4 @@
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/AsyncLog.hpp"
 #include "prx/libc/include/HostThread.hpp"
 #include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
@@ -37,6 +38,8 @@
 #endif
 #ifdef __APPLE__
 #include "prx/libSceAgcDriver/Execution/include/Driver/DriverMemory.hpp"
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #endif
 
 namespace AgcDriver::DriverDetail {
@@ -60,9 +63,12 @@ void PrintFailure(std::exception_ptr error) {
 }
 
 #ifdef __APPLE__
-constexpr std::uint64_t DriverMemoryAddress = MacOsDriverMemoryBase;
+// With bias 0 (guest address == host address) the page needs a free host address; MapDriverMemory takes the first free
+// slot from MacOsDriverMemoryBase, so these are run-time values (with a bias the page is at its guest address in the
+// runtime's reservation and they stay as they are).
+std::uint64_t DriverMemoryAddress = MacOsDriverMemoryBase;
 constexpr std::size_t DriverMemoryBytes = DriverMemorySpan;
-constexpr std::uint64_t FsTableAddress = RetargetPs5DriverMemory(0xfe0040000ull);
+std::uint64_t FsTableAddress = RetargetPs5DriverMemory(0xfe0040000ull);
 #else
 constexpr std::uint64_t DriverMemoryAddress = 0xfe0000000ull + GuestArena::GuestAddressOffset;
 constexpr std::size_t DriverMemoryBytes = 2u << 20u;
@@ -73,8 +79,8 @@ constexpr std::uint64_t FsTableSlots = 6u;
 constexpr std::uint64_t FsRoutineRecords = 8u;
 constexpr std::uint64_t FsRoutineRecordBytes = 16u;
 constexpr std::uint64_t FsRoutineTableBytes = FsRoutineRecords * FsRoutineRecordBytes;
-constexpr std::uint64_t FsRoutineTableAddress = FsTableAddress + FsTableSlots * FsTableSlotBytes;
-constexpr std::uint64_t FsRoutineAddress = FsRoutineTableAddress + FsRoutineTableBytes;
+std::uint64_t FsRoutineTableAddress() { return FsTableAddress + FsTableSlots * FsTableSlotBytes; }
+std::uint64_t FsRoutineAddress() { return FsRoutineTableAddress() + FsRoutineTableBytes; }
 constexpr std::uint32_t ScalarSetpcB64LinkS14 = 0xbe80200eu;
 constexpr std::uint32_t ScalarEndProgram = 0xbf810000u;
 constexpr std::uint64_t FsTableDword3 = 0x5204u;
@@ -85,30 +91,51 @@ void MapDriverMemory() {
     mapped = reinterpret_cast<void*>(DriverMemoryAddress);
     GuestArena::GuestArenaCommit_nid_postfix(mapped, DriverMemoryBytes, PAGE_READWRITE, DriverMemoryBytes);
 #elif defined(__APPLE__)
-    mapped = mmap(reinterpret_cast<void*>(DriverMemoryAddress), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    // Base mode: the driver page is guest memory at DriverMemoryAddress, so it lives at guest + bias inside the
+    // runtime's reservation (MAP_FIXED, but only when the range is inside that reservation).
+    if (AgcDriver::GuestAddr::Bias() != 0) {
+        if (!AgcDriver::GuestAddr::InArena(DriverMemoryAddress, DriverMemoryBytes)) throw std::runtime_error("the AGC driver memory is outside the guest arena");
+        mapped = mmap(AgcDriver::GuestAddr::HostPtr<void>(DriverMemoryAddress), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED, -1, 0);
+    } else {
+        // Guest == host. A hint-only mmap at a fixed address loses to whatever ASLR put there (the intermittent "driver
+        // memory was not mapped at its fixed address" of the AGC tests, about 8 % of runs). The page only has to have the
+        // same guest and host address, not one particular address (every user reads DriverMemoryAddress/FsTableAddress),
+        // so: the preferred address if it is free (mach_vm_allocate with VM_FLAGS_FIXED fails cleanly and never
+        // overwrites), otherwise wherever the kernel finds room.
+        mach_vm_address_t at = MacOsDriverMemoryBase;
+        kern_return_t result = mach_vm_allocate(mach_task_self(), &at, DriverMemoryBytes, VM_FLAGS_FIXED);
+        if (result != KERN_SUCCESS) {
+            at = 0;
+            result = mach_vm_allocate(mach_task_self(), &at, DriverMemoryBytes, VM_FLAGS_ANYWHERE);
+        }
+        if (result != KERN_SUCCESS) throw std::runtime_error("cannot allocate the AGC driver memory (kern_return " + std::to_string(result) + ")");
+        mapped = reinterpret_cast<void*>(at);
+        DriverMemoryAddress = at;
+        FsTableAddress = at + 0x40000ull;
+    }
     if (mapped == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map the AGC driver memory");
-    if (reinterpret_cast<std::uint64_t>(mapped) != DriverMemoryAddress) munmap(mapped, DriverMemoryBytes);
+    if (AgcDriver::GuestAddr::Bias() != 0 && AgcDriver::GuestAddr::HostToGuest(mapped) != DriverMemoryAddress) munmap(mapped, DriverMemoryBytes);
 #else
     mapped = mmap(reinterpret_cast<void*>(DriverMemoryAddress), DriverMemoryBytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
     if (mapped == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "map the AGC driver memory");
 #endif
-    if (reinterpret_cast<std::uint64_t>(mapped) != DriverMemoryAddress) throw std::runtime_error("the AGC driver memory was not mapped at its fixed address");
-    auto* routineTable = reinterpret_cast<std::uint64_t*>(FsRoutineTableAddress);
+    if (AgcDriver::GuestAddr::HostToGuest(mapped) != DriverMemoryAddress) throw std::runtime_error("the AGC driver memory was not mapped at its fixed address");
+    auto* routineTable = AgcDriver::GuestAddr::HostPtr<std::uint64_t>(FsRoutineTableAddress());
     for (std::uint64_t record = 0; record < FsRoutineRecords; ++record) {
-        routineTable[record * 2u] = FsRoutineAddress;
+        routineTable[record * 2u] = FsRoutineAddress();
         routineTable[record * 2u + 1u] = 0u;
     }
-    auto* routine = reinterpret_cast<std::uint32_t*>(FsRoutineAddress);
+    auto* routine = AgcDriver::GuestAddr::HostPtr<std::uint32_t>(FsRoutineAddress());
     routine[0] = ScalarSetpcB64LinkS14;
     routine[1] = ScalarEndProgram;
-    auto* slot = reinterpret_cast<std::uint64_t*>(FsTableAddress);
-    slot[0] = (FsRoutineTableAddress & 0xffffffffffffull) | 16ull << 48u;
+    auto* slot = AgcDriver::GuestAddr::HostPtr<std::uint64_t>(FsTableAddress);
+    slot[0] = (FsRoutineTableAddress() & 0xffffffffffffull) | 16ull << 48u;
     slot[1] = FsTableDword3 << 32u | FsRoutineRecords;
 #ifndef _WIN32
     GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(mapped, DriverMemoryBytes);
 #endif
     GuestAllocations::Mutation mutation;
-    mutation.Add(mapped, DriverMemoryBytes, true, true, true);
+    mutation.Add(reinterpret_cast<void*>(DriverMemoryAddress), DriverMemoryBytes, true, true, true);  // the registry is keyed by guest address
 }
 
 bool StackHoldsImport() {

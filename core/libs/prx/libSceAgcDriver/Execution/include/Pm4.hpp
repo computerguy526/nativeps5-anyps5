@@ -114,6 +114,8 @@ bool WaitSatisfiedUnchecked(std::span<const std::uint32_t> packet);
 bool WaitComparesValue(std::span<const std::uint32_t> packet, std::uint64_t value);
 bool WaitCompares(std::uint32_t function, std::uint64_t reference, std::uint64_t mask, std::uint64_t value);
 std::size_t WaitAwaitedBytes(std::span<const std::uint32_t> packet);
+// ATOMIC_MEM (0x1e): the operand width of the atomic op in dword 1 (bit 6 selects 64-bit).
+std::size_t AtomicMemBytes(std::span<const std::uint32_t> packet);
 std::size_t ConditionalWords(std::span<const std::uint32_t> packet);
 std::uint32_t ReadCondition(std::span<const std::uint32_t> packet);
 // A label write (RELEASE_MEM with a data select, WRITE_DATA to memory): the destination and the

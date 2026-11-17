@@ -3,10 +3,20 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver/Diagnostics.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Driver/Queues/WorkerAffinity.hpp"
 #include "prx/libSceAgcDriver/Execution/include/GuestMemory.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/PipelineCreateStats.hpp"
 #include "prx/libSceAgcDriver/Execution/include/PerformanceTimer.hpp"
 #include <algorithm>
+#include <chrono>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <optional>
+#include <thread>
+#include "prx/libSceAgcDriver/Graphics/include/PipelineJournal.hpp"
 #include "prx/libSceAgcDriver/Execution/include/TracyZone.hpp"
 #include <cstdlib>
+#include "prx/libSceAgcDriver/Execution/include/ProgressScreen.hpp"
+#include "prx/libSceAgcDriver/Execution/include/VulkanDevice.hpp"
 
 namespace AgcDriver::DriverDetail {
 
@@ -62,21 +72,168 @@ void Driver::UnregisterVideoOutput(std::uint32_t handle, const std::shared_ptr<I
     outputs.erase(it);
 }
 
+// nps5: before the guest's first frame, build every pipeline of the journal that the cache does not hold yet, on the whole pool
+// (the replay runs with Now priority while the prebuild mode is on). Progress goes to the log and to the window title as
+// "Compiling shaders  N / M  [#####-----]". NPS5_PREBUILD=0 skips it; NPS5_PREBUILD_SECONDS (default 120) bounds it: the game then starts
+// and the replay goes on in the background. A warm cache finishes in well under a second and shows nothing.
+// nps5: one frame of the progress screen through the presenter's own path (resize, acquire, PresentClear with the progress layout, queue present). Runs on the thread
+// that attaches the window (the guest has not drawn a frame yet, so nothing else presents). NPS5_PREBUILD_SCREEN=0 leaves it to the window title. A minimized window or a dropped frame just skips this frame; only repeated hard failures (kMaxProgressFailures in a row) turn the screen off.
+static bool ShowProgressFrame(const PresentationWindow& window, VulkanDevice& dev, const ProgressScreenInfo& info) {
+    static constexpr int kMaxProgressFailures = 5;
+    static thread_local int failures = 0;
+    try {
+        std::uint32_t width = 0, height = 0;
+        window.getDrawableSize(window.context, &width, &height);
+        if (width == 0 || height == 0) return true;  // minimized: skip this frame
+        bool presentable = false;
+        {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            dev.Resize(width, height);
+            presentable = dev.Presentable();
+            if (presentable) dev.SetProgressScreen(info);
+        }
+        if (!presentable) return true;
+        dev.RetirePresents(0);
+        if (!dev.AcquireImage()) return true;
+        bool submitted = false;
+        {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            submitted = dev.PresentClear(window.width, window.height, true, nullptr);
+        }
+        if (!submitted) return true;
+        if (dev.PresentsOnOwnQueue()) {
+            dev.QueuePresent();
+        } else {
+            std::lock_guard lock(GuestMemory::GpuMutex());
+            dev.QueuePresent();
+        }
+        dev.FinishPresent();
+        failures = 0;
+        return true;
+    } catch (const std::exception& error) {
+        if (++failures < kMaxProgressFailures) {
+            std::fprintf(stderr, "[prebuild] progress frame skipped: %s\n", error.what());
+            return true;
+        }
+        std::fprintf(stderr, "[prebuild] progress screen off after %d failures: %s\n", failures, error.what());
+        return false;
+    }
+}
+
+static void PrebuildPipelines(const PresentationWindow& window, const std::shared_ptr<VulkanDevice>& dev) {
+    static const bool screenOn = [] { const char* value = std::getenv("NPS5_PREBUILD_SCREEN"); return value == nullptr || std::strcmp(value, "0") != 0; }();
+    bool screen = screenOn && dev != nullptr && window.getDrawableSize != nullptr;
+    double rateBase = -1.0;
+    std::uint64_t rateDone = 0;
+    double lastFrame = -1.0;
+    std::uint64_t lastFrameDone = ~0ull;
+    const char* limitText = std::getenv("NPS5_PREBUILD_SECONDS");
+    const double limit = limitText != nullptr ? std::strtod(limitText, nullptr) : 120.0;
+    const auto begin = std::chrono::steady_clock::now();
+    const auto elapsed = [&] { return std::chrono::duration<double>(std::chrono::steady_clock::now() - begin).count(); };
+    double lastLog = 0.0;
+    bool shown = false;
+    for (;;) {
+        const auto progress = Graphics::PipelineJournalProgress();
+        const double now = elapsed();
+        if (progress.finished) break;
+        if (window.stop.stop_requested()) break;
+        if (window.pollQuit != nullptr && window.pollQuit(window.context)) {
+            std::fprintf(stderr, "[prebuild] window closed during the prebuild: stopping it, the process exits\n");
+            break;
+        }
+        if (!Graphics::PipelineJournalReplayActive() && now > 2.0) break;  // no replay (journal off, or another device)
+        if (now >= limit) {
+            std::fprintf(stderr, "[prebuild] stopped after %.0f s at %llu / %llu (NPS5_PREBUILD_SECONDS); the game starts, the rest builds in the background\n", now, static_cast<unsigned long long>(progress.done), static_cast<unsigned long long>(progress.total));
+            break;
+        }
+        if (progress.loaded && progress.total != 0 && now > 0.5) {
+            if (screen && (progress.done != lastFrameDone || now - lastFrame >= 1.0)) {
+                if (rateBase < 0.0 && progress.done != 0) {
+                    rateBase = now;
+                    rateDone = progress.done;
+                }
+                double eta = -1.0;
+                if (rateBase >= 0.0 && now - rateBase >= 1.0 && progress.done > rateDone) eta = static_cast<double>(progress.total - std::min(progress.total, progress.done)) * (now - rateBase) / static_cast<double>(progress.done - rateDone);
+                ProgressScreenInfo info;
+                info.done = progress.done;
+                info.total = progress.total;
+                info.etaSeconds = eta;
+                lastFrame = now;
+                lastFrameDone = progress.done;
+                screen = ShowProgressFrame(window, *dev, info);
+            }
+            if (window.setStatus != nullptr) {
+                const std::size_t cells = 20;
+                const std::size_t filled = static_cast<std::size_t>(cells * progress.done / progress.total);
+                char text[96];
+                std::snprintf(text, sizeof(text), "Shaders %llu/%llu [%s%s]", static_cast<unsigned long long>(progress.done), static_cast<unsigned long long>(progress.total), std::string(filled, '#').c_str(), std::string(cells - filled, '-').c_str());
+                window.setStatus(window.context, text);
+            }
+            if (now - lastLog >= 2.0) {
+                lastLog = now;
+                shown = true;
+                std::fprintf(stderr, "[prebuild] Compiling shaders  %llu / %llu (%.0f s)\n", static_cast<unsigned long long>(progress.done), static_cast<unsigned long long>(progress.total), now);
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+    const auto progress = Graphics::PipelineJournalProgress();
+    std::fprintf(stderr, "[prebuild] %llu / %llu pipelines in %.1f s before the first frame%s\n", static_cast<unsigned long long>(progress.done), static_cast<unsigned long long>(progress.total), elapsed(), shown ? "" : " (nothing to compile)");
+    if (shown && window.setStatus != nullptr) window.setStatus(window.context, "Starting");
+}
+
+namespace {
+// nps5: leaves the prebuild mode and clears the progress screen on every exit path of AttachWindow (including exceptions).
+struct PrebuildGuard {
+    VulkanDevice* dev = nullptr;
+    bool screenSafe = false;  // the GPU mutex is not held by the owner
+    ~PrebuildGuard() {
+        try {
+            if (dev != nullptr && screenSafe) {
+                std::lock_guard lock(GuestMemory::GpuMutex());
+                dev->ClearProgressScreen();
+            }
+        } catch (...) {
+        }
+        Graphics::SetPipelinePrebuildMode(false);
+    }
+};
+}
+
 void Driver::AttachWindow(const PresentationWindow& window) {
     CheckFailure();
     std::unique_lock replacing(deviceReplacement);
     GuestMemory::TagGpuLockSite(GuestMemory::GpuLockSite::Present);
     PerformanceTimer timing("Driver.AttachWindow");
-    std::lock_guard lock(GuestMemory::GpuMutex());
+    std::unique_lock lock(GuestMemory::GpuMutex());
     timing.Mark("gpu_mutex_wait");
+    static const bool prebuildOn = [] { const char* value = std::getenv("NPS5_PREBUILD"); return value == nullptr || std::strcmp(value, "0") != 0; }();
+    const bool prebuild = prebuildOn && Graphics::PipelineJournalEnabled();
+    std::optional<PrebuildGuard> prebuildGuard;
+    if (prebuild) {
+        Graphics::SetPipelinePrebuildMode(true);
+        prebuildGuard.emplace();
+    }
     if (device) {
         require(device->Window() == nullptr, "a window is already attached to the device");
         device->PrepareForReplacement();
         replacedDevices.push_back(device);
         timing.Mark("device_replacement");
     }
-    device = std::make_shared<VulkanDevice>(&window);
+    {
+        Graphics::GpuStallScope stall;  // vkCreateDevice builds Metal pipelines: up to ~1 s on a cold OS cache
+        device = std::make_shared<VulkanDevice>(&window);
+    }
     timing.Mark("vulkan_device_create");
+    if (!prebuild) return;
+    lock.unlock();  // the replay's builds never take the GPU mutex; the guest has not drawn a frame yet
+    const auto prebuildDevice = device.Load();
+    prebuildGuard->dev = prebuildDevice.get();
+    prebuildGuard->screenSafe = true;
+    PrebuildPipelines(window, prebuildDevice);
+    prebuildGuard.reset();
+    timing.Mark("prebuild");
 }
 
 void Driver::TracePresent(std::uint32_t width, std::uint32_t height) {

@@ -10,6 +10,7 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/ShaderPreparationScope.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderUtils.hpp"
+#include "prx/libSceAgc/Shader/include/ShaderView.hpp"
 #include "prx/libSceAgc/Shader/include/ShaderConstants.hpp"
 
 namespace {
@@ -26,13 +27,17 @@ void RequireSpecialOffset(const ShaderRegister& reg, std::uint32_t expected, con
 
 extern "C" {
 
-int APS5_VABI sceAgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs, const Shader* hs, const Shader* gs, std::uint32_t prim_type) {
+int APS5_VABI sceAgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_regs, const Shader* hsHost, const Shader* gsHost, std::uint32_t prim_type) {
     if (cx_regs == nullptr && uc_regs == nullptr) {
         return 0;
     }
-    if (gs == nullptr) {
+    if (gsHost == nullptr) {
         throw std::runtime_error(std::string(__func__) + ": gs is null");
     }
+    // Host views of the guest-resident headers; the driver gets the guest-valued pointers (hsView.guest()).
+    const Agc::Guest::ShaderView hsView(hsHost), gsView(gsHost);
+    const Shader* const hs = hsView.get();
+    const Shader* const gs = gsView.get();
 
     if (gs->type != static_cast<std::uint8_t>(ShaderRegs::ShaderBinaryType::Gs) || gs->specials == nullptr || (hs != nullptr && (hs->type != static_cast<std::uint8_t>(ShaderRegs::ShaderBinaryType::Hs) || hs->specials == nullptr))) {
         throw std::runtime_error(std::string(__func__) + ": invalid shader type or missing special registers");
@@ -54,10 +59,10 @@ int APS5_VABI sceAgcCreatePrimState(ShaderRegister* cx_regs, ShaderRegister* uc_
         contextValues[1] = {ShaderRegs::VGT_GS_OUT_PRIM_TYPE, GraphicsPrimTypeToGsOut(prim_type)};
     }
     std::array<ShaderRegister, 3> primitiveValues{gs->specials->ge_cntl, hs != nullptr ? hs->specials->ge_user_vgpr_en : gs->specials->ge_user_vgpr_en, ShaderRegister{ShaderRegs::VGT_PRIMITIVE_TYPE, prim_type}};
-    const std::array<const Shader*, 2> stages{hs, gs};
+    const std::array<const Shader*, 2> stages{hsView.guest(), gsView.guest()};
     const bool patch = prim_type == static_cast<std::uint32_t>(ShaderRegs::PrimitiveType::Patch);
     if (patch == ((contextValues[0].value & ShaderRegs::VGT_SHADER_STAGES_HS_BIT) != 0)) {
-        AgcDriver::ShaderPreparationScope transaction({hs, gs});
+        AgcDriver::ShaderPreparationScope transaction({hsView.guest(), gsView.guest()});
         AgcDriverResolveGraphicsStagesAbi_nid_postfix(std::span(stages).subspan(hs == nullptr ? 1u : 0u), contextValues, primitiveValues);
         transaction.Commit();
     }
