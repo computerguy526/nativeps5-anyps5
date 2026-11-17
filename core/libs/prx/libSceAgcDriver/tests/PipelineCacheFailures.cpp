@@ -47,6 +47,7 @@ std::atomic<bool> failStartup{false};
 std::atomic<unsigned> queries{0};
 std::atomic<unsigned> faults{0};
 std::size_t initialBytes = 64;
+std::atomic<std::size_t> lastInitialSize{0};
 
 std::vector<std::byte> Payload() {
     std::vector<std::byte> bytes(initialBytes);
@@ -58,6 +59,7 @@ std::vector<std::byte> Payload() {
 VKAPI_ATTR VkResult VKAPI_CALL Create(VkDevice, const VkPipelineCacheCreateInfo* info, const VkAllocationCallbacks*, VkPipelineCache* output) {
     std::lock_guard lock(mutex);
     *output = reinterpret_cast<VkPipelineCache>(next++);
+    lastInitialSize = info->initialDataSize;
     if (info->initialDataSize != 0) {
         const auto* bytes = static_cast<const std::byte*>(info->pInitialData);
         caches[*output] = std::vector<std::byte>(bytes, bytes + info->initialDataSize);
@@ -120,10 +122,100 @@ void Grow(VkPipelineCache cache, std::size_t bytes = 128) {
 
 }
 
+// nps5: what a launch does with a cache file that is corrupted, partial, for another device or driver, over the size cap, or
+// accompanied by the temporary files of a killed save; and that the size cap keeps an oversized blob from being written.
+std::vector<std::byte> CraftFile(std::uint32_t vendor, std::uint32_t device, const std::array<std::uint8_t, 16>& uuid, std::size_t payloadBytes, std::uint32_t magic = 0x50565041u) {
+    std::vector<std::byte> payload(payloadBytes, std::byte{7});
+    const std::array<std::uint32_t, 4> header{32, VK_PIPELINE_CACHE_HEADER_VERSION_ONE, vendor, device};
+    std::memcpy(payload.data(), header.data(), sizeof(header));
+    std::memcpy(payload.data() + 16, uuid.data(), uuid.size());
+    struct FileHeader { std::uint32_t magic, format; std::uint64_t dataBytes, dataHash; } fileHeader{magic, 1, payload.size(), ShaderRecompiler::HashBytes(payload)};
+    std::vector<std::byte> file(sizeof(fileHeader) + payload.size());
+    std::memcpy(file.data(), &fileHeader, sizeof(fileHeader));
+    std::memcpy(file.data() + sizeof(fileHeader), payload.data(), payload.size());
+    return file;
+}
+
+void Write(const std::filesystem::path& path, const std::vector<std::byte>& bytes) {
+    std::ofstream file(path, std::ios::binary | std::ios::trunc);
+    file.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+}
+
+int Validation(const std::filesystem::path& root, Context& context, VkPhysicalDeviceProperties& properties) {
+    const std::array<std::uint8_t, 16> uuid{};
+    std::array<std::uint8_t, 16> other{};
+    other[3] = 1;
+    {
+        PipelineCache first(context, properties);
+        first.SaveNow();
+    }
+    std::filesystem::path file;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) if (entry.path().extension() == ".bin") file = entry.path();
+    Check(!file.empty(), "the first save created no cache file");
+    const auto attempt = [&](const std::vector<std::byte>& bytes, std::size_t expectedInitial, const char* what) {
+        Write(file, bytes);
+        lastInitialSize = 12345;
+        PipelineCache cache(context, properties);
+        Check(lastInitialSize == expectedInitial, what);
+    };
+    const auto good = CraftFile(13, 42, uuid, 4096);
+    attempt(good, 4096, "a valid cache file was not loaded");
+    auto truncated = good;
+    truncated.resize(good.size() / 2);
+    attempt(truncated, 0, "a truncated cache file was loaded");
+    attempt(std::vector<std::byte>(10, std::byte{1}), 0, "a file shorter than its header was loaded");
+    attempt({}, 0, "an empty cache file was loaded");
+    auto flipped = good;
+    flipped[flipped.size() - 5] ^= std::byte{0x40};
+    attempt(flipped, 0, "a cache file with a flipped byte (checksum mismatch) was loaded");
+    attempt(CraftFile(13, 42, other, 4096), 0, "a cache file made for another driver build (pipelineCacheUUID) was loaded");
+    attempt(CraftFile(14, 42, uuid, 4096), 0, "a cache file made for another vendor was loaded");
+    attempt(CraftFile(13, 43, uuid, 4096), 0, "a cache file made for another device was loaded");
+    attempt(CraftFile(13, 42, uuid, 4096, 0x12345678u), 0, "a cache file with a foreign magic was loaded");
+    setenv("APS5_VK_PIPELINE_CACHE_MAX_MIB", "1", 1);
+    attempt(CraftFile(13, 42, uuid, (2u << 20u)), 0, "a cache file over the size cap was loaded");
+    attempt(CraftFile(13, 42, uuid, 4096), 4096, "a cache file under the size cap was not loaded");
+    {
+        // An oversized blob is not written: the file on disk stays as it was.
+        Write(file, good);
+        const auto before = Read(file);
+        PipelineCache cache(context, properties);
+        Grow(cache.Handle(), 3u << 20u);
+        cache.SaveNow();
+        Check(Read(file) == before, "a cache blob over the size cap replaced the file");
+    }
+    unsetenv("APS5_VK_PIPELINE_CACHE_MAX_MIB");
+    {
+        // Temporary files of a killed save: an old one is removed at launch, a recent one (another live save) is kept.
+        Write(file, good);
+        const auto old = std::filesystem::path(file.string() + ".tmp.111.0");
+        const auto recent = std::filesystem::path(file.string() + ".tmp.222.0");
+        Write(old, good);
+        Write(recent, good);
+        std::filesystem::last_write_time(old, std::filesystem::file_time_type::clock::now() - 3h);
+        PipelineCache cache(context, properties);
+        Check(!std::filesystem::exists(old), "a stale temporary file of a killed save was kept");
+        Check(std::filesystem::exists(recent), "a recent temporary file (a live save) was removed");
+    }
+    {
+        // The atomic write leaves exactly one file behind.
+        Write(file, good);
+        PipelineCache cache(context, properties);
+        Grow(cache.Handle(), 8192);
+        cache.SaveNow();
+        std::size_t temporaries = 0;
+        for (const auto& entry : std::filesystem::directory_iterator(file.parent_path())) temporaries += entry.path().filename().string().find(".tmp.") != std::string::npos && entry.path().filename().string().rfind(file.filename().string(), 0) == 0 && entry.path().filename() != std::filesystem::path(file.string() + ".tmp.222.0").filename();
+        Check(temporaries == 0, "a save left a temporary file behind");
+        Check(Read(file).size() == 24 + 8192, "the save did not write the grown cache");
+    }
+    std::puts("validation: corrupt, partial, foreign, oversize and stale-temporary cache files are rejected or cleaned safely");
+    return 0;
+}
+
 int main(int argc, char** argv) {
     Check(argc == 2, "expected startup, now, busy, destructor, worker or read-retry");
     const std::string_view mode(argv[1]);
-    Check(mode == "startup" || mode == "now" || mode == "busy" || mode == "destructor" || mode == "worker" || mode == "read-retry", "unknown mode");
+    Check(mode == "startup" || mode == "now" || mode == "busy" || mode == "destructor" || mode == "worker" || mode == "read-retry" || mode == "validation", "unknown mode");
 #ifndef _WIN32
     if (mode == "read-retry") return 77;
 #endif
@@ -164,6 +256,7 @@ int main(int argc, char** argv) {
         std::puts("startup: propagated the allocation failure, released the cache and allowed recreation");
         return 0;
     }
+    if (mode == "validation") return Validation(root, context, properties);
     if (mode == "read-retry") initialBytes = 32768;
     auto cache = std::make_unique<PipelineCache>(context, properties);
     cache->SaveNow();

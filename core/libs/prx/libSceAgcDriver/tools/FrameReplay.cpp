@@ -3,12 +3,15 @@
 #include "prx/libSceAgcDriver/Execution/include/Driver.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameCapture.hpp"
 #include "prx/libSceAgcDriver/Execution/include/FrameDumpIo.hpp"
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 #include "prx/libSceAgcDriver/Execution/include/Pm4.hpp"
 #include "prx/libSceAgcDriver/Execution/include/VideoOutput.hpp"
+#include "prx/libSceAgcDriver/Graphics/include/Texture.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Acb.hpp"
 #include "prx/libSceAgcDriver/Submit/include/Dcb.hpp"
 #include "prx/libc/include/GuestAllocations.hpp"
 #include "prx/libc/include/GuestArena.hpp"
+#include "prx/libc/include/GuestWriteWatch.hpp"
 #include "SceTypes.hpp"
 #include <algorithm>
 #include <array>
@@ -44,6 +47,12 @@
 #include <sys/mman.h>
 #include <unistd.h>
 #endif
+#ifdef __APPLE__
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -55,6 +64,7 @@ using AgcDriver::FrameMemoryKind;
 using AgcDriver::FrameRangeAccess;
 using AgcDriver::FrameRangeKind;
 using Clock = std::chrono::steady_clock;
+namespace GuestAddr = AgcDriver::GuestAddr;
 
 struct Dump {
     std::uint64_t address = 0;
@@ -76,6 +86,8 @@ struct Options {
     bool synthesize = true;
     std::size_t repeat = 1;
     bool shaders = false;
+    std::uint64_t bias = 0;  // forced host base of the guest window (0: first free 2^40 slot)
+    bool noBias = false;     // identity placement (the capture's addresses are the host addresses)
     std::filesystem::path shaderCode;
     std::size_t submits = 0;
     bool traceSerials = false;
@@ -152,7 +164,7 @@ std::uint64_t headerNumber(const std::string& header, std::string_view key) {
 }
 
 void restore(const FrameCaptureReader& reader, const FrameMemoryChunk& chunk) {
-    reader.Read(chunk, std::span(reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk.address)), static_cast<std::size_t>(chunk.bytes)));
+    reader.Read(chunk, std::span(GuestAddr::HostPtr<std::byte>(chunk.address), static_cast<std::size_t>(chunk.bytes)));
 }
 
 bool committedWritable(std::uint64_t address, std::uint64_t bytes) {
@@ -279,11 +291,165 @@ void restoreSnapshot(const FrameCaptureReader& reader, const Skipped& skipped) {
     }
 }
 
+
+// ---- Base-mode guest memory (docs/m1/memory.md, docs/nps5-gpu-addr.md) ---------------------------------
+// The capture's memory sits at guest addresses (0x2_0000_0000 ...) that a macOS arm64 process cannot use
+// (the dyld shared cache is there). The replay reserves one host window of 2^40 bytes at a multiple of 2^40,
+// sets the driver's bias to its base (host = guest + bias) and maps every captured range at guest + bias
+// inside it. Nothing outside the reservation is ever mapped over, and a reservation that lands on
+// something else is given back and the next slot is tried.
+#ifdef __APPLE__
+struct Reservation {
+    std::uint64_t base = 0;  // host address of guest 0
+    std::uint64_t bytes = 0;
+};
+
+Reservation& reservation() {
+    static Reservation value;
+    return value;
+}
+
+bool biased() { return reservation().bytes != 0; }
+
+// Non-destructive: a hint without MAP_FIXED never replaces a mapping; a result at another address is released.
+bool reserveGuestWindow(std::uint64_t forced) {
+    constexpr std::uint64_t Window = 1ull << 40;
+    auto attempt = [&](std::uint64_t base) {
+        void* const placed = mmap(reinterpret_cast<void*>(base), Window, PROT_NONE, MAP_PRIVATE | MAP_ANON | MAP_NORESERVE, -1, 0);
+        if (placed == MAP_FAILED) return false;
+        if (reinterpret_cast<std::uint64_t>(placed) != base) {
+            munmap(placed, Window);
+            return false;
+        }
+        reservation() = {base, Window};
+        return true;
+    };
+    bool ok = false;
+    if (forced != 0) ok = attempt(forced);
+    else for (std::uint64_t slot = 1; slot < (1ull << 7) && !ok; ++slot) ok = attempt(slot * Window);
+    if (!ok) return false;
+    AgcSetGuestBias(static_cast<std::int64_t>(reservation().base));
+    AgcSetGuestArena(0x400000ull, Window);
+    // Driver-owned memory that needs a guest address (GDS, the float probes' buffers): 256 MiB of guest address space the captures do not use.
+    AgcSetGuestScratch(0xF0'0000'0000ull, 256ull << 20);
+    std::fprintf(stderr, "[frame-replay] guest arena: host window 0x%llx-0x%llx, bias 0x%llx\n", static_cast<unsigned long long>(reservation().base), static_cast<unsigned long long>(reservation().base + Window), static_cast<unsigned long long>(reservation().base));
+    return true;
+}
+
+// Whether every page of the guest range is already mapped read-write in the host process (the driver's own page).
+bool hostWritable(std::uint64_t guest, std::uint64_t bytes) {
+    auto at = static_cast<mach_vm_address_t>(GuestAddr::HostAddress(guest));
+    const auto end = at + bytes;
+    while (at < end) {
+        mach_vm_address_t region = at;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        if (mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object) != KERN_SUCCESS || region > at) return false;
+        if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) return false;
+        at = region + size;
+    }
+    return true;
+}
+
+// Commit guest [address, address + bytes) read-write. MAP_FIXED, but only inside our own reservation, and only
+// over pages that are still the reservation's inaccessible ones: anything else is refused, never replaced.
+void mapGuestRange(std::uint64_t address, std::uint64_t bytes) {
+    const auto page = static_cast<std::uint64_t>(getpagesize());
+    const auto first = address & ~(page - 1);
+    const auto last = (address + bytes + page - 1) & ~(page - 1);
+    const auto host = GuestAddr::HostAddress(first);
+    if (first < 0x400000 || last > (1ull << 40) || host < reservation().base || host + (last - first) > reservation().base + reservation().bytes) throw std::runtime_error("frame replay: capture range 0x" + std::to_string(address) + " is outside the guest window");
+    auto at = static_cast<mach_vm_address_t>(host);
+    const auto end = at + (last - first);
+    while (at < end) {
+        mach_vm_address_t region = at;
+        mach_vm_size_t size = 0;
+        vm_region_basic_info_data_64_t info{};
+        mach_msg_type_number_t count = VM_REGION_BASIC_INFO_COUNT_64;
+        mach_port_t object = MACH_PORT_NULL;
+        const auto status = mach_vm_region(mach_task_self(), &region, &size, VM_REGION_BASIC_INFO_64, reinterpret_cast<vm_region_info_t>(&info), &count, &object);
+        if (status != KERN_SUCCESS || region > at) throw std::runtime_error("frame replay: the guest window lost its reservation");
+        if (info.protection != VM_PROT_NONE) {
+            // Already mapped read-write by us earlier (a range that shares a page with the previous one): keep it.
+            if ((info.protection & (VM_PROT_READ | VM_PROT_WRITE)) != (VM_PROT_READ | VM_PROT_WRITE)) throw std::runtime_error("frame replay: capture range overlaps memory the replay does not own");
+        } else {
+            const auto stop = std::min<mach_vm_address_t>(end, region + size);
+            if (mmap(reinterpret_cast<void*>(at), static_cast<std::size_t>(stop - at), PROT_READ | PROT_WRITE, MAP_FIXED | MAP_PRIVATE | MAP_ANON, -1, 0) == MAP_FAILED) throw std::system_error(errno, std::generic_category(), "frame replay: commit guest memory");
+        }
+        at = std::max<mach_vm_address_t>(at + 1, region + size);
+        at = std::min(at, end);
+        if (region + size >= end) break;
+    }
+}
+#else
+bool biased() { return false; }
+bool reserveGuestWindow(std::uint64_t) { return false; }
+#endif
+
+// A base-mode title (host window = guest + bias) records its guest allocations as kind Host because the recorder compares them
+// with a mis-based arena; a captured range inside the guest window is guest memory all the same.
+template<typename Chunk> bool inGuestWindow(const Chunk& chunk) { return chunk.address >= 0x400000ull && chunk.address + chunk.bytes <= (1ull << 40); }
+
+Skipped restoreMemoryBiased(const FrameCaptureReader& reader) {
+#ifdef __APPLE__
+    if (reader.Version() < 2) throw std::runtime_error("frame replay: calls format 1 does not record whether GPU writes had landed before each memory delta was read; record the capture again");
+    progress();
+    Skipped skipped;
+    // Ranges outside the arena (kind Host: pages the process owns) cannot be placed at guest + bias; one the GPU reads is fatal.
+    for (const auto& chunk : reader.Chunks()) {
+        if (chunk.kind != FrameMemoryKind::Range || chunk.rangeKind != FrameRangeKind::Host || inGuestWindow(chunk)) continue;
+        if ((chunk.access & FrameRangeAccess::Gpu) != 0) throw std::runtime_error("frame replay: cannot map the GPU-visible host range at " + std::to_string(chunk.address));
+        skipped.Add(chunk);
+    }
+    {
+        GuestAllocations::Mutation mutation;
+        for (const auto& chunk : reader.Chunks()) {
+            if (chunk.kind != FrameMemoryKind::Range || (chunk.rangeKind == FrameRangeKind::Host && !inGuestWindow(chunk))) continue;
+            const bool gpu = (chunk.access & FrameRangeAccess::Gpu) != 0;
+            const auto bytes = static_cast<std::size_t>(chunk.bytes);
+            if (hostWritable(chunk.address, chunk.bytes)) {
+                // Already ours (the driver mapped its own page here): reuse it, as the other platforms do.
+                if (!gpu) skipped.Add(chunk);
+                else std::memset(GuestAddr::HostPtr<void>(chunk.address), 0, bytes);
+                continue;
+            }
+            try {
+                mapGuestRange(chunk.address, chunk.bytes);
+            } catch (const std::exception&) {
+                if (gpu) throw;
+                skipped.Add(chunk);
+                continue;
+            }
+            // The registry is keyed by guest address.
+            mutation.Add(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), bytes, (chunk.access & FrameRangeAccess::Readable) != 0, (chunk.access & FrameRangeAccess::Writable) != 0, gpu);
+        }
+    }
+    restoreSnapshot(reader, skipped);
+    if (std::getenv("APS5_REPLAY_WATCH") != nullptr && GuestWriteWatch::GuestWriteWatchAvailable_nid_postfix()) {
+        std::uint64_t watched = 0;
+        for (const auto& chunk : reader.Chunks()) {
+            if (chunk.kind != FrameMemoryKind::Range || (chunk.rangeKind == FrameRangeKind::Host && !inGuestWindow(chunk)) || (chunk.access & FrameRangeAccess::Gpu) == 0) continue;
+            if (std::any_of(skipped.ranges.begin(), skipped.ranges.end(), [&](const auto& range) { return range.first == chunk.address; })) continue;
+            GuestWriteWatch::GuestWriteWatchRegister_nid_postfix(GuestAddr::HostPtr<const void>(chunk.address), static_cast<std::size_t>(chunk.bytes));
+            watched += chunk.bytes;
+        }
+        std::fprintf(stderr, "[frame-replay] write watch on %.1f MiB of GPU-visible guest memory (APS5_REPLAY_WATCH)\n", static_cast<double>(watched) / (1024.0 * 1024.0));
+    }
+    return skipped;
+#else
+    static_cast<void>(reader);
+    throw std::runtime_error("frame replay: base-mode replay is implemented for macOS only");
+#endif
+}
+
 Skipped restoreMemory(const FrameCaptureReader& reader) {
     if (reader.Version() < 2) throw std::runtime_error("frame replay: calls format 1 does not record whether GPU writes had landed before each memory delta was read; record the capture again");
     std::uintptr_t base = 0;
     std::size_t size = 0;
     GuestArena::GuestArenaRange_nid_postfix(&base, &size);
+    if (biased()) return restoreMemoryBiased(reader);
     if (!reader.Header().empty() && headerNumber(reader.Header(), "arena_base") != base) throw std::runtime_error("frame replay: the guest arena is at a different address than in the capture");
     progress();
     Skipped skipped;
@@ -298,12 +464,16 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
             const bool gpu = (chunk.access & FrameRangeAccess::Gpu) != 0;
             if (owned[index]) {
                 if (!gpu) skipped.Add(chunk);
-                else std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
+                else std::memset(GuestAddr::HostPtr<void>(chunk.address), 0, static_cast<std::size_t>(chunk.bytes));
                 continue;
             }
             auto* const pointer = reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address));
             const auto bytes = static_cast<std::size_t>(chunk.bytes);
             try {
+#ifdef __APPLE__
+                // macOS: the title maps its driver memory inside the arena's system-reserved host hole; release it first.
+                if (GuestArena::GuestArenaOverlapsHostRegion_nid_no_patch(chunk.address, bytes)) GuestArena::GuestArenaReleaseHostRegion_nid_no_patch(pointer, bytes);
+#endif
                 GuestArena::GuestArenaMarkUsed_nid_postfix(pointer, bytes);
             } catch (const std::exception&) {
                 if (gpu) throw;
@@ -321,7 +491,7 @@ Skipped restoreMemory(const FrameCaptureReader& reader) {
 void resetMemory(const FrameCaptureReader& reader, const Skipped& skipped) {
     AgcDriverWaitIdle_nid_postfix();
     for (const auto& chunk : reader.Chunks()) {
-        if (chunk.kind == FrameMemoryKind::Range && !skipped.Overlaps(chunk)) std::memset(reinterpret_cast<void*>(static_cast<std::uintptr_t>(chunk.address)), 0, static_cast<std::size_t>(chunk.bytes));
+        if (chunk.kind == FrameMemoryKind::Range && !skipped.Overlaps(chunk)) std::memset(GuestAddr::HostPtr<void>(chunk.address), 0, static_cast<std::size_t>(chunk.bytes));
     }
     restoreSnapshot(reader, skipped);
 }
@@ -569,7 +739,7 @@ struct Replay {
             const SettledHold hold{true};
             if (!settled) return;
             AgcDriverPrepareCommandWrite_nid_no_patch(word.address, word.value.size());
-            std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(word.address)), word.value.data(), word.value.size());
+            std::memcpy(GuestAddr::HostPtr<void>(word.address), word.value.data(), word.value.size());
             std::atomic_thread_fence(std::memory_order_seq_cst);
         }
     }
@@ -588,7 +758,7 @@ struct Replay {
         for (const auto* chunk : found->second) {
             if (skipped.Overlaps(*chunk)) continue;
             auto bytes = reader.Read(*chunk);
-            auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(chunk->address));
+            auto* const target = GuestAddr::HostPtr<std::byte>(chunk->address);
             AgcDriverPrepareCommandWrite_nid_no_patch(chunk->address, static_cast<std::size_t>(chunk->bytes));
             for (auto at = static_cast<std::size_t>((4 - chunk->address % 4) % 4); at + 4 <= bytes.size(); at += 4) {
                 std::uint32_t value = 0;
@@ -633,7 +803,7 @@ struct Replay {
 
     static std::uint64_t load(std::uint64_t address, std::size_t bytes) {
         std::uint64_t value = 0;
-        std::memcpy(&value, reinterpret_cast<const void*>(static_cast<std::uintptr_t>(address)), bytes);
+        std::memcpy(&value, GuestAddr::HostPtr<const void>(address), bytes);
         return value;
     }
 
@@ -675,7 +845,7 @@ struct Replay {
             const auto bytes = reader.Read(*chunk);
             const auto length = static_cast<std::size_t>(std::min<std::uint64_t>(wait.bytes == 8 ? 8 : 4, chunk->address + chunk->bytes - address));
             const auto* const recorded = bytes.data() + (address - chunk->address);
-            auto* const target = reinterpret_cast<std::byte*>(static_cast<std::uintptr_t>(address));
+            auto* const target = GuestAddr::HostPtr<std::byte>(address);
             if (std::memcmp(target, recorded, length) == 0) return false;
             std::uint64_t value = 0;
             std::memcpy(&value, recorded, length);
@@ -706,7 +876,7 @@ struct Replay {
             }
             if (!released && options.synthesize) {
                 if (const auto value = satisfying(wait, load(wait.address, bytes))) {
-                    std::memcpy(reinterpret_cast<void*>(static_cast<std::uintptr_t>(wait.address)), &*value, bytes);
+                    std::memcpy(GuestAddr::HostPtr<void>(wait.address), &*value, bytes);
                     ++syntheticReleases;
                     released = true;
                 }
@@ -877,7 +1047,7 @@ Dump parseDump(std::string_view text) {
 }
 
 void writeDump(const Dump& dump) {
-    auto* const pointer = reinterpret_cast<const std::byte*>(static_cast<std::uintptr_t>(dump.address));
+    auto* const pointer = GuestAddr::HostPtr<const std::byte>(dump.address);
     GuestArena::GuestArenaPrepareHostRead_nid_no_patch(pointer, static_cast<std::size_t>(dump.bytes));
     std::ofstream file(dump.path, std::ios::binary | std::ios::trunc);
     file.write(reinterpret_cast<const char*>(pointer), static_cast<std::streamsize>(dump.bytes));
@@ -904,6 +1074,7 @@ FrameCheck compareFrames(const FrameCaptureReader& reader, const Options& option
         AgcDriver::DisplayBuffer buffer{};
         buffer.address = call.address;
         buffer.pixelFormat = call.values[1];
+        std::fprintf(stderr, "[frame-replay] display buffer 0x%llx pixelFormat 0x%llx %llux%llu tiling %llu\n", static_cast<unsigned long long>(call.address), static_cast<unsigned long long>(call.values[1]), static_cast<unsigned long long>(call.values[2]), static_cast<unsigned long long>(call.values[3]), static_cast<unsigned long long>(call.values[4]));
         buffer.width = static_cast<std::uint32_t>(call.values[2]);
         buffer.height = static_cast<std::uint32_t>(call.values[3]);
         buffer.tilingMode = static_cast<std::uint32_t>(call.values[4]);
@@ -954,6 +1125,7 @@ int relaunchAttempt() {
 void relaunchIfHostRegionBlocks(const FrameCaptureReader& reader) {
     const int attempt = relaunchAttempt() + 1;
     const auto& chunks = reader.Chunks();
+    if (biased()) return;  // the capture is placed at guest + bias inside our own reservation: no host region can sit in it
     const auto blocked = std::find_if(chunks.begin(), chunks.end(), [](const FrameMemoryChunk& chunk) {
         return chunk.kind == FrameMemoryKind::Range && chunk.rangeKind != FrameRangeKind::Host && (chunk.access & FrameRangeAccess::Gpu) != 0 &&
                GuestArena::GuestArenaHostRegionOverlaps_nid_postfix(static_cast<std::uintptr_t>(chunk.address), static_cast<std::size_t>(chunk.bytes));
@@ -1218,6 +1390,9 @@ double percentile(std::vector<double> values, double fraction) {
 int run(const Options& options) {
     const auto loadStart = Clock::now();
     const FrameCaptureReader reader(options.directory);
+#ifdef __APPLE__
+    if (!options.noBias && !reserveGuestWindow(options.bias)) throw std::runtime_error("frame replay: cannot reserve a host window for the guest arena (try --bias <host base>)");
+#endif
 #ifdef _WIN32
     relaunchIfHostRegionBlocks(reader);
 #endif
@@ -1276,6 +1451,7 @@ int run(const Options& options) {
         measured.synthesized = replay.syntheticReleases.load() - measured.synthesized;
         passes.push_back(measured);
     }
+    AgcDriver::Graphics::StorageTexture::VerifyFinal();
     FrameCheck check;
     if (replay.unfinished == 0) {
         for (const auto& dump : options.dumps) writeDump(dump);
@@ -1352,6 +1528,8 @@ int main(int argc, char** argv) {
             if (error != std::errc{} || end != value.data() + value.size() || options.submits == 0) return usage();
         } else if (argument == "--trace-serials") options.traceSerials = true;
         else if (argument == "--cold-pipelines") options.coldPipelines = true;
+        else if (argument == "--bias" && index + 1 < argc) options.bias = std::strtoull(argv[++index], nullptr, 0);
+        else if (argument == "--no-bias") options.noBias = true;
         else if (argument == "--dump" && index + 1 < argc) options.dumps.push_back(parseDump(argv[++index]));
         else if (argument == "--frames" && index + 1 < argc) options.frames = argv[++index];
         else if (!argument.starts_with("-") && options.directory.empty()) options.directory = argument;

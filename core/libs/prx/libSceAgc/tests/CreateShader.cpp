@@ -6,6 +6,9 @@
 #include <cstdint>
 #include <cstdio>
 #include <stdexcept>
+#include <new>
+#include <sys/mman.h>
+#include "prx/libSceAgcDriver/Execution/include/GuestAddr.hpp"
 
 namespace {
 
@@ -96,6 +99,36 @@ void testWithoutProgramAddress() {
     check(binary.registers[0].offset == registers[0].offset && binary.registers[0].value == registers[0].value && binary.registers[1].value == registers[1].value && binary.registers[2].value == registers[2].value, "a fetch shader's registers changed");
 }
 
+// Under a nonzero bias the header and the code live in guest memory: the relative pointers resolve to guest values, the
+// program address registers carry the guest address of the code, and the driver and the caller get the guest-valued header.
+void testBiased() {
+    constexpr std::uint64_t guestBase = 0x2'0000'0000ull;
+    constexpr std::size_t bytes = 1ull << 20;
+    void* const mapped = mmap(nullptr, bytes, PROT_READ | PROT_WRITE, MAP_ANON | MAP_PRIVATE, -1, 0);
+    check(mapped != MAP_FAILED, "map the guest window");
+    const auto bias = static_cast<std::int64_t>(reinterpret_cast<std::uintptr_t>(mapped)) - static_cast<std::int64_t>(guestBase);
+    const auto guest = [&](const void* host) { return reinterpret_cast<std::uint64_t>(host) - static_cast<std::uint64_t>(bias); };
+    AgcSetGuestBias(bias);
+    auto* const hostCode = static_cast<std::uint32_t*>(mapped);
+    hostCode[0] = 0xbf810000u;
+    auto* binary = new (static_cast<std::uint8_t*>(mapped) + 0x1000) Binary{};
+    fill(*binary, ShaderRegs::ShaderBinaryType::Cs, ShaderRegs::COMPUTE_PGM_LO);
+    binary->shader.shader_size = 256;
+    registered = nullptr;
+    registrations = 0;
+    Shader* created = nullptr;
+    check(sceAgcCreateShader(&created, &binary->shader, hostCode) == 0, "sceAgcCreateShader failed under a bias");
+    check(reinterpret_cast<std::uint64_t>(created) == guest(&binary->shader), "the out-slot does not hold the guest address of the header");
+    check(reinterpret_cast<std::uint64_t>(registered) == guest(&binary->shader) && registrations == 1, "the driver was not handed the guest-valued header");
+    check(reinterpret_cast<std::uint64_t>(binary->shader.code) == guest(hostCode), "the header's code pointer is not a guest address");
+    check(reinterpret_cast<std::uint64_t>(binary->shader.sh_registers) == guest(binary->registers.data()), "sh_registers is not a guest address");
+    check(reinterpret_cast<std::uint64_t>(binary->shader.specials) == guest(&binary->specials), "specials is not a guest address");
+    const auto program = guest(hostCode) + 0x1000u;
+    check(binary->registers[0].value == static_cast<std::uint32_t>(program >> 8u), "the program address register does not hold the guest address of the code");
+    AgcSetGuestBias(0);
+    munmap(mapped, bytes);
+}
+
 }
 
 extern "C" void AgcDriverRegisterShader_nid_postfix(const Shader* shader) {
@@ -108,6 +141,7 @@ int main() {
         testCompute();
         testPixelWithUserData();
         testWithoutProgramAddress();
+        testBiased();
         std::puts("AGC create shader tests passed");
         return 0;
     } catch (const std::exception& error) {

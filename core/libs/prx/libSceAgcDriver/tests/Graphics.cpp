@@ -5459,6 +5459,32 @@ void DepthBoundsEmulationTests() {
     stencil.maxDepthBounds = 0.5f;
     AgcDriver::Graphics::ApplyDepthBoundsEmulation(emulating, stencil, pixel);
     Require(stencil.depthTest && stencil.stencilTest, "a stencil test that writes only on a pass refused the depth bounds emulation");
+    // A driver that reports the test and drops it (KosmicKrisp before Apple GPU family 10).
+    AgcDriver::Graphics::Context ignoring{};
+    ignoring.depthBounds = true;
+    ignoring.depthBoundsIgnored = true;
+    auto cascade = base;
+    cascade.minDepthBounds = 0.00116f;
+    cascade.maxDepthBounds = 0.00498f;
+    AgcDriver::Graphics::ApplyDepthBoundsEmulation(ignoring, cascade, pixel);
+    Require(!cascade.depthBoundsTest && cascade.depthTest && cascade.depthCompare == VK_COMPARE_OP_LESS_OR_EQUAL && cascade.viewport.minDepth == 0.00116f && cascade.viewport.maxDepth == 0.00116f, "two-sided bounds over a reversed-depth target did not keep the far (lower) bound");
+    auto forward = base;
+    forward.depth->clearDepth = 1.0f;
+    forward.minDepthBounds = 0.25f;
+    forward.maxDepthBounds = 0.75f;
+    AgcDriver::Graphics::ApplyDepthBoundsEmulation(ignoring, forward, pixel);
+    Require(!forward.depthBoundsTest && forward.depthCompare == VK_COMPARE_OP_GREATER_OR_EQUAL && forward.viewport.minDepth == 0.75f, "two-sided bounds over a forward-depth target did not keep the far (upper) bound");
+    auto oneSided = base;
+    oneSided.maxDepthBounds = 0.5f;
+    AgcDriver::Graphics::ApplyDepthBoundsEmulation(ignoring, oneSided, pixel);
+    Require(!oneSided.depthBoundsTest && oneSided.depthCompare == VK_COMPARE_OP_GREATER_OR_EQUAL && oneSided.viewport.minDepth == 0.5f, "a one-sided bound was not emulated on a driver that ignores the test");
+    auto tested = base;
+    tested.depthTest = true;
+    tested.maxDepthBounds = 0.5f;
+    AgcDriver::Graphics::ApplyDepthBoundsEmulation(ignoring, tested, pixel);
+    Require(tested.depthBoundsTest && tested.depthTest && tested.viewport.minDepth == base.viewport.minDepth, "a draw the emulation cannot express was not left to the driver that ignores the test");
+    Require(AgcDriver::Graphics::DriverIgnoresDepthBounds("KosmicKrisp Mesa 26.0", "Apple M4 Pro") && AgcDriver::Graphics::DriverIgnoresDepthBounds("KosmicKrisp", "Apple M1"), "KosmicKrisp on Apple M1 to M4 was not known to drop the depth bounds test");
+    Require(!AgcDriver::Graphics::DriverIgnoresDepthBounds("KosmicKrisp", "Apple M5 Max") && !AgcDriver::Graphics::DriverIgnoresDepthBounds("KosmicKrisp", "Apple M10") && !AgcDriver::Graphics::DriverIgnoresDepthBounds("MoltenVK", "Apple M4 Pro"), "a driver with the depth bounds test was treated as dropping it");
 }
 
 void ReadOnlyDepthBoundsComparisonTests() {

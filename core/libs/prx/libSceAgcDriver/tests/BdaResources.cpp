@@ -1204,6 +1204,33 @@ void importMappedFailureGenerationTests(const Context& context) {
     ClearHostImports(context.device);
 }
 
+// APS5_NO_MAP_IMPORT=1 (default off): a map imports nothing; the first use imports one window of the range, not the whole range.
+void importMapDeferredTests(const Context& context) {
+    for (const bool deferred : {false, true}) {
+        ClearHostImports(context.device);
+        WindowedRange range(context, WindowedRange::piece, 4);
+        ImportAllocationProbe probe(range.importing);
+        GuestAllocations::Mapped mapped;
+        const auto lease = GuestAllocations::GuestAllocationsAcquire_nid_postfix();
+        for (const auto& owner : lease) if (owner->address == range.First()) mapped.push_back(owner);
+        Require(mapped.size() == 1u, "the deferred map fixture lost its registered range");
+        if (deferred) setenv("APS5_NO_MAP_IMPORT", "1", 1);
+        {
+            std::lock_guard gpu(AgcDriver::GuestMemory::GpuMutex());
+            Require(ImportMappedRanges(range.importing, mapped, GuestAllocations::GuestAllocationsGeneration_nid_postfix(), true), "the deferred map import failed");
+        }
+        unsetenv("APS5_NO_MAP_IMPORT");
+        if (deferred) {
+            Require(probe.calls.empty(), "APS5_NO_MAP_IMPORT=1 still imported at map");
+            HostImportFor(range.importing, range.First(), 4096, ImportRequester::Access);
+            Require(!probe.calls.empty() && probe.calls.back().bytes < range.bytes, "the first use after a deferred map imported the whole range");
+        } else {
+            Require(probe.calls.size() == 1u && probe.calls[0].bytes == range.bytes, "the default map did not import the whole range");
+        }
+        ClearHostImports(context.device);
+    }
+}
+
 void importStaleProbeTests(const Context& context, const BdaTestAccess& access) {
     for (const auto scenario : {0u, 1u, 2u}) {
         const bool held = scenario == 1u;
@@ -5502,6 +5529,7 @@ void RunBdaResourceTests(const Context& context, const BdaTestAccess& access) {
     failedJoinDissolvedOverlayTests(context, access);
     importWholeRangeOverWindowTests(context);
     importMappedFailureGenerationTests(context);
+    importMapDeferredTests(context);
     importStaleProbeTests(context, access);
     importRefusedWholeRangeTests(context);
     importPiecesOverAllocationLimitTests(context);

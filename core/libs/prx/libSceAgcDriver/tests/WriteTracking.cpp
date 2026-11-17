@@ -1892,6 +1892,159 @@ void CheckImportOverReadTraps() {
     reader.join();
     Require(seen == 0x33, "a read after the import did not see the bytes its trap stores");
 }
+
+// The driver's read trap resolver collects writes over the trapped range (ResolveLabelTrap -> FlushGpuWrites ->
+// StorageTexture::AccessKeptByCpu -> collectWrites), which takes the tracker mutex.
+void ResolveCollectingWrites(std::uintptr_t begin, std::uintptr_t end) {
+    static_cast<void>(CollectWritesUncached(static_cast<std::uint64_t>(begin), end - begin));
+    GuestWriteWatch::GuestWriteWatchReleaseReads_nid_postfix(begin, end - begin);
+}
+
+// An import that may write the guest range opens host write access over it. That used to resolve the read traps armed
+// there, with the tracker mutex held, so a resolver that collects writes waited for its own thread: PPSA30552 hung at the
+// intro -> gameplay switch (draw-commit thread, then every thread behind it). The import now keeps the traps: they
+// resolve on the next access to their pages.
+void CheckImportOpensWriteOverReadTraps() {
+    ::alarm(20);
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto synced = CollectWritesUncached(base, bytes);
+    Require(synced != 0, "the read-trapped writable import range is not collected");
+    Require(GuestWriteWatch::GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveCollectingWrites), "cannot set the collecting read trap resolver");
+    Require(GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(base, bytes) && TrappedBytes(base, bytes) == bytes, "cannot arm read traps over the writable import range");
+    bool imported = false;
+    Require(ImportWatched(base, bytes, [&] {
+        imported = true;
+        return true;
+    }, true, true), "the writable import over read traps failed");
+    Require(imported && TrappedBytes(base, bytes) == bytes, "the writable import took the read traps off its range");
+    Require(Watched(base, bytes), "the writable import over read traps left its range unwatched");
+    // The bytes behind a trap are stale: blocks that read as written would tell the driver the CPU stored over the pending image.
+    Require(UnchangedSince(base, bytes, synced), "the writable import made the read-trapped blocks of its range read as written");
+    std::uint8_t seen = 0;
+    std::thread reader([&] { seen = *static_cast<const volatile std::uint8_t*>(memory); });
+    reader.join();
+    Require(seen == 0x11 && TrappedBytes(base, bytes) == 0, "a read after the writable import did not resolve the read traps it kept");
+    ::alarm(0);
+}
+
+std::mutex importsLockStandIn;
+std::atomic<int> importsLockResolvesEntered{0};
+std::atomic<int> importsLockResolvesStored{0};
+
+// The driver's resolver also stores the trapped images (StorageTexture::FlushPending -> writeBack -> writeBackLayers ->
+// HostImportFor), which takes the host imports mutex: a plain mutex.
+void ResolveTakingImportsLock(std::uintptr_t begin, std::uintptr_t end) {
+    importsLockResolvesEntered.fetch_add(1, std::memory_order_release);
+    const std::lock_guard held(importsLockStandIn);
+    importsLockResolvesStored.fetch_add(1, std::memory_order_release);
+    static_cast<void>(CollectWritesUncached(static_cast<std::uint64_t>(begin), end - begin));
+    std::memset(reinterpret_cast<void*>(begin), 0x33, end - begin);
+    GuestWriteWatch::GuestWriteWatchReleaseReads_nid_postfix(begin, end - begin);
+}
+
+// importRunAt calls ImportWatched with the host imports mutex held. Opening the import's host write access resolved the
+// read traps over its range on that thread, and the resolver's write-back locked the imports mutex again: the second
+// self-deadlock of the PPSA30552 load hang (draw-commit: importAllocation -> importRunAt -> ImportWatched ->
+// GuestArenaBeginHostWrite -> Watch::resolve -> ResolveLabelTrap -> ... -> HostImportFor). The import must not run the
+// resolver at all, and must not wait for a resolver already running on another thread, which waits for that mutex.
+void CheckImportUnderImportsLockOverReadTraps() {
+    ::alarm(20);
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto synced = CollectWritesUncached(base, bytes);
+    Require(synced != 0, "the range imported under the imports lock is not collected");
+    Require(GuestWriteWatch::GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTakingImportsLock), "cannot set the read trap resolver that takes the imports lock");
+    Require(GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(base, bytes) && TrappedBytes(base, bytes) == bytes, "cannot arm read traps over the range imported under the imports lock");
+    std::uint8_t waited = 0;
+    std::thread waiter;
+    {
+        const std::lock_guard held(importsLockStandIn);
+        bool imported = false;
+        Require(ImportWatched(base, bytes, [&] {
+            imported = true;
+            return true;
+        }, true, true), "the import under the imports lock failed");
+        Require(imported && importsLockResolvesEntered.load(std::memory_order_acquire) == 0, "the import ran the read trap resolver while its thread held the imports lock");
+        Require(TrappedBytes(base, bytes) == bytes, "the import under the imports lock took the read traps off its range");
+        Require(UnchangedSince(base, bytes, synced), "the import under the imports lock made the read-trapped blocks of its range read as written");
+        waiter = std::thread([&] { waited = *static_cast<const volatile std::uint8_t*>(memory); });
+        while (importsLockResolvesEntered.load(std::memory_order_acquire) == 0) std::this_thread::yield();
+        imported = false;
+        Require(ImportWatched(base, bytes, [&] {
+            imported = true;
+            return true;
+        }, true, true), "the import behind a read trap resolver in flight failed");
+        Require(imported && importsLockResolvesStored.load(std::memory_order_acquire) == 0, "the read trap resolver stored while the importer held the imports lock");
+    }
+    waiter.join();
+    Require(waited == 0x33 && importsLockResolvesStored.load(std::memory_order_acquire) == 1, "a read that waited behind the import did not see the bytes its trap stores");
+    Require(TrappedBytes(base, bytes) == 0, "the read traps the import kept were not resolved by the read behind it");
+    Require(Watched(base, bytes), "the import under the imports lock left its range unwatched");
+    std::uint8_t seen = 0;
+    std::thread reader([&] { seen = *(static_cast<const volatile std::uint8_t*>(memory) + 2 * Block); });
+    reader.join();
+    Require(seen == 0x33 && importsLockResolvesStored.load(std::memory_order_acquire) == 1, "a read after the traps resolved did not see the stored bytes, or resolved again");
+    ::alarm(0);
+}
+
+// The import's host write window opens its trapped pages writable (a host import needs that), so a CPU store to one of them
+// inside the import does not fault. With APS5_IMPORT_WINDOW_STORES=1 it is not lost: the write watch finds it by the page's
+// bytes when the window ends, and the block reads as written; the blocks nothing stored to do not.
+void CheckImportStoreOverReadTraps() {
+    ::alarm(20);
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    const auto synced = CollectWritesUncached(base, bytes);
+    Require(synced != 0, "the range imported over read traps is not collected");
+    Require(GuestWriteWatch::GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveCollectingWrites), "cannot set the collecting read trap resolver");
+    Require(GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(base, bytes) && TrappedBytes(base, bytes) == bytes, "cannot arm read traps over the import range");
+    Require(ImportWatched(base, bytes, [&] {
+        std::thread store([&] { static_cast<volatile std::uint8_t*>(memory)[2 * Block + 0x100] = 0x77; });
+        store.join();
+        return true;
+    }, true, true), "the import over read traps failed");
+    Require(TrappedBytes(base, bytes) == bytes, "a store within the import took the read traps off its range");
+    Require(WrittenSince(base + 2 * Block, Block, synced), "a CPU store to a read-trapped page within an import was lost for the write tracker");
+    Require(UnchangedSince(base, 2 * Block, synced) && UnchangedSince(base + 3 * Block, Block, synced), "the import made read-trapped blocks nothing stored to read as written");
+    GuestWriteWatch::GuestWriteWatchReleaseReads_nid_postfix(base, bytes);
+    Require(TrappedBytes(base, bytes) == 0, "the read traps were not released");
+    Require(static_cast<const volatile std::uint8_t*>(memory)[2 * Block + 0x100] == 0x77, "the store itself was lost");
+    ::alarm(0);
+}
+
+// The import's host write window is ended by its own token. Ended by its range, the end of a plain host write over the same
+// pages (GuestArena::HostWrite on another thread: a read into the buffer, a decoder) closed the trapped pages under the running
+// import: the importer's next touch of them faulted into the resolver, which waits for the imports lock the importer holds.
+void CheckImportWindowKeepsItsPages() {
+    ::alarm(20);
+    constexpr std::size_t bytes = 4 * Block;
+    void* memory = AllocateWatched(bytes);
+    const auto base = reinterpret_cast<std::uint64_t>(memory);
+    std::memset(memory, 0x11, bytes);
+    Require(CollectWritesUncached(base, bytes) != 0, "the range imported next to a plain host write is not collected");
+    importsLockResolvesEntered.store(0, std::memory_order_release);
+    Require(GuestWriteWatch::GuestWriteWatchSetReadTrapResolver_nid_postfix(&ResolveTakingImportsLock), "cannot set the read trap resolver that takes the imports lock");
+    Require(GuestWriteWatch::GuestWriteWatchTrapReads_nid_postfix(base, bytes) && TrappedBytes(base, bytes) == bytes, "cannot arm read traps over the import range");
+    {
+        const std::lock_guard held(importsLockStandIn);
+        std::uint8_t seen = 0;
+        Require(ImportWatched(base, bytes, [&] {
+            GuestWriteWatch::GuestWriteWatchEndHostWrite_nid_postfix(memory, bytes);
+            seen = *static_cast<const volatile std::uint8_t*>(memory);
+            return true;
+        }, true, true), "the import next to the end of a plain host write failed");
+        Require(seen == 0x11 && importsLockResolvesEntered.load(std::memory_order_acquire) == 0, "the end of a plain host write over the import's range closed the import's pages");
+    }
+    GuestWriteWatch::GuestWriteWatchReleaseReads_nid_postfix(base, bytes);
+    ::alarm(0);
+}
 #endif
 
 void CheckImportWindowOtherThread() {
@@ -2607,9 +2760,32 @@ int main(int argc, char** argv) {
             return 0;
         }
 #ifdef __APPLE__
+        if (argc == 2 && std::string_view(argv[1]) == "--import-window-stores") {
+            if (std::getenv("APS5_IMPORT_WINDOW_STORES") == nullptr) {
+                // The write watch reads its switches when the process starts.
+                ::setenv("APS5_IMPORT_WINDOW_STORES", "1", 1);
+                ::execv(argv[0], argv);
+                throw std::runtime_error("cannot start the test again with APS5_IMPORT_WINDOW_STORES=1");
+            }
+            CheckImportStoreOverReadTraps();
+            CheckImportOpensWriteOverReadTraps();
+            CheckImportUnderImportsLockOverReadTraps();
+            std::cout << "import window stores test passed\n";
+            return 0;
+        }
         if (argc == 2 && std::string_view(argv[1]) == "--import-over-read-traps") {
             CheckImportOverReadTraps();
+            CheckImportOpensWriteOverReadTraps();
+            CheckImportUnderImportsLockOverReadTraps();
+            CheckImportWindowKeepsItsPages();
             std::cout << "import over read traps test passed\n";
+            return 0;
+        }
+#endif
+#ifdef __APPLE__
+        if (argc == 2 && std::string_view(argv[1]) == "--import-under-imports-lock") {
+            CheckImportUnderImportsLockOverReadTraps();
+            std::cout << "import under the imports lock test passed\n";
             return 0;
         }
 #endif

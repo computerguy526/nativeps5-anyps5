@@ -19,6 +19,8 @@ if(BUILD_TESTING)
     if(APPLE)
         add_test(NAME agc_write_tracking_import_over_read_traps COMMAND agc_write_tracking_tests --import-over-read-traps)
         set_tests_properties(agc_write_tracking_import_over_read_traps PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
+        add_test(NAME agc_write_tracking_import_under_imports_lock COMMAND agc_write_tracking_tests --import-under-imports-lock)
+        set_tests_properties(agc_write_tracking_import_under_imports_lock PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 30)
     endif()
     if(WIN32)
         set_tests_properties(agc_write_tracking_mark_order PROPERTIES ENVIRONMENT_MODIFICATION

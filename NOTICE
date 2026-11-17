@@ -1,0 +1,34 @@
+nativeps5 additions to AnyPS5 (AGC driver, pipeline pre-warm)
+=============================================================
+
+The nativeps5 work on this tree is licensed under the same terms as AnyPS5 (see LICENSE). The pipeline job pool, pipeline stamp,
+draw fallback and pipeline-cache hardening (core/libs/prx/libSceAgcDriver/Graphics/{include,src}/PipelineJobs.*,
+PipelineJournal.cpp, Pipeline.cpp, PipelineCache.cpp) were written with reference to the projects below. No source file of any of
+them is included.
+
+RPCS3 (GPL-2.0)
+---------------
+https://github.com/RPCS3/rpcs3 (reference clone in repos/rpcs3)
+
+  - Draw with something compiled instead of skipping the draw while a pipeline builds (async shader mode with the interpreter as
+    the stand-in: rpcs3/Emu/RSX/VK/VKGSRender.cpp get_graphics_pipeline / use_interpreter, VKShaderInterpreter.cpp), and the
+    background compile pool at low priority (VKPipelineCompiler.cpp). The stand-in here is a compiled pipeline with the same shaders
+    and render pass but different blend/depth/cull state, or a skipped draw that only writes render targets.
+  - Placeholder entry in the pipeline cache before a compile starts so concurrent misses never compile twice
+    (rpcs3/Emu/RSX/Program/ProgramStateCache.h).
+
+RPCS3 ARM64 port "ARMSX3" (GPL-2.0)
+-----------------------------------
+reference clone in repos/armsx3
+
+  - Persisting the Vulkan pipeline cache properly: temporary file plus rename, a header carrying the vendor/device/UUID of the
+    driver, a size cap, validation at launch (vk/vkutils/device.cpp).
+
+ARMSX2 (GPL-3.0): ideas only, no code
+-------------------------------------
+reference clone in repos/armsx2 (read for design only)
+
+  - A recorded pipeline-key list kept apart from the binary cache, replayed at start-up on a worker pool in three priority classes
+    (Now / Ahead / Idle), where a waiting thread runs the job itself if no worker has started it, and where the key-list
+    fingerprint leaves the driver version out so the list survives driver updates while the binary cache stamp includes it.
+    PipelineJobs.cpp and PipelineJournal.cpp implement that design independently.

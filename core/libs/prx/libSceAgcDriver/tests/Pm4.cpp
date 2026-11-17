@@ -87,7 +87,7 @@ void testCatalog() {
         const auto reason = AgcDriver::Pm4::UnsupportedReason(packet[0]);
         if (!reason.empty()) expectFailure([&] { AgcDriver::Pm4::Validate(packet, 0); }, std::string(reason).c_str());
     }
-    check(values.size() == 57, "reference opcode catalog is incomplete");
+    check(values.size() == 58, "reference opcode catalog is incomplete");
     check(AgcDriver::Pm4::Name(makePacket(0x3a, {0})[0]) == "DRAW_INDEX_MULTI_INST", "opcode 0x3a is not DRAW_INDEX_MULTI_INST");
     expectFailure([] { AgcDriver::Pm4::Validate(makePacket(0xff, {0}), 0); }, "not known");
     check(AgcDriver::Pm4::KnownName(makePacket(0xff, {0})[0]).empty() && AgcDriver::Pm4::Name(makePacket(0xff, {0})[0]) == "UNKNOWN_0xff", "an unknown opcode is named");
@@ -1408,6 +1408,35 @@ void testMemSemaphore() {
     AgcDriverWaitIdle_nid_postfix();
     check(std::atomic_ref<std::uint32_t>(marker).load() == 1, "work after a signalled MEM_SEMAPHORE wait never ran");
     check(std::atomic_ref<std::uint64_t>(semaphore).load() == 1, "a MEM_SEMAPHORE wait did not take one from the semaphore");
+}
+
+void testAtomicMem() {
+    alignas(8) static std::uint64_t cell = 0;
+    const auto packet = [](std::uint32_t op, std::uint32_t command, std::uint64_t src, std::uint64_t cmp, std::uint64_t at) {
+        return makePacket(0x1e, {op | (command << 8u), static_cast<std::uint32_t>(at), static_cast<std::uint32_t>(at >> 32u), static_cast<std::uint32_t>(src), static_cast<std::uint32_t>(src >> 32u), static_cast<std::uint32_t>(cmp), static_cast<std::uint32_t>(cmp >> 32u), 0});
+    };
+    const auto at = reinterpret_cast<std::uint64_t>(&cell);
+    check(AgcDriver::Pm4::AccessesMemory(packet(0x2f, 0, 1, 0, at)[0]), "ATOMIC_MEM must synchronize guest memory");
+    for (const auto queue : {0u, 0x20u}) AgcDriver::Pm4::Validate(packet(0x2f, 0, 1, 0, at), queue);
+    expectFailure([&] { AgcDriver::Pm4::Validate(packet(0x2f, 1, 1, 0, at), 0x20); }, "loop-until-compare");
+    expectFailure([&] { AgcDriver::Pm4::Validate(packet(0x2e, 0, 1, 0, at), 0x20); }, "ATOMIC_MEM operation");
+    expectFailure([&] { AgcDriver::Pm4::Validate(packet(0x2f, 0, 1, 0, at + 2), 0x20); }, "ATOMIC_MEM address");
+    expectFailure([&] { AgcDriver::Pm4::Validate(packet(0x6f, 0, 1, 0, at + 4), 0x20); }, "ATOMIC_MEM address");
+    const auto run = [&](std::uint32_t op, std::uint64_t initial, std::uint64_t src, std::uint64_t cmp) {
+        cell = initial;
+        auto words = packet(op, 0, src, cmp, at);
+        submitWords(words, 0x20);
+        AgcDriverWaitIdle_nid_postfix();
+        return std::atomic_ref<std::uint64_t>(cell).load();
+    };
+    check(run(0x6f, 5, 7, 0) == 12, "64-bit ATOMIC_MEM add");
+    check(run(0x67, 5, 9, 0) == 9, "64-bit ATOMIC_MEM swap");
+    check(run(0x68, 5, 9, 5) == 9 && run(0x68, 5, 9, 4) == 5, "64-bit ATOMIC_MEM compare-swap");
+    check(run(0x14, 0xffffffff00000003ull, 9, 0) == (0xffffffff00000000ull | 9), "32-bit ATOMIC_MEM umax keeps the high word");
+    check(run(0x13, 0xffffffffull, 1, 0) == 1 && run(0x11, 0xffffffffull, 1, 0) == 0xffffffffull, "32-bit ATOMIC_MEM signed min and max treat 0xffffffff as -1");
+    check(run(0x18, 3, 3, 0) == 0 && run(0x18, 2, 3, 0) == 3, "ATOMIC_MEM increment wraps at the source");
+    check(run(0x19, 0, 6, 0) == 6 && run(0x19, 4, 6, 0) == 3, "ATOMIC_MEM decrement wraps at the source");
+    check(run(0x16, 0xf0, 0x0f, 0) == 0xff && run(0x15, 0xff, 0x3c, 0) == 0x3c && run(0x17, 0xff, 0x0f, 0) == 0xf0, "ATOMIC_MEM bit ops");
 }
 
 void testSuspendPointWritesQueuedLabels() {
@@ -2743,6 +2772,7 @@ int main(int argc, char** argv) {
         testConditionalSubmission();
         testSuspendPointWritesQueuedLabels();
         testMemSemaphore();
+        testAtomicMem();
         testNopPadSubmission();
         testBranchSubmission();
         testWaitRegMemMasking();

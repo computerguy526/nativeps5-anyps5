@@ -540,6 +540,18 @@ std::vector<ShaderRecompiler::PipelineIdentity> ReadJournalComputeIdentities(con
     return identities;
 }
 
+// A mistyped switch must not take the process down: the replay reads APS5_PIPELINE_JOURNAL_AHEAD on its loader thread, where an
+// exception from the number parser used to reach std::terminate.
+void BadSwitchTests() {
+    SetEnvironment("APS5_PIPELINE_JOURNAL_AHEAD", "banana");
+    {
+        const auto device = OpenVulkanTestDevice();
+        Require(device != nullptr, "the device for the bad switch test could not be opened");
+        device->WaitForPipelineJournalReplay();
+    }
+    SetEnvironment("APS5_PIPELINE_JOURNAL_AHEAD", "");
+}
+
 void ReplayRacesDispatchTests() {
     using namespace NarrowConstantStoreFixture;
     Block compute(BlockBytes);
@@ -885,8 +897,14 @@ int main(int argc, char** argv) {
             std::puts("pipeline journal undecodable module passed");
             return 0;
         }
+        if (argc >= 2 && std::string(argv[1]) == "--bad-switch") {
+            BadSwitchTests();
+            std::puts("pipeline journal bad switch passed");
+            return 0;
+        }
         JournalTests();
         ReplayRacesDispatchTests();
+        BadSwitchTests();
         NewestEntriesTests();
         EvictionTests();
         EvictionWatermarkTests();

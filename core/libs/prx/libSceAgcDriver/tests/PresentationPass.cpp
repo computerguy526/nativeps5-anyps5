@@ -344,6 +344,33 @@ std::string describe(const Source& source, VkExtent2D extent) {
     return std::string(AgcDriver::DisplayPq(source.pixelFormat) ? "PQ " : AgcDriver::DisplayTenBit(source.pixelFormat) ? "10-bit " : "8-bit ") + (AgcDriver::DisplayRedLow(source.pixelFormat) ? "red-low" : "blue-low") + " display in VkFormat " + std::to_string(static_cast<int>(source.storage)) + " at " + std::to_string(extent.width) + "x" + std::to_string(extent.height);
 }
 
+// The mean of the source texels each destination pixel of the contained rectangle covers (edge
+// texels by their covered share), black outside the rectangle: what the pass draws when it shrinks.
+std::vector<std::byte> areaReference(const std::vector<std::byte>& exact, std::uint32_t width, std::uint32_t height, VkExtent2D extent) {
+    const auto rect = AgcDriver::ComputeContainRect_nid_postfix(width, height, extent.width, extent.height);
+    std::vector<std::byte> result(static_cast<std::size_t>(extent.width) * extent.height * 4, std::byte{0});
+    for (std::size_t texel = 3; texel < result.size(); texel += 4) result[texel] = std::byte{255};
+    const double ratioX = static_cast<double>(width) / rect.width, ratioY = static_cast<double>(height) / rect.height;
+    for (std::uint32_t y = 0; y < rect.height; ++y) {
+        const double lowY = y * ratioY, highY = lowY + ratioY;
+        for (std::uint32_t x = 0; x < rect.width; ++x) {
+            const double lowX = x * ratioX, highX = lowX + ratioX;
+            double sum[4]{}, total = 0.0;
+            for (auto sy = static_cast<std::uint32_t>(lowY); sy < std::min<double>(height, std::ceil(highY)); ++sy) {
+                const double weightY = std::min<double>(sy + 1, highY) - std::max<double>(sy, lowY);
+                for (auto sx = static_cast<std::uint32_t>(lowX); sx < std::min<double>(width, std::ceil(highX)); ++sx) {
+                    const double weight = weightY * (std::min<double>(sx + 1, highX) - std::max<double>(sx, lowX));
+                    for (std::size_t channel = 0; channel < 4; ++channel) sum[channel] += weight * std::to_integer<unsigned>(exact[(static_cast<std::size_t>(sy) * width + sx) * 4 + channel]);
+                    total += weight;
+                }
+            }
+            const auto offset = (static_cast<std::size_t>(rect.y + static_cast<std::int32_t>(y)) * extent.width + static_cast<std::size_t>(rect.x + static_cast<std::int32_t>(x))) * 4;
+            for (std::size_t channel = 0; channel < 4; ++channel) result[offset + channel] = static_cast<std::byte>(std::lround(sum[channel] / total));
+        }
+    }
+    return result;
+}
+
 void passMatchesConvertPath(const Context& context, PresentationPass& pass, const Source& source, const Image& resident) {
     const std::array<VkExtent2D, 3> exact{{{source.width, source.height}, {source.width + 60, source.height}, {source.width, source.height + 51}}};
     for (const auto extent : exact) {
@@ -351,9 +378,13 @@ void passMatchesConvertPath(const Context& context, PresentationPass& pass, cons
         const auto drawn = passPresent(context, pass, source, resident, extent, VK_FORMAT_B8G8R8A8_UNORM);
         Require(expected == drawn, "the presentation pass differs from the convert path: " + describe(source, extent));
     }
-    const std::array<VkExtent2D, 3> scaled{{{117, 76}, {331, 215}, {150, 150}}};
+    // Enlarged, the pass is the convert path's filtered blit; shrunk, it is the mean of the texels
+    // each pixel covers (the blit's two taps per axis skip texels and alias per-pixel dither).
+    const auto unscaled = convertPathPresent(context, source, {source.width, source.height});
+    const std::array<VkExtent2D, 4> scaled{{{117, 76}, {331, 215}, {150, 150}, {47, 31}}};
     for (const auto extent : scaled) {
-        const auto expected = convertPathPresent(context, source, extent);
+        const bool shrunk = extent.width < source.width || extent.height < source.height;
+        const auto expected = shrunk ? areaReference(unscaled, source.width, source.height, extent) : convertPathPresent(context, source, extent);
         const auto drawn = passPresent(context, pass, source, resident, extent, VK_FORMAT_B8G8R8A8_UNORM);
         int worst = 0;
         std::size_t differing = 0;
@@ -362,9 +393,50 @@ void passMatchesConvertPath(const Context& context, PresentationPass& pass, cons
             worst = std::max(worst, difference);
             differing += difference != 0;
         }
-        std::printf("  %s: scaled, %zu of %zu channels differ, by at most %d\n", describe(source, extent).c_str(), differing, expected.size(), worst);
-        Require(worst <= 2, "the scaled presentation pass differs from the convert path's filtered blit by more than two levels: " + describe(source, extent));
+        std::printf("  %s: %s, %zu of %zu channels differ, by at most %d\n", describe(source, extent).c_str(), shrunk ? "shrunk (area mean)" : "enlarged (filtered blit)", differing, expected.size(), worst);
+        Require(worst <= (shrunk ? 1 : 2), std::string("the scaled presentation pass differs from ") + (shrunk ? "the mean of the covered texels by more than one level: " : "the convert path's filtered blit by more than two levels: ") + describe(source, extent));
     }
+}
+
+// A black 10-bit display buffer carrying per-pixel interleaved-gradient dither (what ASTRO BOT's
+// final pass writes: 0..13 of 255 after its sRGB encode) keeps its mean and loses the pattern when
+// the pass shrinks it 4.24 times (3840x2160 into a 906x510 window).
+void passShrinksDitherEvenly(const Context& context, PresentationPass& pass) {
+    Source source{Bgra8 | TenBit, VK_FORMAT_A2R10G10B10_UNORM_PACK32, 1920, 1080, std::vector<std::byte>(static_cast<std::size_t>(1920) * 1080 * 4), {}};
+    double sourceMean = 0.0;
+    for (std::uint32_t y = 0; y < source.height; ++y) {
+        for (std::uint32_t x = 0; x < source.width; ++x) {
+            double whole;
+            const double noise = std::modf(52.9829189 * std::modf(0.06711056 * (x + 0.5) + 0.00583715 * (y + 0.5), &whole), &whole);
+            const double linear = noise / 255.0, root = std::sqrt(linear);
+            const double encoded = std::clamp(0.662002687 * root + 0.684122060 * std::sqrt(root) - 0.323583601 * std::sqrt(std::sqrt(root)) - 0.0225411470 * linear, 0.0, 1.0);
+            const auto level = static_cast<std::uint32_t>(std::lround(encoded * 1023.0));
+            const std::uint32_t word = 0xc0000000u | (level << 20u) | (level << 10u) | level;
+            std::memcpy(source.words.data() + (static_cast<std::size_t>(y) * source.width + x) * 4, &word, 4);
+            sourceMean += level >> 2u;
+        }
+    }
+    sourceMean /= static_cast<double>(source.width) * source.height;
+    const auto resident = residentImage(context, source);
+    const VkExtent2D extent{453, 255};
+    const auto drawn = passPresent(context, pass, source, *resident, extent, VK_FORMAT_B8G8R8A8_UNORM);
+    double mean = 0.0, square = 0.0;
+    unsigned low = 255, high = 0;
+    std::size_t count = 0;
+    for (std::size_t texel = 0; texel < drawn.size(); texel += 4) {
+        const auto value = std::to_integer<unsigned>(drawn[texel + 1]);
+        mean += value;
+        square += static_cast<double>(value) * value;
+        low = std::min(low, value);
+        high = std::max(high, value);
+        ++count;
+    }
+    mean /= static_cast<double>(count);
+    const double deviation = std::sqrt(std::max(0.0, square / static_cast<double>(count) - mean * mean));
+    std::printf("  dithered black 1920x1080 into 453x255: source mean %.2f of 255 (0..13), presented mean %.2f, standard deviation %.2f, range %u..%u\n", sourceMean, mean, deviation, low, high);
+    Require(sourceMean > 5.0 && sourceMean < 6.5, "the dither fixture is not the 0..13 pattern");
+    Require(std::abs(mean - sourceMean) <= 0.3, "shrinking moved the mean of a dithered black display buffer");
+    Require(deviation <= 1.0 && high - low <= 4, "shrinking left the dither as a pattern (two bilinear taps give a deviation of 2.2 and the full 0..13 range)");
 }
 
 void passDumpMatchesSubsample(const Context& context, PresentationPass& pass, const Source& source, const Image& resident, std::uint32_t layer = 0) {
@@ -551,9 +623,10 @@ void passConvertsPq(const Context& context, PresentationPass& pass, const Source
         Require(largestDifference(convertPathPresent(context, source, extent), passPresent(context, pass, source, resident, extent, VK_FORMAT_B8G8R8A8_UNORM, 0, whiteNits)) <= 1, "the PQ presentation pass differs from the CPU conversion by more than one level: " + describe(source, extent));
     }
     for (const auto extent : {VkExtent2D{117, 76}, VkExtent2D{331, 215}}) {
-        const int worst = largestDifference(convertPathPresent(context, source, extent), passPresent(context, pass, source, resident, extent, VK_FORMAT_B8G8R8A8_UNORM, 0, whiteNits));
-        std::printf("  %s, white %.0f nits: scaled, by at most %d\n", describe(source, extent).c_str(), whiteNits, worst);
-        Require(worst <= 2, "the scaled PQ presentation pass differs from the convert path's filtered blit by more than two levels: " + describe(source, extent));
+        const bool shrunk = extent.width < source.width || extent.height < source.height;
+        const int worst = largestDifference(shrunk ? areaReference(source.decoded, source.width, source.height, extent) : convertPathPresent(context, source, extent), passPresent(context, pass, source, resident, extent, VK_FORMAT_B8G8R8A8_UNORM, 0, whiteNits));
+        std::printf("  %s, white %.0f nits: %s, by at most %d\n", describe(source, extent).c_str(), whiteNits, shrunk ? "shrunk (area mean)" : "enlarged (filtered blit)", worst);
+        Require(worst <= 2, std::string("the scaled PQ presentation pass differs from ") + (shrunk ? "the mean of the covered texels" : "the convert path's filtered blit") + " by more than two levels: " + describe(source, extent));
     }
     for (const std::uint32_t stride : {1u, 3u}) {
         const auto extent = PresentationPass::DumpExtent(source.width, source.height, stride);
@@ -765,6 +838,7 @@ void residentPresentTests(const Context& context) {
         passConvertsPq(context, pass, source, *resident, 1000.0f);
         passPassesPqThrough(context, pass, source, *resident);
     }
+    passShrinksDitherEvenly(context, pass);
     passRefusesSdrToHdr10(context, pass);
     passPresentsSlice(context, pass);
     blitLetterboxMatchesClear(context);
