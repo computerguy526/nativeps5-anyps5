@@ -80,3 +80,17 @@ The [pull request template](.github/pull_request_template.md) is the checklist f
 ## Documentation
 
 Text in the repository is dry, strict and concise. Record known gaps, unknown NIDs and signatures in [technical debt](docs/dev/TechnicalDebt.md) instead of new files. An entry states the gap first (what differs from the console, what is unverified, what throws) and describes the implemented behaviour only as far as the gap needs it. A pull request that closes a gap removes its entry, or cuts it to what is still open, instead of rewriting it to describe the corrected behaviour. An entry goes in `docs/dev/debt/<name>.md`, named after the first `core/` path it links (`<name>` for `core/libs/prx/<name>/...`, otherwise for `core/<name>/...`), under the same `###` sections as the index; entries that link neither stay in the index. A pull request whose `TechnicalDebt.md` change conflicts after the split rebases and runs `python3 tools/debt_split.py resolve` during the stopped rebase, which moves its added, edited and removed entries to their files; `python3 tools/debt_split.py split` moves entries left in the index.
+
+## CI (this fork)
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and push to `main`, with no secrets, game data or GPU.
+Each check is one command locally (from the repository root):
+
+| Job | What | Locally |
+|---|---|---|
+| relinker | relinker-only build and ctest on macOS arm64 (no submodules; minus 17 tests of the upstream's own GitHub workflows, which this fork does not carry, see `-E` in the workflow) | `cmake -S . -B build-relinker -G Ninja -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON && cmake --build build-relinker && ctest --test-dir build-relinker -j4` |
+| clang-format | the lines the change touches (.clang-format); existing code is never reformatted | `pip install clang-format==22.1.3 && git clang-format origin/main -- core demo tools` (`--diff` to look) |
+| privacy | game data, secrets, personal paths, commit e-mails (a copy of the entry repository's gate, `.github/nps5-ci/`) | `BASE=origin/main TIP=HEAD .github/nps5-ci/privacy.sh` |
+| workflows | workflow syntax | `actionlint` |
+
+Not in CI: the full runtime build (39 submodules, GPU for most tests), the Windows build and the sanitizer runs described above, which were the upstream's workflows. A PR needs green CI; it does not replace the evidence in the pull request template.
