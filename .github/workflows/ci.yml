@@ -20,8 +20,8 @@ concurrency:
 # Actions are pinned to a full commit SHA (the comment names the release); Dependabot (github-actions) raises them.
 jobs:
   relinker:
-    name: relinker-only build and tests (macOS arm64)
-    runs-on: macos-latest
+    name: relinker-only build and tests (macOS)
+    runs-on: macos-15-intel
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
