@@ -32,8 +32,8 @@ jobs:
         run: |
           cmake -S . -B build-relinker -G Ninja -DCMAKE_BUILD_TYPE=Release -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON
           cmake --build build-relinker --parallel 4
-      - name: ctest (minus the tests of the upstream's own GitHub workflows, which this fork does not carry)
-        run: ctest --test-dir build-relinker -j4 --output-on-failure -E '^(mingw_host_only_test_targets|pr_overlap_tools|progress_report_inputs|ffmpeg_cache_keys|winlibs_digest|progress_comment_concurrency|eligibility_paths|release_workflow|emsdk_pin|conventions_ci_gate|ctest_no_tests_flag|test_script_registration|build_eligibility|pr_intake_reopen|relinker_test_step|stale_conflicts_workflow|conventions_pr_template)$'
+      - name: ctest (minus the tests of the upstream's own GitHub workflows, which this fork does not carry, and check_skips, whose fixed 20 s timeout is too tight for a loaded hosted runner)
+        run: ctest --test-dir build-relinker -j4 --output-on-failure -E '^(mingw_host_only_test_targets|pr_overlap_tools|progress_report_inputs|ffmpeg_cache_keys|winlibs_digest|progress_comment_concurrency|eligibility_paths|release_workflow|emsdk_pin|conventions_ci_gate|ctest_no_tests_flag|test_script_registration|build_eligibility|pr_intake_reopen|relinker_test_step|stale_conflicts_workflow|conventions_pr_template|check_skips)$'
 
   clang-format:
     name: clang-format (changed lines only)
