@@ -163,7 +163,9 @@ void RunScript(std::vector<Pad::VirtualPadEvent> script) try {
     bool shaking = false;
     const bool motionLog = std::getenv("NPS5_PAD_LOG") != nullptr;
     std::array<std::chrono::steady_clock::time_point, 32> pressedAt{};
-    while (!g_scriptStop.load() && next < script.size()) {
+    // A shake still playing keeps the loop going after the last event (it would otherwise never play, or leave its last
+    // accelerometer/gyro sample published for good).
+    while (!g_scriptStop.load() && (next < script.size() || shaking)) {
         const auto now = std::chrono::steady_clock::now();
         const auto elapsedMs = static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(now - start).count());
         const std::uint64_t elapsedFrames = g_flips.load() - startFrame;

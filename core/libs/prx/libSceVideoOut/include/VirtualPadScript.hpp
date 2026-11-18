@@ -9,7 +9,7 @@
 //   <op>    +<button>        press
 //           -<button>        release
 //           tap=<button>     press now, release 120 ms (or 4 frames, for "f") later
-//           shake=<seconds>  shake the controller (accelerometer + gyro, about 2.5 g at 10 Hz) for that long; plays in the Kyty host only
+//           shake=<seconds>  shake the controller (accelerometer + gyro, about 2.5 g at 10 Hz) for that long (at most 30 s); plays in the Kyty host only
 //           <axis>=<value>   lx ly rx ry in -1..1 (down and right are positive), l2 r2 in 0..1 (the pad starts with both triggers released)
 // Buttons use SDL's positional names: a/south/cross, b/east/circle, x/west/square, y/north/triangle, back/share/view,
 // guide/ps/home, start/options, l3, r3, l1, r1, up, down, left, right, misc1/capture, touchpad.
@@ -122,7 +122,7 @@ inline bool ParseVirtualPadScript(std::string_view script, std::vector<VirtualPa
             if (detail::lowerCopy(name) == "shake") {
                 char* shakeEnd = nullptr;
                 const double seconds = std::strtod(valueText.c_str(), &shakeEnd);
-                if (valueText.empty() || shakeEnd != valueText.c_str() + valueText.size() || seconds <= 0.0 || seconds > 60.0 || base.byFrame) {
+                if (valueText.empty() || shakeEnd != valueText.c_str() + valueText.size() || seconds <= 0.0 || seconds > 30.0 || base.byFrame) {  // value holds ms in 16 bits
                     error = "bad shake duration '" + std::string(item) + "'";
                     return false;
                 }
