@@ -80,3 +80,21 @@ The [pull request template](.github/pull_request_template.md) is the checklist f
 ## Documentation
 
 Text in the repository is dry, strict and concise. Record known gaps, unknown NIDs and signatures in [technical debt](docs/dev/TechnicalDebt.md) instead of new files. An entry states the gap first (what differs from the console, what is unverified, what throws) and describes the implemented behaviour only as far as the gap needs it. A pull request that closes a gap removes its entry, or cuts it to what is still open, instead of rewriting it to describe the corrected behaviour. An entry goes in `docs/dev/debt/<name>.md`, named after the first `core/` path it links (`<name>` for `core/libs/prx/<name>/...`, otherwise for `core/<name>/...`), under the same `###` sections as the index; entries that link neither stay in the index. A pull request whose `TechnicalDebt.md` change conflicts after the split rebases and runs `python3 tools/debt_split.py resolve` during the stopped rebase, which moves its added, edited and removed entries to their files; `python3 tools/debt_split.py split` moves entries left in the index.
+
+## CI (this fork)
+
+Before pushing, run `scripts/ci/run-local.sh` (commit first): it runs every job of `.github/workflows/ci.yml` from a clean checkout of HEAD (same steps, fresh venv, no submodules); `--job <id>` runs one, `--x86` runs the macOS job under Rosetta like the Intel hosted runner. See docs/ci.md.
+
+Be gentle with GitHub (contributors and agents): no pushes until `scripts/ci/run-local.sh` passes; at most one push per branch, batching commits; do not poll `gh` in loops (look at most every ~5 minutes, or use one `gh run watch <run-id>`); never re-run jobs to test for flakiness (reproduce locally); no bulk API calls. Hammering the API gets the account suspended.
+
+GitHub Actions (`.github/workflows/ci.yml`) runs on every pull request and push to `main`, with no secrets, game data or GPU.
+Each check is one command locally (from the repository root):
+
+| Job | What | Locally |
+|---|---|---|
+| relinker | relinker-only build and ctest on a GitHub macOS runner (macos-15-intel; the arm64 runners queue starve) (no submodules; minus 18 tests (17 of the upstream's own GitHub workflows plus check_skips, whose 20 s timeout is too tight on a loaded runner), see `-E` in the workflow) | `cmake -S . -B build-relinker -G Ninja -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON && cmake --build build-relinker && ctest --test-dir build-relinker -j4` |
+| clang-format | the lines the change touches (.clang-format); existing code is never reformatted | `pip install clang-format==22.1.3 && git clang-format origin/main -- core demo tools` (`--diff` to look) |
+| privacy | game data, secrets, personal paths, commit e-mails (a copy of the entry repository's gate, `.github/nps5-ci/`) | `BASE=origin/main TIP=HEAD .github/nps5-ci/privacy.sh` |
+| workflows | workflow syntax | `actionlint` |
+
+Not in CI: the full runtime build (39 submodules, GPU for most tests), the Windows build and the sanitizer runs described above, which were the upstream's workflows. A PR needs green CI; it does not replace the evidence in the pull request template.

@@ -1,0 +1,17 @@
+# CI
+
+Workflow: `.github/workflows/ci.yml`, on every pull request and push.
+
+- **privacy and identity gate**: no game data, secrets, personal paths or non-noreply commit e-mails. Never relaxed.
+- **workflow syntax (actionlint)**: pinned actionlint 1.7.7, checksum verified.
+- **format/lint** and **tests**: clang-format on changed lines, relinker-only cmake build + ctest.
+- Every job has `timeout-minutes`, pinned tool versions and actions (by SHA), and retries (3x, backoff) around network installs (pip, brew, curl).
+- The macOS job runs on `macos-15-intel` with `continue-on-error: true`: GitHub's macOS arm64 pool is capacity-starved (jobs were cancelled after 15 min in the queue), so a miss there shows as a warning and does not fail the PR. Rerun it from the Actions tab ("Re-run failed jobs"). `.github/actionlint.yaml` teaches actionlint that label.
+- Tests that need game data, a GPU or local paths are skipped with a stated reason, not run on CI.
+
+Rerun: Actions tab, open the run, "Re-run failed jobs"; or `gh run rerun <run-id> --failed`.
+Run locally: `cmake -S . -B build-relinker -G Ninja -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON && ctest --test-dir build-relinker`.
+
+Run the whole workflow locally before every push: `scripts/ci/run-local.sh` (commit first; clean `git worktree` of HEAD, no submodules, fresh venv, same `run:` steps as the workflow; `--job <id>`, `--x86` for the macOS job under Rosetta, `--act` for ubuntu jobs in nektos/act). Needs ruby, git and the job tools (shellcheck, go, cmake, ninja, actionlint as the job needs).
+
+Be gentle with GitHub (contributors and agents): no pushes until `scripts/ci/run-local.sh` passes; at most one push per branch, batching commits; do not poll `gh` in loops (look at most every ~5 minutes, or use one `gh run watch <run-id>`); never re-run jobs to test for flakiness (reproduce locally); no bulk API calls. Hammering the API gets the account suspended.
