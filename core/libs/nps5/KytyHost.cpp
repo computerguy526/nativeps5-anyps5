@@ -180,7 +180,8 @@ void RunScript(std::vector<Pad::VirtualPadEvent> script) try {
                 shakeStart = now;
                 shakeEnd = now + std::chrono::milliseconds(event.value);
                 shaking = true;
-                if (motionLog) std::fprintf(stderr, "[pad] kyty-host script: shake %d ms (t=%llums)\n", event.value, static_cast<unsigned long long>(elapsedMs));
+                if (motionLog)
+                    std::fprintf(stderr, "[pad] kyty-host script: shake %d ms (t=%llums)\n", event.value, static_cast<unsigned long long>(elapsedMs));
                 changed = true;
                 ++next;
                 continue;

@@ -122,7 +122,8 @@ inline bool ParseVirtualPadScript(std::string_view script, std::vector<VirtualPa
             if (detail::lowerCopy(name) == "shake") {
                 char* shakeEnd = nullptr;
                 const double seconds = std::strtod(valueText.c_str(), &shakeEnd);
-                if (valueText.empty() || shakeEnd != valueText.c_str() + valueText.size() || seconds <= 0.0 || seconds > 30.0 || base.byFrame) {  // value holds ms in 16 bits
+                if (valueText.empty() || shakeEnd != valueText.c_str() + valueText.size() || seconds <= 0.0 || seconds > 30.0 ||
+                    base.byFrame) {  // value holds ms in 16 bits
                     error = "bad shake duration '" + std::string(item) + "'";
                     return false;
                 }

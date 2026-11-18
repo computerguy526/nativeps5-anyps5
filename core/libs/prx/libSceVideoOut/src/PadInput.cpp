@@ -248,7 +248,10 @@ void PadInput::advanceScriptedPad(const DisplayWindow& window) {
     while (scriptNext < script.size()) {
         const auto& event = script[scriptNext];
         if ((event.byFrame ? elapsedFrames : elapsedMs) < event.when) break;
-        if (event.isShake) { ++scriptNext; continue; }  // shake=<s> plays in the Kyty host only
+        if (event.isShake) {
+            ++scriptNext;
+            continue;
+        }  // shake=<s> plays in the Kyty host only
         // nps5: a tap is held until the title has had time to sample it: 100 ms and 2 guest pad reads after the press
         // (a frame-counted tap is 4 presented flips, which at a fast loading screen is a few ms and can be read
         // by nobody).
