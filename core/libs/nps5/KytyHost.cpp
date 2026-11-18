@@ -131,6 +131,7 @@ std::uint32_t ButtonBit(int sdlButton) {
 }
 
 void ApplyScriptEvent(PadInputState& state, const Pad::VirtualPadEvent& event) {
+    if (event.isShake) return;  // handled by RunScript (time-based motion)
     if (!event.isAxis) {
         const auto bit = ButtonBit(event.index);
         state.buttons = event.value != 0 ? (state.buttons | bit) : (state.buttons & ~bit);
@@ -155,6 +156,12 @@ void RunScript(std::vector<Pad::VirtualPadEvent> script) try {
     const std::uint64_t startFrame = g_flips.load();
     std::size_t next = 0;
     auto lastPublish = start;
+    // shake=<seconds>: a 10 Hz shake the way a hand shakes a DualSense: accel X +-2.5 g (and Z +-1.5 g, 90 degrees later) on top of gravity on Y,
+    // gyro X/Z +-5 rad/s, through the same ScePadData motion fields real motion uses. Published every 5 ms while it lasts.
+    std::chrono::steady_clock::time_point shakeEnd{};
+    std::chrono::steady_clock::time_point shakeStart{};
+    bool shaking = false;
+    const bool motionLog = std::getenv("NPS5_PAD_LOG") != nullptr;
     std::array<std::chrono::steady_clock::time_point, 32> pressedAt{};
     while (!g_scriptStop.load() && next < script.size()) {
         const auto now = std::chrono::steady_clock::now();
@@ -167,12 +174,37 @@ void RunScript(std::vector<Pad::VirtualPadEvent> script) try {
             const auto slot = static_cast<std::size_t>(event.index) % pressedAt.size();
             // A tap stays down at least 100 ms so the title samples it (a frame-counted tap can be a few ms long).
             if (event.tapRelease && !event.isAxis && now - pressedAt[slot] < std::chrono::milliseconds(100)) break;
+            if (event.isShake) {
+                shakeStart = now;
+                shakeEnd = now + std::chrono::milliseconds(event.value);
+                shaking = true;
+                if (motionLog) std::fprintf(stderr, "[pad] kyty-host script: shake %d ms (t=%llums)\n", event.value, static_cast<unsigned long long>(elapsedMs));
+                changed = true;
+                ++next;
+                continue;
+            }
             if (!event.isAxis && event.value != 0) pressedAt[slot] = now;
             ApplyScriptEvent(state, event);
             if (log) std::fprintf(stderr, "[pad] kyty-host script: %s %d = %d (t=%llums frame+%llu)\n", event.isAxis ? "axis" : "button", event.index, event.value,
                 static_cast<unsigned long long>(elapsedMs), static_cast<unsigned long long>(elapsedFrames));
             changed = true;
             ++next;
+        }
+        if (shaking) {
+            if (now >= shakeEnd) {
+                shaking = false;
+                state.hasMotion = false;
+                if (motionLog) std::fprintf(stderr, "[pad] kyty-host script: shake end\n");
+                changed = true;
+            } else if (now - lastPublish >= std::chrono::milliseconds(5)) {
+                const double t = std::chrono::duration<double>(now - shakeStart).count();
+                const double phase = 2.0 * 3.14159265358979 * 10.0 * t;
+                constexpr float g = 9.80665f;
+                state.hasMotion = true;
+                state.accel = {static_cast<float>(2.5 * g * std::sin(phase)), g, static_cast<float>(1.5 * g * std::cos(phase))};
+                state.gyro = {static_cast<float>(5.0 * std::cos(phase)), 0.0f, static_cast<float>(5.0 * std::sin(phase))};
+                changed = true;
+            }
         }
         if (changed || now - lastPublish > std::chrono::milliseconds(50)) {
             PadPublishInputForPort_nid_postfix(0, state);

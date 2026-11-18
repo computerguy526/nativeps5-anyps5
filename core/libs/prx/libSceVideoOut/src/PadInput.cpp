@@ -227,6 +227,7 @@ void PadInput::advanceScriptedPad(const DisplayWindow& window) {
                 const auto at = scriptStart + std::chrono::milliseconds(event.when);
                 while (!scriptStop && std::chrono::steady_clock::now() < at) std::this_thread::sleep_for(std::chrono::microseconds(200));
                 if (scriptStop) return;
+                if (event.isShake) continue;
                 const auto asyncMs = [&] { return static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - scriptStart).count()); };
                 if (event.tapRelease && !event.isAxis) {
                     while (!scriptStop && !tapHeldLongEnough(event.index, asyncMs())) std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -247,6 +248,7 @@ void PadInput::advanceScriptedPad(const DisplayWindow& window) {
     while (scriptNext < script.size()) {
         const auto& event = script[scriptNext];
         if ((event.byFrame ? elapsedFrames : elapsedMs) < event.when) break;
+        if (event.isShake) { ++scriptNext; continue; }  // shake=<s> plays in the Kyty host only
         // nps5: a tap is held until the title has had time to sample it: 100 ms and 2 guest pad reads after the press
         // (a frame-counted tap is 4 presented flips, which at a fast loading screen is a few ms and can be read
         // by nobody).

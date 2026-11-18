@@ -9,6 +9,7 @@
 //   <op>    +<button>        press
 //           -<button>        release
 //           tap=<button>     press now, release 120 ms (or 4 frames, for "f") later
+//           shake=<seconds>  shake the controller (accelerometer + gyro, about 2.5 g at 10 Hz) for that long; plays in the Kyty host only
 //           <axis>=<value>   lx ly rx ry in -1..1 (down and right are positive), l2 r2 in 0..1 (the pad starts with both triggers released)
 // Buttons use SDL's positional names: a/south/cross, b/east/circle, x/west/square, y/north/triangle, back/share/view,
 // guide/ps/home, start/options, l3, r3, l1, r1, up, down, left, right, misc1/capture, touchpad.
@@ -30,6 +31,7 @@ struct VirtualPadEvent {
     bool isAxis = false;
     int index = 0;           // SDL_GameControllerButton or SDL_GameControllerAxis
     std::int16_t value = 0;  // button: 0/1, axis: -32768..32767
+    bool isShake = false;    // shake=<seconds>: a controller shake (motion sensors), value = duration in ms (millisecond clock only)
     bool tapRelease = false; // release of a tap: held at least 4 flips (f) / 120 ms (ms) AND 100 ms AND 2 guest pad reads after the press
 };
 
@@ -117,7 +119,17 @@ inline bool ParseVirtualPadScript(std::string_view script, std::vector<VirtualPa
         } else if (equals != std::string_view::npos) {
             const auto name = detail::trimView(op.substr(0, equals));
             const std::string valueText(detail::trimView(op.substr(equals + 1)));
-            if (detail::lowerCopy(name) == "tap") {
+            if (detail::lowerCopy(name) == "shake") {
+                char* shakeEnd = nullptr;
+                const double seconds = std::strtod(valueText.c_str(), &shakeEnd);
+                if (valueText.empty() || shakeEnd != valueText.c_str() + valueText.size() || seconds <= 0.0 || seconds > 60.0 || base.byFrame) {
+                    error = "bad shake duration '" + std::string(item) + "'";
+                    return false;
+                }
+                base.isShake = true;
+                base.value = static_cast<std::int16_t>(seconds * 1000.0);
+                events.push_back(base);
+            } else if (detail::lowerCopy(name) == "tap") {
                 const int button = detail::buttonIndex(valueText);
                 if (button < 0) { error = "unknown button in '" + std::string(item) + "'"; return false; }
                 base.index = button;
