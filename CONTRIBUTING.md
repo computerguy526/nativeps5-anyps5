@@ -92,7 +92,7 @@ Each check is one command locally (from the repository root):
 
 | Job | What | Locally |
 |---|---|---|
-| relinker | relinker-only build and ctest on a GitHub macOS runner (macos-15-intel; the arm64 runners queue starve) (no submodules; minus 18 tests (17 of the upstream's own GitHub workflows plus check_skips, whose 20 s timeout is too tight on a loaded runner) of the upstream's own GitHub workflows, which this fork does not carry, see `-E` in the workflow) | `cmake -S . -B build-relinker -G Ninja -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON && cmake --build build-relinker && ctest --test-dir build-relinker -j4` |
+| relinker | relinker-only build and ctest on a GitHub macOS runner (macos-15-intel; the arm64 runners queue starve) (no submodules; minus 18 tests (17 of the upstream's own GitHub workflows plus check_skips, whose 20 s timeout is too tight on a loaded runner), see `-E` in the workflow) | `cmake -S . -B build-relinker -G Ninja -DANYPS5_RELINKER_ONLY=ON -DBUILD_TESTING=ON && cmake --build build-relinker && ctest --test-dir build-relinker -j4` |
 | clang-format | the lines the change touches (.clang-format); existing code is never reformatted | `pip install clang-format==22.1.3 && git clang-format origin/main -- core demo tools` (`--diff` to look) |
 | privacy | game data, secrets, personal paths, commit e-mails (a copy of the entry repository's gate, `.github/nps5-ci/`) | `BASE=origin/main TIP=HEAD .github/nps5-ci/privacy.sh` |
 | workflows | workflow syntax | `actionlint` |
